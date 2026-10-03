@@ -49,6 +49,11 @@ pub struct Scene {
     rain: Vec<Column>,
 }
 
+/// Seed for the rain's initial column stats (see `rng.rs` on why the render
+/// path must not draw from the wall clock): fixed, so a scene's first frame
+/// depends only on the scene.
+const RAIN_SEED: u64 = 0x9E37_79B9_7F4A_7C15; // the golden-ratio constant
+
 // The template's PURPLE_BLUE_HUES, decoded from xterm-256 to RGB.
 const HUES: [[u8; 3]; 10] = [
     [0x5f, 0x00, 0xff], // 57  dark purple
@@ -141,7 +146,7 @@ impl Column {
 
 impl Scene {
     pub fn new(tris: Vec<Tri>, extent: f32, with_rain: bool, frame_w: usize, frame_h: usize) -> Scene {
-        let mut rng = Rng::new();
+        let mut rng = Rng::with_seed(RAIN_SEED);
         // a column every `step` px at a half-step offset, like the template's
         // wide-char `step_by(2)`; ~60 columns looks right at any resolution
         let step = (frame_w / 60).clamp(16, 48);
@@ -170,7 +175,7 @@ impl Scene {
             0
         };
         if want as usize != self.rain.len() {
-            let mut rng = Rng::new();
+            let mut rng = Rng::with_seed(RAIN_SEED);
             self.rain = (0..want)
                 .map(|i| i * step as i64 + step as i64 / 2)
                 .map(|x| Column::new(x, frame_h, &mut rng))
@@ -217,8 +222,18 @@ impl Renderer {
     pub fn render(&mut self, frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
         self.time = time;
         frame.clear(BG);
+        // Refill the z-buffer — the module doc promises this per frame and
+        // the frame-cost budget counts on it (33 MB WB fill at 4K). Without
+        // it, stale depths from the previous frame reject the rotating mesh
+        // pixel-by-pixel: coverage erodes every frame, and the big-grid
+        // assets (79/120, whose surfaces travel farthest in z per frame)
+        // vanish entirely within a few dozen frames.
+        self.z.fill(f32::INFINITY);
         if with_rain {
-            let mut rng = Rng::new();
+            // Seeded from the frame time: identical across a selftest's runs
+            // (its times are exact), never repeated in a live show — the rain
+            // steps stay a pure function of (scene, time).
+            let mut rng = Rng::with_seed(self.time.to_bits() as u64 ^ RAIN_SEED);
             for col in &mut scene.rain {
                 col.step(frame.height, &mut rng);
                 col.draw(frame, time);

@@ -376,8 +376,51 @@ fn run_selftest(opts: &Options) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Selftest helpers
+// ---------------------------------------------------------------------------
+
+/// `selftest --dump`: downsample the last frame to ~80x40 cells and print
+/// one character per cell, brightness on the same ` .:-=+*#%@` ramp the
+/// logo's density ramp uses — the text-mode picture of what would have
+/// reached `/dev/fb0`, so the headless selftest shows its work on any
+/// machine (the `fbstress`/`fbprobe` show-me convention).
+fn dump_ascii(frame: &Frame) {
+    const RAMP: &[u8; 10] = b" .:-=+*#%@";
+    let cols = frame.width.min(80);
+    let rows = frame.height.min(40);
+    let mut out = String::with_capacity((cols + 1) * rows);
+    for cy in 0..rows {
+        let y0 = cy * frame.height / rows;
+        let y1 = ((cy + 1) * frame.height / rows).max(y0 + 1);
+        for cx in 0..cols {
+            let x0 = cx * frame.width / cols;
+            let x1 = ((cx + 1) * frame.width / cols).max(x0 + 1);
+            // mean luminance of the cell (ITU-R BT.601 weights, scaled x1000
+            // to stay in integers). `BG` is near-black, so background cells
+            // land on the ramp's first char (` `) with no special case.
+            let mut sum: u64 = 0;
+            let mut n: u64 = 0;
+            for y in y0..y1 {
+                let row = &frame.buf[y * frame.width + x0..y * frame.width + x1];
+                for &px in row {
+                    sum += u64::from((px >> 16) & 0xff) * 299
+                        + u64::from((px >> 8) & 0xff) * 587
+                        + u64::from(px & 0xff) * 114;
+                    n += 1;
+                }
+            }
+            let lum = if n == 0 { 0 } else { (sum / n / 1000) as usize }; // 0..=255
+            out.push(RAMP[lum * (RAMP.len() - 1) / 255] as char);
+        }
+        out.push('\n');
+    }
+    print!("{out}");
+}
+
+// ---------------------------------------------------------------------------
 // Exit report — the template's metrics culture, in framebuffer units
 // ---------------------------------------------------------------------------
+fn print_metrics(opts: &Options, meter: &FpsMeter, frame: &Frame, switches: u64, why: &str) {
     let (dur, frames, fps, over, slowest) = meter.summary();
     let px = frame.width as u64 * frame.height as u64;
     let bytes = px * 4 * frames; // canonical 0x00RRGGBB frames written
