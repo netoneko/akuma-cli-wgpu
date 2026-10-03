@@ -28,10 +28,9 @@ mod softrender;
 mod wgpu_backend;
 
 use std::io::Write as _;
-use std::time::{Duration, Instant};
+use clock::{monotonic, FpsMeter, Pacer};
 
 use catlogo::HeightField;
-use clock::{FpsMeter, Pacer};
 use fb::{FbDevice, Frame};
 use input::{Key, RawTty};
 use softrender::{Renderer, Scene};
@@ -223,17 +222,15 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
     };
 
     let mut tty = RawTty::new().ok();
-    let started = Instant::now();
+    let started = monotonic();
     let mut pacer = Pacer::new(opts.fps);
-    let mut meter = FpsMeter::new(Duration::from_nanos(
-        1_000_000_000 / u64::from(opts.fps.max(1)),
-    ));
+    let mut meter = FpsMeter::new(1.0 / f64::from(opts.fps.max(1)));
     let mut switches: u64 = 0;
     let mut quit_reason = "q/Esc";
 
     loop {
-        let t0 = Instant::now();
-        let time = t0.duration_since(started).as_secs_f32();
+        let t0 = monotonic();
+        let time = (t0 - started) as f32;
 
         // --- input ---
         if let Some(tty) = &mut tty {
@@ -266,7 +263,7 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
 
         // --- timeout ---
         if opts.timeout_secs > 0
-            && started.elapsed() >= Duration::from_secs(opts.timeout_secs)
+            && monotonic() - started >= opts.timeout_secs as f64
         {
             quit_reason = "timeout";
         }
@@ -276,7 +273,7 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
         renderer.render(&mut frame, &mut scene, time, true);
         dev.present(&frame);
 
-        meter.frame(t0.elapsed());
+        meter.frame(monotonic() - t0);
         pacer.finish_frame();
 
         if quit_reason != "q/Esc" {
@@ -333,9 +330,9 @@ fn run_selftest(opts: &Options) -> i32 {
         let mut asset_checksum: u32 = 0;
         for k in 0..per {
             let time = (i as f64 * 10.0 + k as f64) as f32 / opts.fps.max(1) as f32;
-            let t0 = Instant::now();
+            let t0 = monotonic();
             renderer.render(&mut frame, &mut scene, time, true);
-            total_ns += t0.elapsed().as_nanos();
+            total_ns += ((monotonic() - t0) * 1e9) as u128;
             if k == per - 1 {
                 let coverage = frame
                     .buf
@@ -424,20 +421,20 @@ fn print_metrics(opts: &Options, meter: &FpsMeter, frame: &Frame, switches: u64,
     let (dur, frames, fps, over, slowest) = meter.summary();
     let px = frame.width as u64 * frame.height as u64;
     let bytes = px * 4 * frames; // canonical 0x00RRGGBB frames written
-    let mbps = if dur.as_secs_f64() > 0.0 {
-        bytes as f64 / 1e6 / dur.as_secs_f64()
+    let mbps = if dur > 0.0 {
+        bytes as f64 / 1e6 / dur
     } else {
         0.0
     };
     let mut out = String::new();
     out.push_str("\n=== Screensaver Metrics ===\n");
     out.push_str(&format!("Exit: {why}\n"));
-    out.push_str(&format!("Duration: {:.2} seconds\n", dur.as_secs_f64()));
+    out.push_str(&format!("Duration: {:.2} seconds\n", dur));
     out.push_str(&format!("Frames: {frames}\n"));
     out.push_str(&format!("Average FPS: {fps:.2}\n"));
     out.push_str(&format!("Frame budget: {:.1} ms at {} fps\n", 1000.0 / opts.fps.max(1) as f64, opts.fps));
     out.push_str(&format!("Over-budget frames: {over}\n"));
-    out.push_str(&format!("Slowest frame render: {:.2} ms\n", slowest.as_secs_f64() * 1e3));
+    out.push_str(&format!("Slowest frame render: {:.2} ms\n", slowest * 1e3));
     out.push_str(&format!(
         "Total pixels: {:.2} Gpx ({}x{} per frame)\n",
         (px * frames) as f64 / 1e9,
