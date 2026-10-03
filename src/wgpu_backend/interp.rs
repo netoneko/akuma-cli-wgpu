@@ -188,6 +188,14 @@ pub fn round_up(align: u32, val: u32) -> u32 {
     (val + align - 1) & !(align - 1)
 }
 
+/// Array element stride, computed from OUR layout math: element size rounded
+/// up to element alignment — the WGSL rule. Idx stepping and member offsets
+/// must come from one set of rules (naga's stored stride agrees with these,
+/// but deriving the stride here is what keeps the two from drifting apart).
+fn array_stride(module: &naga::Module, base: Handle<naga::Type>) -> u32 {
+    round_up(align_of(module, base), size_of(module, base))
+}
+
 fn align_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
     match &module.types[ty].inner {
         TypeInner::Scalar(s) | TypeInner::Atomic(s) => w(*s),
@@ -217,13 +225,13 @@ fn size_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
         TypeInner::Matrix { columns, rows, scalar } => {
             vec_stride(vsize(*rows), *scalar) * vsize(*columns)
         }
-        TypeInner::Array { base: _, size, stride } => {
+        TypeInner::Array { base, size, .. } => {
             let n = match size {
                 naga::ArraySize::Constant(c) => c.get(),
                 naga::ArraySize::Dynamic => panic!("interp: unsized array has no size"),
                 naga::ArraySize::Pending(_) => panic!("interp: pending array size unsupported"),
             };
-            stride * n
+            array_stride(module, *base) * n
         }
         TypeInner::Struct { members, .. } => {
             let mut off = 0;
@@ -346,7 +354,7 @@ fn read_value(module: &naga::Module, bytes: &[u8], off: u32, ty: Handle<naga::Ty
                 rows: vsize(*rows) as usize,
             }
         }
-        TypeInner::Array { base, size, stride } => {
+        TypeInner::Array { base, size, .. } => {
             let n = match size {
                 naga::ArraySize::Constant(c) => c.get(),
                 // unsized arrays: the runtime length is not in the IR; the
@@ -354,6 +362,7 @@ fn read_value(module: &naga::Module, bytes: &[u8], off: u32, ty: Handle<naga::Ty
                 naga::ArraySize::Dynamic => panic!("interp: dynamic array length unsupported"),
                 naga::ArraySize::Pending(_) => panic!("interp: pending array unsupported"),
             };
+            let stride = array_stride(module, *base);
             Value::Arr(
                 (0..n)
                     .map(|i| read_value(module, bytes, off + i * stride, *base))
@@ -391,8 +400,9 @@ fn write_value(
                 }
             }
         }
-        TypeInner::Array { base, stride, .. } => {
+        TypeInner::Array { base, .. } => {
             if let Value::Arr(vs) = v {
+                let stride = array_stride(module, *base);
                 for (i, c) in vs.iter().enumerate() {
                     write_value(module, bytes, off + i as u32 * stride, *base, c);
                 }
@@ -701,7 +711,7 @@ impl<'a> Frame<'a> {
             shape = match (std::mem::replace(&mut shape, PtrShape::Scalar(naga::Scalar::F32)), s) {
                 (PtrShape::Ty(ty), PtrStep::Idx(i)) => {
                     let stride = match &self.sh.module.types[ty].inner {
-                        TypeInner::Array { stride, .. } => *stride,
+                        TypeInner::Array { base, .. } => array_stride(&self.sh.module, *base),
                         other => panic!("interp: index into {other:?}"),
                     };
                     off += i * stride;
@@ -715,8 +725,8 @@ impl<'a> Frame<'a> {
                             off += offs[*m as usize];
                             PtrShape::Ty(members[*m as usize].ty)
                         }
-                        TypeInner::Array { base, stride, .. } => {
-                            off += m * stride;
+                        TypeInner::Array { base, .. } => {
+                            off += m * array_stride(&self.sh.module, base);
                             PtrShape::Ty(base)
                         }
                         TypeInner::Vector { size, scalar } => {

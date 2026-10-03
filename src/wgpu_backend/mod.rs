@@ -87,7 +87,10 @@ pub struct WgpuRenderer {
     h: usize,
 }
 
-const TRI_WGSL_STRIDE: usize = 48; // vec3f has 16-byte alignment: 3 * 16
+// WGSL `Tri` layout, per the storage rules the interpreter applies: vec3f
+// members are 12 bytes but align 16, so a/b/c sit at 0/16/32; `kind` (u32,
+// align 4) follows c at 44; struct size rounds up to align: 48.
+const TRI_WGSL_STRIDE: usize = 48;
 
 impl WgpuRenderer {
     pub fn new(width: usize, height: usize) -> WgpuRenderer {
@@ -317,13 +320,22 @@ impl WgpuRenderer {
             uni[16..20].copy_from_slice(&scene.center_x.to_le_bytes());
             self.queue.write_buffer(&self.uniform, 0, &uni);
 
-            // mesh: pad each tri to the WGSL storage stride
+            // mesh: pack each tri to the WGSL storage stride. Each vec3<f32>
+            // member occupies 12 bytes but ALIGNS to 16, so every vertex
+            // gets its own 16-byte lane (a@0, b@16, c@32) and `kind` lands
+            // right after c, at +44. (The original code packed the 12 floats
+            // contiguously — b/c then read shifted by one float, which is
+            // the squashed-cat M3 parity bug.)
             let mut mesh = vec![0u8; n * TRI_WGSL_STRIDE];
             for (i, t) in scene.tris.iter().enumerate() {
                 let o = i * TRI_WGSL_STRIDE;
-                for (c, p) in t.a.iter().chain(t.b.iter()).chain(t.c.iter()).enumerate() {
-                    mesh[o + c * 4..o + c * 4 + 4].copy_from_slice(&p.to_le_bytes());
+                for (v, p3) in [t.a, t.b, t.c].iter().enumerate() {
+                    for (c, p) in p3.iter().enumerate() {
+                        let at = o + v * 16 + c * 4;
+                        mesh[at..at + 4].copy_from_slice(&p.to_le_bytes());
+                    }
                 }
+                mesh[o + 44..o + 48].copy_from_slice(&t.kind.to_le_bytes());
             }
             let (tris_buf, _) = self.tris.as_ref().unwrap();
             self.queue.write_buffer(tris_buf, 0, &mesh);

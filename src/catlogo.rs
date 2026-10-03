@@ -12,7 +12,7 @@
 //! `akuma_40.txt` is byte-identical to `amd64/src/akuma_40.txt`, the asset the
 //! kernel banner and splash paint.
 
-use crate::softrender::Tri;
+use crate::softrender::{Tri, KIND_FRONT, KIND_WALL};
 
 /// Ink density ramp, darkest last. Every non-space character in the assets is
 /// in here; anything unknown maps to mid density so future assets degrade
@@ -97,9 +97,10 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
             let ay = (h / 2.0) - cy as f32 - 1.0;
             let by = ay + 1.0;
 
-            // top face at z (CCW seen from +z)
+            // top face at z (CCW seen from +z) — the plate's FRONT
             quad(
                 &mut tris,
+                KIND_FRONT,
                 [ax, ay, z],
                 [bx, ay, z],
                 [bx, by, z],
@@ -111,6 +112,7 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
             if at(cx as i64 + 1, cy as i64) < d {
                 quad(
                     &mut tris,
+                    KIND_WALL,
                     [bx, ay, 0.0],
                     [bx, by, 0.0],
                     [bx, by, z],
@@ -121,6 +123,7 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
             if at(cx as i64 - 1, cy as i64) < d {
                 quad(
                     &mut tris,
+                    KIND_WALL,
                     [ax, by, 0.0],
                     [ax, ay, 0.0],
                     [ax, ay, z],
@@ -131,6 +134,7 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
             if at(cx as i64, cy as i64 - 1) < d {
                 quad(
                     &mut tris,
+                    KIND_WALL,
                     [bx, by, 0.0],
                     [ax, by, 0.0],
                     [ax, by, z],
@@ -141,6 +145,7 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
             if at(cx as i64, cy as i64 + 1) < d {
                 quad(
                     &mut tris,
+                    KIND_WALL,
                     [ax, ay, 0.0],
                     [bx, ay, 0.0],
                     [bx, ay, z],
@@ -152,8 +157,15 @@ pub fn extrude(hf: &HeightField, depth: f32) -> Vec<Tri> {
     tris
 }
 
-/// Two CCW triangles (a, b, c) + (a, c, d).
-fn quad(tris: &mut Vec<Tri>, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
-    tris.push(Tri::new(a, b, c));
-    tris.push(Tri::new(a, c, d));
+/// Extrusion depth for an asset: a *slim plate*. A logo reads thin — the
+/// old 35%-of-short-side slabs read as candy blocks — but the floor keeps
+/// even the 20-column cat's edge visible instead of collapsing to a wafer.
+pub fn depth_for(hf: &HeightField) -> f32 {
+    ((hf.height.min(hf.width) as f32).max(6.0) * 0.14).max(2.0)
+}
+
+/// Two CCW triangles (a, b, c) + (a, c, d), tagged with the face `kind`.
+fn quad(tris: &mut Vec<Tri>, kind: u32, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
+    tris.push(Tri::new(a, b, c, kind));
+    tris.push(Tri::new(a, c, d, kind));
 }

@@ -3,7 +3,7 @@
 //! One triangle pipeline, no dependencies:
 //!
 //!   mesh (catlogo::extrude) -> rotate -> perspective project -> cull ->
-//!   shade (lambert + purple-blue hue wave) -> scanline spans into a
+//!   shade (solid two-tone logo colors) -> scanline spans into a
 //!   z-buffered RAM `Frame` -> one contiguous present into /dev/fb0.
 //!
 //! Design notes tied to the platform:
@@ -37,11 +37,15 @@ pub struct Tri {
     pub a: [f32; 3],
     pub b: [f32; 3],
     pub c: [f32; 3],
+    /// Face family, tagged by `catlogo::extrude`: `KIND_FRONT` (the plate's
+    /// z+ face) or `KIND_WALL` (the extrusion sides). The logo shading keys
+    /// on this and nothing else.
+    pub kind: u32,
 }
 
 impl Tri {
-    pub fn new(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Tri {
-        Tri { a, b, c }
+    pub fn new(a: [f32; 3], b: [f32; 3], c: [f32; 3], kind: u32) -> Tri {
+        Tri { a, b, c, kind }
     }
 }
 
@@ -84,6 +88,20 @@ const HUES: [[u8; 3]; 10] = [
 const HEAD: u32 = 0xccffff; // rain head: near-white cyan
 pub const BG: u32 = 0x05030a; // near-black, a hint of purple
 
+/// Face families `catlogo::extrude` tags triangles with.
+pub const KIND_FRONT: u32 = 0;
+pub const KIND_WALL: u32 = 1;
+
+/// The logo palette: the template's two palette extremes as *flat* colors —
+/// bright cyan (hue 51, full strength) for the plate's front, deep purple
+/// (hue 57, halved) for the extrusion walls. Solid colors are what make the
+/// mark read as a logo; the old lambert + rolling hue wave read as a lava
+/// lamp. (All front faces share the normal (0,0,1), so the old lighting
+/// already gave them one constant brightness — only the hue wave varied
+/// them; the walls carried the whole gradient.)
+pub const FRONT_COLOR: u32 = 0x00ffff;
+pub const WALL_COLOR: u32 = 0x2f007f;
+
 #[inline]
 fn rgb([r, g, b]: [u8; 3]) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
@@ -95,11 +113,6 @@ fn shade(c: u32, k: f32) -> u32 {
     let g = (((c >> 8) & 0xff) as f32 * k).min(255.0) as u32;
     let b = ((c & 0xff) as f32 * k).min(255.0) as u32;
     (r << 16) | (g << 8) | b
-}
-
-#[inline]
-fn frac01(x: f32) -> f32 {
-    x - x.floor()
 }
 
 /// Rain cell geometry: the template rains on a terminal character grid, so
@@ -276,9 +289,6 @@ pub fn backdrop(frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool
     }
 }
 
-/// Fixed directional light, roughly "from the upper left, out of the screen".
-const LIGHT: [f32; 3] = [-0.45, 0.65, 0.62];
-
 #[derive(Clone, Copy)]
 struct Vtx {
     /// screen coords (pixels, y down)
@@ -292,8 +302,6 @@ pub struct Renderer {
     z: Vec<f32>,
     /// 3 projected vertices per triangle, in triangle order
     scratch: Vec<Vtx>,
-    /// seconds since start, set per frame; drives the hue wave
-    time: f32,
 }
 
 impl Renderer {
@@ -301,14 +309,12 @@ impl Renderer {
         Renderer {
             z: vec![f32::INFINITY; width * height],
             scratch: Vec::new(),
-            time: 0.0,
         }
     }
 
-    /// Render one frame. `time` is seconds since start (drives the orbit and
-    /// the hue wave); the rain steps and draws as the backdrop first.
+    /// Render one frame. `time` is seconds since start (drives the orbit);
+    /// the rain steps and draws as the backdrop first.
     pub fn render(&mut self, frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
-        self.time = time;
         backdrop(frame, scene, time, with_rain);
         // Refill the z-buffer — the module doc promises this per frame and
         // the frame-cost budget counts on it (33 MB WB fill at 4K). Without
@@ -378,8 +384,9 @@ impl Renderer {
             return;
         }
 
-        // flat shading: world-space face normal (light is fixed in world
-        // space, so no rotation needed here)
+        // face normal, kept solely for the degenerate-triangle cull: the
+        // WGSL port needs the same check to park zero-area triangles where
+        // the fixed-function area cull drops them (see shaders.rs)
         let e1 = [t.b[0] - t.a[0], t.b[1] - t.a[1], t.b[2] - t.a[2]];
         let e2 = [t.c[0] - t.a[0], t.c[1] - t.a[1], t.c[2] - t.a[2]];
         let nx = e1[1] * e2[2] - e1[2] * e2[1];
@@ -389,18 +396,14 @@ impl Renderer {
         if nl <= 1e-9 {
             return;
         }
-        let lam = ((nx / nl) * LIGHT[0] + (ny / nl) * LIGHT[1] + (nz / nl) * LIGHT[2]).max(0.0);
-        let bright = 0.35 + 0.75 * lam;
 
-        // hue wave: purple->cyan sweeping across world height and extrusion
-        // depth, rolling in time — the splash's palette idea, transplanted
-        let wave = frac01(
-            (t.a[1] + t.b[1] + t.c[1]) * 0.055
-                + (t.a[2] + t.b[2] + t.c[2]) * 0.14
-                + self.time * 0.12,
-        );
-        let hue_idx = (wave * (HUES.len() as f32 - 1.0)).round() as usize % HUES.len();
-        let color = shade(rgb(HUES[hue_idx]), bright);
+        // logo shading: one solid color per face family, nothing else —
+        // no lambert, no hue wave (see FRONT_COLOR / WALL_COLOR)
+        let color = if t.kind == KIND_WALL {
+            WALL_COLOR
+        } else {
+            FRONT_COLOR
+        };
 
         // scanline raster with per-pixel z interpolated along the edges
         let (w, h) = (frame.width as i64, frame.height as i64);

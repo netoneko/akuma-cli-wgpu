@@ -323,8 +323,7 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
 
 fn build_scene(_opts: &Options, asset: &str, w: usize, h: usize) -> Scene {
     let hf = HeightField::parse(asset);
-    // extrusion depth scales with the asset so the 20-col cat is not a wafer
-    let depth = (hf.height.min(hf.width) as f32).max(6.0) * 0.35;
+    let depth = catlogo::depth_for(&hf);
     let tris = catlogo::extrude(&hf, depth);
     let extent = hf.width.max(hf.height) as f32;
     let mut scene = Scene::new(tris, extent, true, w, h);
@@ -353,7 +352,7 @@ fn run_selftest(opts: &Options) -> i32 {
     // one scene per asset: exercises every mesh shape
     for (i, (name, asset)) in ASSET_NAMES.iter().zip(ASSETS.iter()).enumerate() {
         let hf = HeightField::parse(asset);
-        let depth = (hf.height.min(hf.width) as f32).max(6.0) * 0.35;
+        let depth = catlogo::depth_for(&hf);
         let tris = catlogo::extrude(&hf, depth);
         let mut scene =
             Scene::new(tris, hf.width.max(hf.height) as f32, true, opts.width, opts.height);
