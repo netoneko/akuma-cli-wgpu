@@ -17,20 +17,81 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static QUIT_FLAG: AtomicBool = AtomicBool::new(false);
 
+// True when install_signal_handlers managed to block SIGINT/SIGTERM. When
+// blocked, delivery is only ever opened up inside `drain_signals`' ppoll
+// window (see below), never mid-raster.
+static SIGS_BLOCKED: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn on_signal(_sig: libc::c_int) {
     QUIT_FLAG.store(true, Ordering::SeqCst);
 }
 
 /// Install SIGINT/SIGTERM handlers. Idempotent; harmless if stdin is not a
-/// tty. Returns the initial flag state (always false).
+/// tty.
+///
+/// Why blocked, not merely handled: on this kernel an unblocked
+/// SIGINT/SIGTERM interrupts whatever the CPU was doing — if that is a
+/// syscall, Akuma returns EINTR (no SA_RESTART for instantaneous calls)
+/// and Rust std unwraps it (`Instant::now` -> clock_gettime ->
+/// "called `Result::unwrap()` on an `Err` value: Os { code: 4,
+/// kind: Interrupted }" panic, observed on the box 2026-10-03); if it is
+/// plain userspace, the kernel has to snapshot live register state, and
+/// eight SIGTERM runs during the 2026-10-03 session crashed five of those
+/// as segfaults or impossible out-of-bounds indices (softrender.rs:359
+/// with an index no f32 input can produce). Delivery *at a syscall
+/// boundary* restarted cleanly in a C probe, so we confine delivery to
+/// one: both signals stay blocked all frame, and `quit_requested` opens
+/// a ppoll window (mask empty, timeout 0) once per frame — the pselect
+/// pattern. ppoll is the only mask-taking primitive this kernel
+/// implements (sigpending/sigtimedwait/signalfd are all ENOSYS).
 pub fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        // pthread_sigmask rather than sigprocmask: correct even if the
+        // promised render thread (see FbDevice) ever shows up.
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) == 0 {
+            SIGS_BLOCKED.store(true, Ordering::SeqCst);
+        } else {
+            eprintln!(
+                "[input] DEBUG pthread_sigmask failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let r2 = libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        eprintln!("[input] DEBUG sigprocmask ret={}", r2);
     }
 }
 
+/// True once a SIGINT/SIGTERM has been seen. When the signals are blocked,
+/// this opens the per-frame ppoll delivery window first: for the duration
+/// of that one syscall the mask is empty, so pending signals are delivered
+/// into the handler at a syscall boundary (any EINTR from that is ours to
+/// ignore), and the block is restored by the kernel before ppoll returns.
 pub fn quit_requested() -> bool {
+    if SIGS_BLOCKED.load(Ordering::SeqCst) {
+        unsafe {
+            let mut pfd = libc::pollfd {
+                fd: -1, // ignored by ppoll; we only want the mask swap
+                events: 0,
+                revents: 0,
+            };
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            let tmo = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // A delivered signal makes this return EINTR; that is the
+            // mechanism working, not an error.
+            libc::ppoll(&mut pfd, 1, &tmo, &empty);
+        }
+    }
     QUIT_FLAG.load(Ordering::SeqCst)
 }
 
