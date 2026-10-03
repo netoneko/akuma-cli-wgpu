@@ -1,0 +1,409 @@
+//! `akuma-wgpu` — the akuma-cli screensaver, extruded into 3D and rendered
+//! straight into the framebuffer.
+//!
+//! Template: github.com/netoneko/akuma-cli (same CLI surface — `screensaver`,
+//! `matrix`, `--latin`, arrow keys switch assets, `q`/Esc quits, metrics on
+//! exit). Difference: instead of ANSI escape codes into a terminal grid, a
+//! software rasterizer draws into `/dev/fb0` via the Linux-standard fbdev
+//! interface — three ioctls and an mmap, zero akuma-private syscalls, the
+//! surface rio and wgpu will eventually sit on.
+//!
+//! Subcommands:
+//!   screensaver   3D cat logo over the Matrix backdrop (the default show)
+//!   matrix        backdrop only
+//!   selftest      render headlessly into RAM and print stats — runs
+//!                 anywhere, no /dev/fb0 needed (the fbstress convention:
+//!                 same binary, Linux and Akuma)
+//!
+//! Exit metrics mirror the template's, in the frame buffer's units: frames,
+//! fps, MB written, MB/s — directly comparable to the kernel banner's
+//! `[fb] ... clear 10.9ms = 3026MB/s` line.
+
+mod catlogo;
+mod clock;
+mod fb;
+mod input;
+mod rng;
+mod softrender;
+mod wgpu_backend;
+
+use std::io::Write as _;
+use std::time::{Duration, Instant};
+
+use catlogo::HeightField;
+use clock::{FpsMeter, Pacer};
+use fb::{FbDevice, Frame};
+use input::{Key, RawTty};
+use softrender::{Renderer, Scene};
+
+/// The assets, embedded like the template embeds them.
+const AKUMA_20: &str = include_str!("akuma_20.txt");
+const AKUMA_40: &str = include_str!("akuma_40.txt");
+const AKUMA_79: &str = include_str!("akuma_79.txt");
+const AKUMA_120: &str = include_str!("akuma_120.txt");
+const ASSETS: [&str; 4] = [AKUMA_40, AKUMA_79, AKUMA_120, AKUMA_20];
+const ASSET_NAMES: [&str; 4] = ["akuma_40", "akuma_79", "akuma_120", "akuma_20"];
+
+struct Options {
+    mode: Mode,
+    latin: bool,
+    fps: u32,
+    timeout_secs: u64,
+    fb_path: String,
+    width: usize,
+    height: usize,
+    frames: u64,
+    /// request the not-yet-wired wgpu path (milestone M3)
+    wgpu: bool,
+    /// selftest: print ASCII maps of final frames
+    dump: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Screensaver,
+    Matrix,
+    Selftest,
+}
+
+const USAGE: &str = "\
+akuma-wgpu — the akuma-cli screensaver, 3D, straight into the framebuffer
+
+USAGE:
+    akuma-wgpu <COMMAND> [OPTIONS]
+
+COMMANDS:
+    screensaver    3D cat logo over the Matrix backdrop
+    matrix         Matrix backdrop only
+    selftest       render headlessly into RAM, print stats, exit
+
+OPTIONS:
+    --latin        Latin characters in the backdrop (default: katakana)
+    --fps <N>      target frame rate (default 60)
+    --timeout <S>  exit after S seconds (0 = run until q/Esc/^C; default 0)
+    --fb <PATH>    framebuffer device (default /dev/fb0)
+    --wgpu         try the wgpu backend (not wired yet — milestone M3)
+    --w <W>        selftest frame width (default 1280)
+    --h <H>        selftest frame height (default 720)
+    --frames <N>   selftest frame count (default 120)
+    --dump         selftest also prints an ASCII map of each last frame
+    -h, --help     this text
+
+CONTROLS:
+    Left/Right     switch asset     q / Esc / ^C    quit (metrics on exit)
+";
+
+fn parse_args(argv: &[String]) -> Result<Options, String> {
+    let mut mode = Mode::Screensaver;
+    let mut opt = Options {
+        mode,
+        latin: false,
+        fps: 60,
+        timeout_secs: 0,
+        fb_path: "/dev/fb0".to_string(),
+        width: 1280,
+        height: 720,
+        frames: 120,
+        wgpu: false,
+        dump: false,
+    };
+    let mut it = argv.iter();
+    if let Some(first) = it.next() {
+        match first.as_str() {
+            "screensaver" => mode = Mode::Screensaver,
+            "matrix" => mode = Mode::Matrix,
+            "selftest" => mode = Mode::Selftest,
+            "-h" | "--help" | "help" => return Err(USAGE.to_string()),
+            other => return Err(format!("unknown command `{other}` (try --help)")),
+        }
+    }
+    let mut flags = it.peekable();
+    while let Some(flag) = flags.next() {
+        let mut value = |name: &str| -> Result<String, String> {
+            flags
+                .next()
+                .ok_or_else(|| format!("{name} needs a value"))
+                .cloned()
+        };
+        match flag.as_str() {
+            "--latin" => opt.latin = true,
+            "--wgpu" => opt.wgpu = true,
+            "--dump" => opt.dump = true,
+            "--fps" => opt.fps = value("--fps")?.parse().map_err(|_| "--fps wants a number")?,
+            "--timeout" => {
+                opt.timeout_secs = value("--timeout")?
+                    .parse()
+                    .map_err(|_| "--timeout wants seconds")?
+            }
+            "--fb" => opt.fb_path = value("--fb")?,
+            "--w" => opt.width = value("--w")?.parse().map_err(|_| "--w wants pixels")?,
+            "--h" => opt.height = value("--h")?.parse().map_err(|_| "--h wants pixels")?,
+            "--frames" => {
+                opt.frames = value("--frames")?
+                    .parse()
+                    .map_err(|_| "--frames wants a count")?
+            }
+            "-h" | "--help" => return Err(USAGE.to_string()),
+            other => return Err(format!("unknown option `{other}` (try --help)")),
+        }
+    }
+    opt.mode = mode;
+    Ok(opt)
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let opts = match parse_args(&argv) {
+        Ok(o) => o,
+        Err(msg) => {
+            // usage text goes to stdout, errors to stderr — like clap
+            if msg.trim_start().starts_with("akuma-wgpu") {
+                println!("{msg}");
+            } else {
+                eprintln!("error: {msg}");
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+            return;
+        }
+    };
+
+    input::install_signal_handlers();
+
+    if opts.wgpu {
+        eprintln!("{}", wgpu_backend::STATUS);
+        return;
+    }
+
+    let code = match opts.mode {
+        Mode::Selftest => run_selftest(&opts),
+        Mode::Matrix => run_show(&opts, /*asset overlay*/ false),
+        Mode::Screensaver => run_show(&opts, true),
+    };
+    std::process::exit(code);
+}
+
+// ---------------------------------------------------------------------------
+// The show (screensaver | matrix) — the /dev/fb0 path
+// ---------------------------------------------------------------------------
+
+fn run_show(opts: &Options, with_asset: bool) -> i32 {
+    let dev = match FbDevice::open(&opts.fb_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "error: cannot open {}: {} — is this the akuma kernel with \
+                 slices S1-S5 (see docs/runbooks/amd64-fbdev-wgpu-demo.md)?",
+                opts.fb_path, e
+            );
+            return 1;
+        }
+    };
+    eprintln!(
+        "[fb] {} {}x{} pitch {} bpp {} smem {} KiB",
+        dev.id,
+        dev.width,
+        dev.height,
+        dev.pitch,
+        dev.format.bits_per_pixel,
+        dev.smem_len / 1024
+    );
+
+    let mut frame = Frame::new(dev.width, dev.height);
+    let mut renderer = Renderer::new(dev.width, dev.height);
+
+    // asset 0 is the template's default (akuma_40); Left/Right cycle. The
+    // matrix subcommand runs with no mesh at all — rain only, like the
+    // template's `matrix` mode.
+    let mut asset_idx: usize = 0;
+    let mut scene = if with_asset {
+        build_scene(opts, ASSETS[asset_idx], dev.width, dev.height)
+    } else {
+        Scene::new(Vec::new(), 1.0, true, dev.width, dev.height)
+    };
+
+    let mut tty = RawTty::new().ok();
+    let started = Instant::now();
+    let mut pacer = Pacer::new(opts.fps);
+    let mut meter = FpsMeter::new(Duration::from_nanos(
+        1_000_000_000 / u64::from(opts.fps.max(1)),
+    ));
+    let mut switches: u64 = 0;
+    let mut quit_reason = "q/Esc";
+
+    loop {
+        let t0 = Instant::now();
+        let time = t0.duration_since(started).as_secs_f32();
+
+        // --- input ---
+        if let Some(tty) = &mut tty {
+            for key in tty.poll_keys() {
+                match key {
+                    Key::Quit => {
+                        quit_reason = "key";
+                    }
+                    Key::Left => {
+                        if with_asset {
+                            asset_idx = (asset_idx + ASSETS.len() - 1) % ASSETS.len();
+                            scene = build_scene(opts, ASSETS[asset_idx], dev.width, dev.height);
+                            switches += 1;
+                        }
+                    }
+                    Key::Right => {
+                        if with_asset {
+                            asset_idx = (asset_idx + 1) % ASSETS.len();
+                            scene = build_scene(opts, ASSETS[asset_idx], dev.width, dev.height);
+                            switches += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if input::quit_requested() {
+            quit_reason = "^C";
+        }
+
+        // --- timeout ---
+        if opts.timeout_secs > 0
+            && started.elapsed() >= Duration::from_secs(opts.timeout_secs)
+        {
+            quit_reason = "timeout";
+        }
+
+        // --- render + present ---
+        scene.resize_rain(dev.width, dev.height, true);
+        renderer.render(&mut frame, &mut scene, time, true);
+        dev.present(&frame);
+
+        meter.frame(t0.elapsed());
+        pacer.finish_frame();
+
+        if quit_reason != "q/Esc" {
+            break;
+        }
+    }
+
+    // Leave the console how we found it: drop closes /dev/fb0 (releasing
+    // ownership back to fbcon, kernel slice S6) and RawTty restores termios.
+    drop(tty);
+    drop(dev);
+    print_metrics(opts, &meter, &frame, switches, quit_reason);
+    0
+}
+
+fn build_scene(_opts: &Options, asset: &str, w: usize, h: usize) -> Scene {
+    let hf = HeightField::parse(asset);
+    // extrusion depth scales with the asset so the 20-col cat is not a wafer
+    let depth = (hf.height.min(hf.width) as f32).max(6.0) * 0.35;
+    let tris = catlogo::extrude(&hf, depth);
+    let extent = hf.width.max(hf.height) as f32;
+    Scene::new(tris, extent, true, w, h)
+}
+
+// ---------------------------------------------------------------------------
+// selftest — headless, no /dev/fb0, the same binary on Linux and Akuma
+// ---------------------------------------------------------------------------
+
+fn run_selftest(opts: &Options) -> i32 {
+    println!(
+        "selftest: {}x{}, {} frames, fps target {}, latin={}",
+        opts.width, opts.height, opts.frames, opts.fps, opts.latin
+    );
+    let mut frame = Frame::new(opts.width, opts.height);
+    let mut renderer = Renderer::new(opts.width, opts.height);
+    let mut total_ns: u128 = 0;
+    let mut checksum: u32 = 0;
+
+    // one scene per asset: exercises every mesh shape
+    for (i, (name, asset)) in ASSET_NAMES.iter().zip(ASSETS.iter()).enumerate() {
+        let hf = HeightField::parse(asset);
+        let depth = (hf.height.min(hf.width) as f32).max(6.0) * 0.35;
+        let tris = catlogo::extrude(&hf, depth);
+        let mut scene =
+            Scene::new(tris, hf.width.max(hf.height) as f32, true, opts.width, opts.height);
+        println!(
+            "  {name}: {}x{} cells -> {} triangles",
+            hf.width,
+            hf.height,
+            scene.tris.len()
+        );
+
+        let per = (opts.frames / ASSETS.len() as u64).max(1);
+        let mut asset_checksum: u32 = 0;
+        for k in 0..per {
+            let time = (i as f64 * 10.0 + k as f64) as f32 / opts.fps.max(1) as f32;
+            let t0 = Instant::now();
+            renderer.render(&mut frame, &mut scene, time, true);
+            total_ns += t0.elapsed().as_nanos();
+            if k == per - 1 {
+                let coverage = frame
+                    .buf
+                    .iter()
+                    .filter(|&&p| p != softrender::BG)
+                    .count();
+                for &p in &frame.buf {
+                    asset_checksum =
+                        asset_checksum.wrapping_mul(0x0100_0193).wrapping_add(p & 0xff_ffff);
+                }
+                println!(
+                    "    last frame: {:.1}% coverage, fnv1a {:08x}",
+                    100.0 * coverage as f64 / frame.buf.len() as f64,
+                    asset_checksum
+                );
+                checksum = checksum.wrapping_add(asset_checksum);
+                if opts.dump {
+                    dump_ascii(&frame);
+                }
+            }
+        }
+    }
+
+    let frames_done = opts.frames.max(1);
+    let avg_ms = total_ns as f64 / frames_done as f64 / 1e6;
+    let total_px = opts.width as u64 * opts.height as u64 * frames_done;
+    println!(
+        "  avg render: {avg_ms:.2} ms/frame ({} fps theoretical)",
+        (1000.0 / avg_ms).round()
+    );
+    println!(
+        "SELFTEST OK — {} frames, {:.1} Mpx/s, {:.0} MB/s equivalent write rate",
+        frames_done,
+        total_px as f64 / 1e6 / (total_ns as f64 / 1e9),
+        total_px as f64 * 4.0 / 1e6 / (total_ns as f64 / 1e9)
+    );
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Exit report — the template's metrics culture, in framebuffer units
+// ---------------------------------------------------------------------------
+    let (dur, frames, fps, over, slowest) = meter.summary();
+    let px = frame.width as u64 * frame.height as u64;
+    let bytes = px * 4 * frames; // canonical 0x00RRGGBB frames written
+    let mbps = if dur.as_secs_f64() > 0.0 {
+        bytes as f64 / 1e6 / dur.as_secs_f64()
+    } else {
+        0.0
+    };
+    let mut out = String::new();
+    out.push_str("\n=== Screensaver Metrics ===\n");
+    out.push_str(&format!("Exit: {why}\n"));
+    out.push_str(&format!("Duration: {:.2} seconds\n", dur.as_secs_f64()));
+    out.push_str(&format!("Frames: {frames}\n"));
+    out.push_str(&format!("Average FPS: {fps:.2}\n"));
+    out.push_str(&format!("Frame budget: {:.1} ms at {} fps\n", 1000.0 / opts.fps.max(1) as f64, opts.fps));
+    out.push_str(&format!("Over-budget frames: {over}\n"));
+    out.push_str(&format!("Slowest frame render: {:.2} ms\n", slowest.as_secs_f64() * 1e3));
+    out.push_str(&format!(
+        "Total pixels: {:.2} Gpx ({}x{} per frame)\n",
+        (px * frames) as f64 / 1e9,
+        frame.width,
+        frame.height
+    ));
+    out.push_str(&format!("Total bytes written: {:.2} MB\n", bytes as f64 / 1e6));
+    out.push_str(&format!("Write rate: {mbps:.0} MB/s  (kernel [fb] clear reference: ~3026 MB/s)\n"));
+    out.push_str(&format!("Asset switches: {switches}\n"));
+    out.push_str("============================\n");
+    let _ = std::io::stderr().write_all(out.as_bytes());
+}

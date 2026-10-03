@@ -1,0 +1,41 @@
+# Standalone crate, like `userspace/tcc`: the empty `[workspace]` table is what
+# keeps cargo from adopting us into the parent `userspace/` workspace, which
+# targets `aarch64-unknown-none` + libakuma — exactly what this binary must not
+# touch. This is an ordinary Linux program: `x86_64-unknown-linux-musl`, real
+# std, real libc, raw ioctls; see docs/runbooks/amd64-fbdev-wgpu-demo.md.
+[workspace]
+
+[package]
+name = "akuma-cli-wgpu"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "akuma-wgpu"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately tiny so the self-hosted on-box toolchain can build it:
+#   * libc        — open/ioctl/mmap/munmap, termios, poll, signal. The fbdev
+#                   ABI (FBIOGET_* structs + 0x46xx numbers) is declared
+#                   locally in `fb.rs` so the exact bytes that cross the
+#                   syscall boundary are visible in our tree — the kernel side
+#                   of those bytes is slice S4 of the runbook.
+#   * no clap     — hand-rolled arg parsing (the template's clap surface is
+#                   two subcommands and one boolean).
+#   * no rand     — xorshift64* in `rng.rs` (visuals only).
+#   * no crossterm — `input.rs` does termios raw mode + `poll(2)` + its own
+#                   escape-sequence decode; that is all crossterm would do for
+#                   us, and rio will not have it either.
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+overflow-checks = false
+# opt-level=3, not the workspace's "z": this program is compute-bound (a
+# software rasterizer), not I/O-bound. It is staged onto the disk like ruststd,
+# so its size is a few MiB and nobody minds.
+opt-level = 3
