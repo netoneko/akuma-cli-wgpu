@@ -148,13 +148,14 @@ these to change — update this table and say why in your report.
 
 | config | akuma_40 | akuma_79 | akuma_120 | akuma_20 | avg render |
 |---|---|---|---|---|---|
-| 1280×720, 120 frames | `1c264f04` | `489f0d15` | `93efaaa0` | `88be4cc4` | 1.44–1.59 ms/frame (628–693 fps) |
-| 3840×2160, 120 frames | `6c21dff8` | `519cada9` | `f80e85c3` | `5e4d47f7` | 10.81 ms/frame (~92 fps) |
+| 1280×720, 120 frames | `e2d09484` | `6d843915` | `c0c7d7a0` | `b818d9c4` | see done-log Task 5 |
+| 3840×2160, 120 frames | `89e08bf8` | `9ead0da9` | `9bf8edc3` | `5f15aff7` | 10.74 ms/frame (~93 fps) |
 
-**Changed 2026-10-03 — matrix rain rework, intentional** (done-log Task 4): the backdrop went
-from 1-px streaks to cell-based Matrix columns, so every frame's bits changed and the table was
-re-measured on the box; two consecutive 720p runs print identical values. The mesh math is
-untouched (`Scene::center_x` defaults to mid-frame in selftest), so these remain the
+**Changed 2026-10-03 twice — intentional.** (1) Matrix rain rework (done-log Task 4): the
+backdrop went from 1-px streaks to cell-based Matrix columns. (2) Rain packed to a column per
+cell column (Task 5) — the user asked for a denser, always-present matrix. Every frame's bits
+changed; the table was re-measured on the box after each change. The mesh math is untouched
+(`Scene::center_x` defaults to mid-frame in selftest), so these remain the
 renderer-equivalence target — see "The wgpu backend (M3)" for the one path that misses it.
 
 Re-verified 2026-10-03 after the fb.rs u16 fix, the clock hardening and the signal-handler
@@ -284,6 +285,23 @@ what its absence does.
   `screensaver --timeout 2` = 96 frames @ 45.9 fps, both 4K, clean timeout exits.
 - **Could not verify:** how the new rain actually looks to a human is on the panel right now —
   the ASCII dumps only approximate it. The wgpu mesh defect is documented, not fixed.
+
+### Task 5 — a packed Matrix, the biggest cat by default, and the start of the wgpu mesh hunt — DONE 2026-10-03
+
+- **Rain packed** (asked for: "more packed … there the whole time"): one rain column per cell
+  column instead of every second one — ~160 columns at 4K/16:9, double Task 4's density. The
+  rain was already drawn every frame of every mode (shared `backdrop`); the density is what
+  makes it read as always-there. Checksums re-measured (table above); 4K avg 10.74 ms/frame;
+  live `screensaver --timeout 2` at 4K: 39.9 fps (bigger cat + denser rain, still comfortably
+  screensaver territory).
+- **The show starts on `akuma_120`** (asked for: "the biggest one"): new `DEFAULT_ASSET = 2`
+  in `main.rs`; Left/Right still cycles all four. selftest still walks the four assets in
+  ASSETS order, so the table's columns keep their meaning.
+- **wgpu mesh hunt, started** (the next list item: the M3 acceptance). Timeboxed to a survey
+  this session: `interp.rs`'s `MathFunction::Sin/Cos/Min` and `backend.rs`'s rasterizer
+  (`edge_xz` verbatim, fma area test, strict `z <`) look correct — suspicion narrows to
+  `vs_main` expression evaluation or the tri storage-buffer read. Repro in "The wgpu backend
+  (M3)" stands; not cracked here.
 
 ## Tasks, in order
 

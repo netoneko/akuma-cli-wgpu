@@ -74,6 +74,9 @@ const AKUMA_79: &str = include_str!("akuma_79.txt");
 const AKUMA_120: &str = include_str!("akuma_120.txt");
 const ASSETS: [&str; 4] = [AKUMA_40, AKUMA_79, AKUMA_120, AKUMA_20];
 const ASSET_NAMES: [&str; 4] = ["akuma_40", "akuma_79", "akuma_120", "akuma_20"];
+/// where the live show starts: the biggest logo (index into ASSETS). The
+/// selftest still walks all four in ASSETS order; Left/Right cycles from here.
+const DEFAULT_ASSET: usize = 2;
 
 struct Options {
     mode: Mode,
@@ -240,10 +243,10 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
     let mut frame = Frame::new(dev.width, dev.height);
     let mut renderer = RenderPath::new(opts.wgpu, dev.width, dev.height);
 
-    // asset 0 is the template's default (akuma_40); Left/Right cycle. The
-    // matrix subcommand runs with no mesh at all — rain only, like the
-    // template's `matrix` mode.
-    let mut asset_idx: usize = 0;
+    // the show starts on the biggest logo (akuma_120); Left/Right cycles
+    // all four. The matrix subcommand runs with no mesh at all — rain only,
+    // like the template's `matrix` mode.
+    let mut asset_idx: usize = DEFAULT_ASSET;
     let mut scene = if with_asset {
         build_scene(opts, ASSETS[asset_idx], dev.width, dev.height)
     } else {

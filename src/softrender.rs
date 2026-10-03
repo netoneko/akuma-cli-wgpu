@@ -13,8 +13,9 @@
 //!   71 MB/s failure mode; full spans are the 3026 MB/s one.
 //! * The rain backdrop is the template's Matrix columns on a *virtual
 //!   character grid*: cells sized like terminal cells (height = frame/45,
-//!   the kernel console's HD-font row on the 4K panel; width 1:2), one rain
-//!   column every two cell columns (the template's wide-char `step_by(2)`),
+//!   the kernel console's HD-font row on the 4K panel; width 1:2), a rain
+//!   column per cell column (packed twice denser than the template's
+//!   wide-char `step_by(2)`),
 //!   trails of discrete glyphs — near-white head, purple->cyan fading tail,
 //!   per-cell flicker with the occasional dark cell. (The first port drew
 //!   1-px streaks, which read as shooting stars on a 4K panel.) Still no
@@ -156,7 +157,7 @@ impl Column {
         // gap, so stacked cells read as separate glyphs on a character grid
         let gw = (cw * 3 / 4).max(2);
         let gh = (ch * 5 / 6).max(2);
-        let gx = self.col * cw * 2 + (cw - gw) / 2;
+        let gx = self.col * cw + (cw - gw) / 2;
         // flicker re-rolls ~12x/s; the same tick for the whole frame keeps
         // every cell stable within the frame (a pure function of scene+time)
         let tick = (time * 12.0) as u64;
@@ -196,9 +197,9 @@ impl Column {
 impl Scene {
     pub fn new(tris: Vec<Tri>, extent: f32, with_rain: bool, frame_w: usize, frame_h: usize) -> Scene {
         let mut rng = Rng::with_seed(RAIN_SEED);
-        // one column every two cell columns, like the template's wide-char
-        // `step_by(2)`; density tracks the cell, so the rain looks the same
-        // at any resolution (~80 columns on 16:9)
+        // a column per cell column — packed twice denser than the
+        // template's wide-char `step_by(2)`; density tracks the cell, so
+        // the rain looks the same at any resolution (~160 columns on 16:9)
         let rain = if with_rain {
             rain_columns(frame_w, frame_h, &mut rng)
         } else {
@@ -216,7 +217,7 @@ impl Scene {
     pub fn resize_rain(&mut self, frame_w: usize, frame_h: usize, with_rain: bool) {
         let want = if with_rain {
             let (cw, _) = cell_metrics(frame_h);
-            (frame_w as i64 / (cw * 2)).max(0) as usize
+            (frame_w as i64 / cw).max(0) as usize
         } else {
             0
         };
