@@ -148,13 +148,16 @@ these to change — update this table and say why in your report.
 
 | config | akuma_40 | akuma_79 | akuma_120 | akuma_20 | avg render |
 |---|---|---|---|---|---|
-| 1280×720, 120 frames | `e2d09484` | `6d843915` | `c0c7d7a0` | `b818d9c4` | see done-log Task 5 |
-| 3840×2160, 120 frames | `89e08bf8` | `9ead0da9` | `9bf8edc3` | `5f15aff7` | 10.74 ms/frame (~93 fps) |
+| 1280×720, 120 frames | `20365fb4` | `d0e5069d` | `a3614304` | `63bcb2d0` | 1.46 ms/frame (~686 fps) |
+| 3840×2160, 120 frames | `39155478` | `40cb1469` | `b095c423` | `e4574017` | 10.67 ms/frame (~94 fps) |
 
 **Changed 2026-10-03 twice — intentional.** (1) Matrix rain rework (done-log Task 4): the
 backdrop went from 1-px streaks to cell-based Matrix columns. (2) Rain packed to a column per
 cell column (Task 5) — the user asked for a denser, always-present matrix. Every frame's bits
-changed; the table was re-measured on the box after each change. The mesh math is untouched
+changed; the table was re-measured on the box after each change. (3) Task 7 fixed the frozen
+live rain (see done-log): column count now matches between builder and resizer, so the show
+loop no longer rebuilds the rain every frame — positions and per-column speeds are back. The
+mesh math is untouched
 (`Scene::center_x` defaults to mid-frame in selftest), so these remain the
 renderer-equivalence target — see "The wgpu backend (M3)" for the one path that misses it.
 
@@ -302,6 +305,37 @@ what its absence does.
   (`edge_xz` verbatim, fma area test, strict `z <`) look correct — suspicion narrows to
   `vs_main` expression evaluation or the tri storage-buffer read. Repro in "The wgpu backend
   (M3)" stands; not cracked here.
+
+### Task 6 — rain motion is time-based — DONE 2026-10-03
+
+- Reported on the box: on the wgpu path the rain sat frozen at its initial layout. Root cause:
+  rain stepped per *frame*, and the interpreter runs ~seconds per frame at 4K, so between two
+  presented frames the rain moved <1 cell — visually frozen (its slowness and the tiny mesh
+  are the known M3 items). Fix: `backdrop` now derives a clamped `dt` from `time`
+  (`Scene::last_t`), columns step `speed * dt * 60` cells — identical visuals at 60 fps,
+  correct motion at any fps, still a pure function of `time` (rule 5). Checksums re-measured
+  (table above; asset-switch jumps clamp to 0.1 s, hence slightly higher last-frame coverage);
+  4K avg 10.98 ms/frame.
+
+### Task 7 — the live rain was frozen at spawn — DONE 2026-10-03
+
+- Reported on the box: on the live show the matrix columns never moved down, but their colors
+  kept animating. Root cause: Task 5 changed `resize_rain` and `Column::draw` to one column
+  per *cell* column (`frame_w / cw`), but the builder `rain_columns` still produced half that
+  (`frame_w / (cw * 2)`). The show loop calls `scene.resize_rain` every frame, saw
+  `want != rain.len()`, and rebuilt the rain from `RAIN_SEED` every frame — positions reset
+  constantly (frozen), while hue drift and flicker (pure functions of `time` inside `draw`)
+  kept changing. The selftest never resizes, which is why its frames looked right.
+- Fix, three lines of substance: `rain_columns` now builds `frame_w / cw` columns (matching
+  the resizer, so the per-frame rebuild is gone); `Column::step` applies the per-column speed
+  again (`y += dt_cells * speed` — Task 6's dt conversion had dropped it, making every column
+  uniform-speed); `backdrop` passes rows in *cell* units (`frame_h / ch`) to `step`, the same
+  unit `Column::new` spawns in, so respawn off the bottom actually fires.
+- Verified: 720p selftest twice — bit-identical across runs; new checksums in the table
+  (coverage back up to ~6%, the doubled column count). Movement proved by diffing
+  `selftest --dump` last frames at `--frames 40` vs `--frames 100`: trails advance several
+  rows deeper over the extra second (frozen rain dumps were identical). Live
+  `matrix --timeout 2`: 113 frames @ 54 fps on the panel.
 
 ## Tasks, in order
 

@@ -52,6 +52,9 @@ pub struct Scene {
     pub extent: f32,
     /// rain state; empty when the backdrop is off
     rain: Vec<Column>,
+    /// last `time` the rain stepped (rain motion is time-based, so a slow
+    /// path — the wgpu interpreter runs seconds per frame — still moves)
+    last_t: f32,
     /// screen x the mesh orbits around. Defaults to mid-frame; the live
     /// screensaver parks it at quarter width (the trashcan's panel is dead
     /// on the right half — the rain still spans the whole frame). selftest
@@ -114,8 +117,7 @@ fn cell_metrics(frame_h: usize) -> (i64, i64) {
 /// same speed classes and hue re-rolls, but in *cell* units so the rain
 /// reads as columns of glyphs instead of 1-px streaks.
 struct Column {
-    /// cell column index; one rain column every two cell columns, the
-    /// template's wide-char `step_by(2)`
+    /// cell column index; one rain column per cell column
     col: i64,
     /// head row in cells (y grows downward, the tail trails above)
     y: f32,
@@ -137,8 +139,8 @@ impl Column {
         }
     }
 
-    fn step(&mut self, rows: i64, rng: &mut Rng) {
-        self.y += self.speed;
+    fn step(&mut self, rows: i64, dt_cells: f32, rng: &mut Rng) {
+        self.y += dt_cells * self.speed;
         if self.y - self.len as f32 > rows as f32 {
             // respawn above the top with fresh stats
             self.y = -(rng.below(rows.max(1) as u64 / 2 + 1) as f32);
@@ -210,6 +212,7 @@ impl Scene {
             extent,
             rain,
             center_x: frame_w as f32 / 2.0,
+            last_t: 0.0,
         }
     }
 
@@ -231,7 +234,7 @@ impl Scene {
 fn rain_columns(frame_w: usize, frame_h: usize, rng: &mut Rng) -> Vec<Column> {
     let (cw, ch) = cell_metrics(frame_h);
     let rows = (frame_h as i64 / ch).max(1);
-    let cols = frame_w as i64 / (cw * 2);
+    let cols = frame_w as i64 / cw;
     (0..cols).map(|col| Column::new(col, rows, rng)).collect()
 }
 
@@ -253,9 +256,21 @@ fn rain_columns(frame_w: usize, frame_h: usize, rng: &mut Rng) -> Vec<Column> {
 pub fn backdrop(frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
     frame.clear(BG);
     if with_rain {
+        // rain motion is time-based: dt seconds → cell-steps (speed is
+        // cells per 1/60 s, so 60 fps reproduces the old per-frame step).
+        // A slow path (the wgpu interpreter: seconds per frame) now still
+        // shows rain moving at the same visual speed. dt is clamped and is
+        // a pure function of `time`, so rendering stays deterministic.
+        let dt = (time - scene.last_t).clamp(0.0, 0.1);
+        scene.last_t = time;
+        let dt_cells = dt * 60.0;
+        // rows in *cell* units — the same unit `Column::new` spawns in, so
+        // the respawn test actually fires once a trail falls off the bottom
+        let (_, ch) = cell_metrics(frame.height);
+        let rows = (frame.height as i64 / ch).max(1);
         let mut rng = Rng::with_seed(time.to_bits() as u64 ^ RAIN_SEED);
         for col in &mut scene.rain {
-            col.step(frame.height as i64, &mut rng);
+            col.step(rows, dt_cells, &mut rng);
             col.draw(frame, time);
         }
     }
