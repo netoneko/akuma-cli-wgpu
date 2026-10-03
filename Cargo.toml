@@ -29,6 +29,18 @@ path = "src/main.rs"
 #                   us, and rio will not have it either.
 libc = "0.2"
 
+# Milestone M3 (docs/runbooks/amd64-fbdev-wgpu-demo.md §5): the custom-backend
+# seam. default-features=false keeps every real GPU backend (vulkan/gles/metal/
+# dx12/webgl) out of the build; "custom" is the supported no-fork hook
+# (wgpu::Instance::from_custom), "wgsl" pulls the WGSL front-end through
+# wgpu-core so shader modules arrive here as naga IR to interpret — no JIT,
+# no W^X fight (§5b option A).
+wgpu = { version = "30", default-features = false, features = ["std", "custom", "wgsl"] }
+# Our backend does its own WGSL parsing (wgpu hands ShaderSource::Wgsl to the
+# custom device untouched — wgpu-core never sees it on the custom path), so the
+# front-end must live here: wgsl-in, pure Rust, nothing executed.
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
+
 [profile.release]
 panic = "abort"
 lto = true

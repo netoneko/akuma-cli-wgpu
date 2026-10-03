@@ -188,6 +188,28 @@ impl Scene {
 // Renderer
 // ---------------------------------------------------------------------------
 
+/// The shared backdrop of both render paths: clear the frame, then step and
+/// draw the matrix rain. `Renderer::render` (software) and
+/// `wgpu_backend::WgpuRenderer::render` both call this so the backdrop is
+/// bit-identical by construction — the M3 acceptance is about the *mesh*
+/// pixels, and keeping the rain in one place on the CPU is what makes the
+/// frame checksums comparable at all. (The rain is a u64 xorshift; it has no
+/// business in a WGSL shader, and rio's sugarloaf will not ship one either.)
+///
+/// Seeded from the frame time: identical across a selftest's runs (its times
+/// are exact), never repeated in a live show — the rain steps stay a pure
+/// function of (scene, time).
+pub fn backdrop(frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
+    frame.clear(BG);
+    if with_rain {
+        let mut rng = Rng::with_seed(time.to_bits() as u64 ^ RAIN_SEED);
+        for col in &mut scene.rain {
+            col.step(frame.height, &mut rng);
+            col.draw(frame, time);
+        }
+    }
+}
+
 /// Fixed directional light, roughly "from the upper left, out of the screen".
 const LIGHT: [f32; 3] = [-0.45, 0.65, 0.62];
 
@@ -221,7 +243,7 @@ impl Renderer {
     /// the hue wave); the rain steps and draws as the backdrop first.
     pub fn render(&mut self, frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
         self.time = time;
-        frame.clear(BG);
+        backdrop(frame, scene, time, with_rain);
         // Refill the z-buffer — the module doc promises this per frame and
         // the frame-cost budget counts on it (33 MB WB fill at 4K). Without
         // it, stale depths from the previous frame reject the rotating mesh
@@ -229,16 +251,6 @@ impl Renderer {
         // assets (79/120, whose surfaces travel farthest in z per frame)
         // vanish entirely within a few dozen frames.
         self.z.fill(f32::INFINITY);
-        if with_rain {
-            // Seeded from the frame time: identical across a selftest's runs
-            // (its times are exact), never repeated in a live show — the rain
-            // steps stay a pure function of (scene, time).
-            let mut rng = Rng::with_seed(self.time.to_bits() as u64 ^ RAIN_SEED);
-            for col in &mut scene.rain {
-                col.step(frame.height, &mut rng);
-                col.draw(frame, time);
-            }
-        }
 
         // the screensaver orbit: slow yaw, capped pitch wobble. The cap
         // matters: catlogo::extrude skips bottom faces assuming the camera

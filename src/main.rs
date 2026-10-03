@@ -19,6 +19,12 @@
 //! fps, MB written, MB/s — directly comparable to the kernel banner's
 //! `[fb] ... clear 10.9ms = 3026MB/s` line.
 
+// deep trait-solver recursion: proving our custom-backend futures Send walks
+// the whole wgpu dispatch enum (including wgpu-core's hub types), which
+// overflows the default depth of 128 with a spurious "overflow evaluating
+// the requirement" warning
+#![recursion_limit = "512"]
+
 mod catlogo;
 mod clock;
 mod fb;
@@ -34,6 +40,32 @@ use catlogo::HeightField;
 use fb::{FbDevice, Frame};
 use input::{Key, RawTty};
 use softrender::{Renderer, Scene};
+
+/// Which renderer draws the frames: the software rasterizer (M2, the
+/// reference) or the wgpu custom backend (M3). Same frame signature on both
+/// — that is the milestone's whole point.
+enum RenderPath {
+    Soft(Renderer),
+    Wgpu(wgpu_backend::WgpuRenderer),
+}
+
+impl RenderPath {
+    fn new(wgpu_path: bool, w: usize, h: usize) -> RenderPath {
+        if wgpu_path {
+            eprintln!("[wgpu] {}", wgpu_backend::STATUS);
+            RenderPath::Wgpu(wgpu_backend::WgpuRenderer::new(w, h))
+        } else {
+            RenderPath::Soft(Renderer::new(w, h))
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
+        match self {
+            RenderPath::Soft(r) => r.render(frame, scene, time, with_rain),
+            RenderPath::Wgpu(r) => r.render(frame, scene, time, with_rain),
+        }
+    }
+}
 
 /// The assets, embedded like the template embeds them.
 const AKUMA_20: &str = include_str!("akuma_20.txt");
@@ -169,11 +201,6 @@ fn main() {
 
     input::install_signal_handlers();
 
-    if opts.wgpu {
-        eprintln!("{}", wgpu_backend::STATUS);
-        return;
-    }
-
     let code = match opts.mode {
         Mode::Selftest => run_selftest(&opts),
         Mode::Matrix => run_show(&opts, /*asset overlay*/ false),
@@ -209,7 +236,7 @@ fn run_show(opts: &Options, with_asset: bool) -> i32 {
     );
 
     let mut frame = Frame::new(dev.width, dev.height);
-    let mut renderer = Renderer::new(dev.width, dev.height);
+    let mut renderer = RenderPath::new(opts.wgpu, dev.width, dev.height);
 
     // asset 0 is the template's default (akuma_40); Left/Right cycle. The
     // matrix subcommand runs with no mesh at all — rain only, like the
@@ -308,7 +335,7 @@ fn run_selftest(opts: &Options) -> i32 {
         opts.width, opts.height, opts.frames, opts.fps, opts.latin
     );
     let mut frame = Frame::new(opts.width, opts.height);
-    let mut renderer = Renderer::new(opts.width, opts.height);
+    let mut renderer = RenderPath::new(opts.wgpu, opts.width, opts.height);
     let mut total_ns: u128 = 0;
     let mut checksum: u32 = 0;
 
