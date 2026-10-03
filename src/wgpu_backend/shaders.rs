@@ -23,16 +23,19 @@
 //! divide, no viewport transform — those fixed-function stages do not exist
 //! on this device, and the demo's math never wanted them.
 
-/// Per-frame scalars. All four are f32 so the layout is one vec4 with no
-/// struct-padding rules involved anywhere.
+/// Per-frame scalars, all f32 (no padding rules involved anywhere):
 ///
-/// * time   — seconds since start, the exact f32 softrender received
-/// * width  — frame width as f32 (exact: <= 2^24)
-/// * height — frame height as f32
-/// * extent — scene.extent: world extent of the larger grid axis
+/// * time     — seconds since start, the exact f32 softrender received
+/// * width    — frame width as f32 (exact: <= 2^24)
+/// * height   — frame height as f32
+/// * extent   — scene.extent: world extent of the larger grid axis
+/// * center_x — screen x the mesh is centered on (`Scene::center_x`; the
+///              live screensaver parks the logo on the left half of the
+///              panel, selftest keeps the mid-frame default)
 ///
-/// (The uniform is a plain `vec4<f32>` bound at group 0 / binding 0; the mesh
-/// is `array<Tri>` at group 0 / binding 1 with a 48-byte stride — vec3<f32>
+/// (The uniform is a plain 8xf32 struct — two vec4s' worth, no struct-
+/// padding rules involved — bound at group 0 / binding 0; the mesh is
+/// `array<Tri>` at group 0 / binding 1 with a 48-byte stride — vec3<f32>
 /// has 16-byte alignment.)
 
 /// The cat-logo mesh: one `Tri` per softrender `Tri`, padded to the WGSL
@@ -44,8 +47,21 @@ struct Tri {
     c: vec3<f32>,
 };
 
-// (time, width, height, extent) — see mod.rs for who fills it
-@group(0) @binding(0) var<uniform> frame: vec4<f32>;
+// (time, width, height, extent, center_x) — see mod.rs for who fills it
+struct Uniforms {
+    time: f32,
+    width: f32,
+    height: f32,
+    extent: f32,
+    // screen x the mesh is centered on: scene.center_x — mid-frame in the
+    // selftest, quarter width in the live screensaver (dead right half)
+    center_x: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+};
+
+@group(0) @binding(0) var<uniform> frame: Uniforms;
 @group(0) @binding(1) var<storage, read> tris: array<Tri>;
 
 // the ten xterm-256 PURPLE_BLUE_HUES of akuma-cli, decoded to RGB, in
@@ -101,10 +117,10 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     }
 
     // ---- Renderer::transform, same op order ----
-    let time = frame.x;
-    let width = frame.y;
-    let height = frame.z;
-    let extent = frame.w;
+    let time = frame.time;
+    let width = frame.width;
+    let height = frame.height;
+    let extent = frame.extent;
 
     let yaw = time * 0.55;
     let pitch = 0.16 + 0.10 * sin(time * 0.7);
@@ -116,7 +132,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     let sy = sin(yaw);
     let cp = cos(pitch);
     let sp = sin(pitch);
-    let cx = width / 2.0;
+    let cx = frame.center_x;
     let cypix = height / 2.0;
 
     // yaw around Y

@@ -223,6 +223,10 @@ impl Frame {
     }
 
     #[inline]
+    /// Single-pixel write. Unused since the rain went cell-based (cells
+    /// draw with `span`, which is the WC-friendly shape anyway); kept as
+    /// part of the Frame surface, like the FBIOPUT* constants in this file.
+    #[allow(dead_code)]
     pub fn pixel(&mut self, x: i64, y: i64, rgb: u32) {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             return;

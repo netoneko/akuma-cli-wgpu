@@ -3,7 +3,8 @@
 A 3D screensaver of the Akuma cat logo that draws straight into the framebuffer. It is the first
 user of a Linux-standard framebuffer device (`/dev/fb0`) on the Akuma amd64 kernel. The real goal
 behind it is to run the **rio terminal** on Akuma's screen later, through a wgpu backend that
-renders into that same framebuffer.
+renders into that same framebuffer. The wgpu-backend half of that exists now
+(`src/wgpu_backend/`, milestone M3 — see "The wgpu backend (M3)" below); rio is still ahead.
 
 This README is the brief for whoever works on this repo next. If you are an agent, read all of it
 before changing anything.
@@ -13,10 +14,12 @@ before changing anything.
 1. **Plain Linux only.** This is an ordinary `x86_64-unknown-linux-musl` program using `std` and
    the `libc` crate. **Never use `libakuma`** or any Akuma-private syscall. rio and wgpu will run
    on this substrate without knowing Akuma exists, so this demo must too.
-2. **Keep dependencies tiny.** The only dependency today is `libc`. It has to build with the
-   nightly musl toolchain that runs *on the Akuma box itself*. Do not add `clap`, `rand`,
-   `crossterm` or similar; the code has its own replacements on purpose (see `Cargo.toml`).
-   wgpu and naga arrive later, in milestone M3, and only there.
+2. **Keep dependencies tiny.** Three, no more: `libc`; `wgpu` with
+   `default-features = false, features = ["std", "custom", "wgsl"]` (no real GPU backend
+   gets built); and `naga` with `wgsl-in` only (our half of shader parsing on the custom
+   path — see `Cargo.toml`). It all has to build with the nightly musl toolchain that runs
+   *on the Akuma box itself*. Do not add `clap`, `rand`, `crossterm` or similar; the code
+   has its own replacements on purpose.
 3. **Standalone crate.** `Cargo.toml` has an empty `[workspace]` table on purpose. Do not join
    any other workspace.
 4. **Small edits, rebuild after each one.** Two sessions in a row have lost code to large edits
@@ -71,6 +74,9 @@ cargo build --release --target x86_64-unknown-linux-musl
   and `matrix` run on metal: ~46-50 fps at 4K including the present pass (the selftest math
   predicted ~45), write rate 1.5-1.8 GB/s effective. `selftest` needs no device and remains
   the test you can always run.
+- `selftest --wgpu` runs the same headless test through the wgpu backend (M3). Its rain
+  backdrop is bit-identical to the software path (shared CPU code), but the **mesh is not**
+  yet — see "The wgpu backend (M3)" — so its checksums do not match the baseline table.
 - SIGINT/SIGTERM kill the process immediately with exit status 0 — see the kernel
   signal-delivery bug in the done-log (a handler returning to userspace is not survivable on
   this kernel yet). There is **no metrics report on a signal death**; use `--timeout N` for a
@@ -96,12 +102,42 @@ ANSI-terminal screensaver with the same subcommands, `--latin`, arrow keys to sw
 | `src/rng.rs` | xorshift64* with a splitmix64-seeded `with_seed` constructor; the render path never touches wall-clock or ASLR entropy (rule 5) |
 | `src/input.rs` | termios raw mode, `poll(2)` and escape-sequence decoding; SIGINT/SIGTERM exit the process immediately (kernel signal bug — see done-log) |
 | `src/clock.rs` | `Pacer` (sleeps out the frame budget) and `FpsMeter` (live fps, over-budget count, slowest frame) — EINTR-tolerant `CLOCK_MONOTONIC`/`nanosleep`, never std `Instant` (kernel note in `input.rs`) |
-| `src/wgpu_backend.rs` | placeholder for milestone M3; `--wgpu` prints its status and exits |
+| `src/wgpu_backend/` | **milestone M3, the wgpu custom backend — exists now.** `mod.rs`: `WgpuRenderer`, the exact `new(w, h)`/`render(&mut frame, &mut scene, time, with_rain)` surface of the software `Renderer`, so `--wgpu` swaps paths in one place. `backend.rs`: the `wgpu::custom::*` device/adapter/queue plus the fixed-function rasterizer under contract to mirror softrender's scanline walk. `interp.rs`: the naga-IR interpreter — no JIT, the kernel refuses W^X (plan §5b A). `shaders.rs`: the WGSL, line-for-line ports of softrender's per-frame math. Status: runs, rain identical, **mesh not yet frame-identical** — see "The wgpu backend (M3)" |
 | `src/akuma_{20,40,79,120}.txt` | the logo at four sizes; `akuma_40.txt` is byte-identical to the kernel's boot-banner asset |
 
 Composing each frame in ordinary RAM and copying whole rows into the mapping is deliberate. The
 kernel maps the framebuffer write-combining, which is fast for full-row copies (~3000 MB/s on the
 box) and slow for scattered writes (~71 MB/s). Keep that property in anything you change.
+
+## The wgpu backend (M3) — exists, one known defect
+
+`--wgpu` renders any mode through the custom backend instead of the software rasterizer:
+`wgpu::Instance::from_custom(backend::Instance)` (wgpu 30, `features = ["custom", "wgsl"]`, no
+real GPU backends in the build), WGSL parsed by naga into IR and *interpreted* (`interp.rs`) —
+no JIT, the kernel refuses writable-and-executable memory (plan §5b option A). Rasterization is
+fixed-function in `backend.rs`, under contract to mirror softrender's scanline walk exactly
+(same `mul_add` area test and `-0.01` cull, same edge/z interpolation, strict `z <` depth test).
+
+Verified on 2026-10-03, on this tree:
+
+* Both paths run end to end on the box: live `screensaver`/`matrix` into `/dev/fb0`, headless
+  `selftest --wgpu` (`SELFTEST OK`).
+* The **rain backdrop is bit-identical** on the two paths — it is shared CPU code
+  (`softrender::backdrop`), so it cannot diverge.
+* The per-frame uniform carries `(time, width, height, extent, center_x)` as eight plain f32s.
+  An A/B of the previous 16-byte `vec4` uniform against the current 32-byte struct produced
+  byte-identical wgpu output — the uniform layout is not involved in the defect below.
+
+Not verified — the M3 acceptance is currently **not met**:
+
+* `selftest --wgpu` frames do **not** equal the software frames: mesh coverage lands at
+  0.9–1.5% vs 5.1–6.3% on the software path, and the `--dump` pictures show a cat roughly
+  1/3 the expected size, shrunk toward mid-frame. The A/B above rules out the uniform; the
+  defect predates 2026-10-03's edits and lives somewhere in the mesh path — `vs_main`
+  interpretation, the tri storage-buffer read (48-byte stride), or the fixed-function
+  rasterizer. Repro (cheap, the interpreter is slow at big frames):
+  `selftest --w 256 --h 144 --frames 8 --dump` vs the same with `--wgpu` — the rain rows diff
+  clean, only the mesh differs. Next session starts there.
 
 ## Baseline: selftest checksums and timings (2026-10-03)
 
@@ -112,17 +148,24 @@ these to change — update this table and say why in your report.
 
 | config | akuma_40 | akuma_79 | akuma_120 | akuma_20 | avg render |
 |---|---|---|---|---|---|
-| 1280×720, 120 frames | `1fb62b0e` | `106fe365` | `2000460c` | `d9cef3ca` | 1.46 ms/frame (686 fps) |
-| 3840×2160, 120 frames | `6ad3744e` | `caf9295f` | `38f2e499` | `45c6878d` | 10.65–10.74 ms/frame (~94 fps) |
+| 1280×720, 120 frames | `1c264f04` | `489f0d15` | `93efaaa0` | `88be4cc4` | 1.44–1.59 ms/frame (628–693 fps) |
+| 3840×2160, 120 frames | `6c21dff8` | `519cada9` | `f80e85c3` | `5e4d47f7` | 10.81 ms/frame (~92 fps) |
+
+**Changed 2026-10-03 — matrix rain rework, intentional** (done-log Task 4): the backdrop went
+from 1-px streaks to cell-based Matrix columns, so every frame's bits changed and the table was
+re-measured on the box; two consecutive 720p runs print identical values. The mesh math is
+untouched (`Scene::center_x` defaults to mid-frame in selftest), so these remain the
+renderer-equivalence target — see "The wgpu backend (M3)" for the one path that misses it.
 
 Re-verified 2026-10-03 after the fb.rs u16 fix, the clock hardening and the signal-handler
 change: **checksums identical**, `SELFTEST OK` on every build.
 
 Where the 4K render milliseconds go (probe measurements): the two 33.2 MB fills — `frame.clear`
 (~3.5 ms) and the z-buffer refill (~3.4 ms) — are ~64% of the frame; the raster is the rest
-(~1 ms for the 442-tri `akuma_20` up to ~2.8 ms for the 8538-tri `akuma_120`); rain is
-negligible (~0.03 ms). Do not "optimise" the z refill away — see the done-log for what its
-absence does.
+(~1 ms for the 442-tri `akuma_20` up to ~2.8 ms for the 8538-tri `akuma_120`); rain is no
+longer free since the cell rework but stays small (the 4K average moved 10.7 → 10.8 ms/frame,
+so the new rain costs ≲0.15 ms). Do not "optimise" the z refill away — see the done-log for
+what its absence does.
 
 ## Done-log
 
@@ -209,6 +252,39 @@ absence does.
   unwrapping it (std's `Instant::now` aborts on EINTR; that was the original crash signature).
   selftest numbers unchanged.
 
+### Task 4 — docs catch-up on the wgpu backend, a Matrix that reads as Matrix, logo on the living half of the panel — DONE 2026-10-03
+
+- **Docs caught up with the wgpu backend (M3), which a previous session built without
+  updating this README** (`src/wgpu_backend.rs` "placeholder" → the real
+  `src/wgpu_backend/{mod,backend,interp,shaders}.rs`; rule 2's dependency list; a status
+  section "The wgpu backend (M3)"; `main.rs` USAGE and `Options::wgpu` no longer claim "not
+  wired yet"; `docs/fbdev-wgpu-plan.md` got a status banner). Documenting included *running*
+  it: the rain is bit-identical across paths, the mesh is **not** — pre-existing defect,
+  details in the M3 section, not debugged in this task.
+- **Matrix rain rework** (asked for: it "looked like shooting stars, not a matrix"). The old
+  rain drew 1-px-wide, 4–17-px streaks — shooting stars at 4K. Now the template's
+  character-grid idea, made explicit in `softrender.rs`: `cell_metrics()` sizes a virtual
+  terminal cell (height = frame_h/45 — the kernel console's HD-font row at 4K — width 1:2,
+  clamped), one rain column every two cell columns (the template's wide-char `step_by(2)`,
+  ~80 columns at 16:9), trails of 6–30 discrete glyph boxes (¾ cell wide, ⅚ cell tall, drawn
+  with `Frame::span` — full horizontal spans, the WC-friendly shape), near-white head,
+  purple→cyan hue drift down the tail, per-cell flicker with ~1 in 5 cells dark, keyed
+  deterministically by (column, row, 12 Hz tick) through `Rng::with_seed` — no new entropy,
+  rule 5 intact. Speeds 0.055–0.22 cells/frame ≈ 3–13 rows/s at 60 fps. `Frame::pixel` is
+  unused since (kept with `#[allow(dead_code)]`, like the FBIOPUT constants).
+- **Logo parked on the left half** (asked for: the panel is dead on its right half).
+  `Scene::center_x` (default: mid-frame) is read by the software `transform` and shipped to
+  the WGSL via the uniform, now 32 bytes / 8 f32s. The live `screensaver` sets quarter width
+  in `build_scene`; the rain still spans the whole frame; `selftest` keeps the default so
+  its checksums stay about the renderers. A/B: old vec4 uniform vs new struct → byte-identical
+  wgpu output, so the uniform change is exonerated (see the M3 section).
+- **Checksums re-measured** — the rain rework changes every frame's bits, so the baseline
+  table was updated per this README's own rule; two consecutive 720p runs identical; 4K avg
+  10.81 ms/frame. Live metal after the rework: `matrix --timeout 3` = 167 frames @ 53.9 fps,
+  `screensaver --timeout 2` = 96 frames @ 45.9 fps, both 4K, clean timeout exits.
+- **Could not verify:** how the new rain actually looks to a human is on the panel right now —
+  the ASCII dumps only approximate it. The wgpu mesh defect is documented, not fixed.
+
 ## Tasks, in order
 
 ### Task 3 — a raw C probe for `/dev/fb0` (kernel-side preparation) — DONE 2026-10-03 (see done-log; the probe found a live `/dev/fb0` and an fb.rs ABI bug)
@@ -231,12 +307,10 @@ framebuffer, which is how its expected output gets calibrated.
 
 ### Later — not now, unless asked
 
-- **M3, the wgpu backend:** wgpu 30 with `features = ["custom", "wgsl"]`, a custom backend
-  through `wgpu::Instance::from_custom`, and WGSL shaders *interpreted* from naga IR. The
-  kernel refuses writable-and-executable memory, so a cranelift JIT is not an option.
-  `jgraef/wgpu-cpu` is a useful reference, but it has **no license**, so read it and do not copy
-  it. Acceptance: the wgpu path produces the same frames as `softrender` — the checksums in
-  "Baseline" above are the concrete target.
+- **M3, the wgpu backend:** implemented since (see "The wgpu backend (M3)" above). What
+  remains of it is the acceptance: frames bit-identical to `softrender` — the checksums in
+  "Baseline" are the concrete target, and the mesh defect described in the M3 section is the
+  blocker.
 - **rio:** a framebuffer platform in rio's `rio-window`, plus the wgpu backend above.
 
 ## The kernel side (not in this repo)

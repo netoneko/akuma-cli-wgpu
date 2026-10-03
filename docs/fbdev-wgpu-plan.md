@@ -1,6 +1,13 @@
 # A wgpu demo on the framebuffer — `akuma-cli-wgpu` and the road to rio
 
-**Status: plan (researched 2026-10-02).** Not implemented yet. This document is the
+**Status: plan (researched 2026-10-02). Update 2026-10-03: the userspace half of this is
+real — `netoneko/akuma-cli-wgpu` runs on `/dev/fb0` with the software rasterizer (M2) and the
+§5 wgpu custom backend (M3: `Instance::from_custom`, WGSL via the naga-IR interpreter, no
+JIT). Its README tracks what works; one open defect: the wgpu mesh path does not yet
+reproduce the software frames bit-for-bit. The kernel-side slices below are still the
+reference for that repo's work.**
+
+Not implemented yet (kernel side). This document is the
 design + slice plan for two things that share one substrate:
 
 1. `userspace/akuma-cli-wgpu` — a userspace demo that draws a 3D screensaver of the

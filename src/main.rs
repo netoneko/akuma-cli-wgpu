@@ -84,7 +84,8 @@ struct Options {
     width: usize,
     height: usize,
     frames: u64,
-    /// request the not-yet-wired wgpu path (milestone M3)
+    /// render through the wgpu custom backend (milestone M3) instead of
+    /// the software rasterizer
     wgpu: bool,
     /// selftest: print ASCII maps of final frames
     dump: bool,
@@ -113,7 +114,8 @@ OPTIONS:
     --fps <N>      target frame rate (default 60)
     --timeout <S>  exit after S seconds (0 = run until q/Esc/^C; default 0)
     --fb <PATH>    framebuffer device (default /dev/fb0)
-    --wgpu         try the wgpu backend (not wired yet — milestone M3)
+    --wgpu         render through the wgpu custom backend (M3) instead of
+                   the software rasterizer (both draw the same frames)
     --w <W>        selftest frame width (default 1280)
     --h <H>        selftest frame height (default 720)
     --frames <N>   selftest frame count (default 120)
@@ -322,7 +324,13 @@ fn build_scene(_opts: &Options, asset: &str, w: usize, h: usize) -> Scene {
     let depth = (hf.height.min(hf.width) as f32).max(6.0) * 0.35;
     let tris = catlogo::extrude(&hf, depth);
     let extent = hf.width.max(hf.height) as f32;
-    Scene::new(tris, extent, true, w, h)
+    let mut scene = Scene::new(tris, extent, true, w, h);
+    // this panel is dead on the right half: park the logo in the middle of
+    // the left half (the rain still spans the whole frame). Only the live
+    // show moves; selftest keeps the mid-frame default so its checksums stay
+    // about the two renderers.
+    scene.center_x = w as f32 * 0.25;
+    scene
 }
 
 // ---------------------------------------------------------------------------

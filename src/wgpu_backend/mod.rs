@@ -17,8 +17,8 @@
 //!      + draws the rain on the CPU. This is *the same code* the software
 //!      path runs, so the backdrop is identical by construction (the rain is
 //!      a u64-xorshift CPU effect; it has no business in a shader).
-//!   2. `queue.write_buffer` — per-frame uniform (time, w, h, extent) and
-//!      the triangle mesh into the storage buffer.
+//!   2. `queue.write_buffer` — per-frame uniform (time, w, h, extent,
+//!      center_x) and the triangle mesh into the storage buffer.
 //!   3. `queue.write_texture` — the frame (including rain) into the color
 //!      target; the render pass loads it so the logo draws on top, exactly
 //!      like the software path draws on top of the rain.
@@ -36,7 +36,8 @@ pub mod backend;
 pub mod interp;
 pub mod shaders;
 
-/// One-line status of the wgpu path (main.rs used to print this and exit).
+/// One-line status of the wgpu path (main.rs prints it when the wgpu path
+/// starts).
 pub const STATUS: &str = "wgpu path: akuma custom backend — WGSL via naga 30 \
 interpreter (no JIT), fixed-function raster per softrender contract";
 
@@ -137,7 +138,8 @@ impl WgpuRenderer {
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("akuma uniform"),
-            size: 16,
+            // two vec4<f32>s: time, width, height, extent | center_x, pad
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -156,7 +158,7 @@ impl WgpuRenderer {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(16),
+                        min_binding_size: wgpu::BufferSize::new(32),
                     },
                     count: None,
                 },
@@ -306,12 +308,13 @@ impl WgpuRenderer {
         if n > 0 {
             self.ensure_tris(n);
 
-            // 2. uniform: (time, width, height, extent) as four f32s
-            let mut uni = [0u8; 16];
+            // 2. uniform: time, width, height, extent, center_x (+3 pad)
+            let mut uni = [0u8; 32];
             uni[0..4].copy_from_slice(&time.to_le_bytes());
             uni[4..8].copy_from_slice(&(self.w as f32).to_le_bytes());
             uni[8..12].copy_from_slice(&(self.h as f32).to_le_bytes());
             uni[12..16].copy_from_slice(&scene.extent.to_le_bytes());
+            uni[16..20].copy_from_slice(&scene.center_x.to_le_bytes());
             self.queue.write_buffer(&self.uniform, 0, &uni);
 
             // mesh: pad each tri to the WGSL storage stride

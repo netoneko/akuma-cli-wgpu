@@ -11,11 +11,15 @@
 //! * Composing in cached WB memory and presenting as full-span copies is the
 //!   WC story of the whole runbook: random writes into a WC mapping are the
 //!   71 MB/s failure mode; full spans are the 3026 MB/s one.
-//! * The rain backdrop is the template's Matrix columns, re-imagined as
-//!   pixels: same purple-blue ramp (the ten xterm-256 hues of akuma-cli,
-//!   decoded to RGB), same speed-1..=3 descent, but drawn into the frame
-//!   buffer instead of a terminal grid — no font dependency, which rio's
-//!   sugarloaf will supply from its own glyph atlas later.
+//! * The rain backdrop is the template's Matrix columns on a *virtual
+//!   character grid*: cells sized like terminal cells (height = frame/45,
+//!   the kernel console's HD-font row on the 4K panel; width 1:2), one rain
+//!   column every two cell columns (the template's wide-char `step_by(2)`),
+//!   trails of discrete glyphs — near-white head, purple->cyan fading tail,
+//!   per-cell flicker with the occasional dark cell. (The first port drew
+//!   1-px streaks, which read as shooting stars on a 4K panel.) Still no
+//!   font dependency — a glyph is a filled rect; rio's sugarloaf supplies
+//!   real glyphs later.
 //! * The z-buffer is refilled with +inf each frame. At 4K that is a 33 MB
 //!   WB fill — the same class of write as the kernel's timed clear, so the
 //!   exit metrics put an upper bound on it for free.
@@ -45,8 +49,13 @@ pub struct Scene {
     pub tris: Vec<Tri>,
     /// world extent of the larger grid axis (cells are 1.0 units)
     pub extent: f32,
-    /// draw the matrix backdrop (the `matrix` subcommand is rain-only)
+    /// rain state; empty when the backdrop is off
     rain: Vec<Column>,
+    /// screen x the mesh orbits around. Defaults to mid-frame; the live
+    /// screensaver parks it at quarter width (the trashcan's panel is dead
+    /// on the right half — the rain still spans the whole frame). selftest
+    /// keeps the default so its checksums stay about the renderers.
+    pub center_x: f32,
 }
 
 /// Seed for the rain's initial column stats (see `rng.rs` on why the render
@@ -89,34 +98,51 @@ fn frac01(x: f32) -> f32 {
     x - x.floor()
 }
 
-/// One Matrix column, transplanted from the template (`MatrixColumn`):
-/// speed 1..=3, hues that occasionally re-roll as it falls.
+/// Rain cell geometry: the template rains on a terminal character grid, so
+/// the pixel rain does too — one "glyph" per cell, cells stacked with row
+/// gaps, trails measured in cells. Height is a 45th of the frame (the
+/// kernel console's HD-font grid is ~44 rows on the 4K panel), width half
+/// of that (terminal cells are 1:2), clamped so odd frame sizes stay sane.
+fn cell_metrics(frame_h: usize) -> (i64, i64) {
+    let ch = (frame_h / 45).clamp(8, 48) as i64;
+    let cw = (ch / 2).max(4);
+    (cw, ch)
+}
+
+/// One Matrix column, transplanted from the template (`MatrixColumn`) —
+/// same speed classes and hue re-rolls, but in *cell* units so the rain
+/// reads as columns of glyphs instead of 1-px streaks.
 struct Column {
-    x: i64,
+    /// cell column index; one rain column every two cell columns, the
+    /// template's wide-char `step_by(2)`
+    col: i64,
+    /// head row in cells (y grows downward, the tail trails above)
     y: f32,
+    /// cells per frame
     speed: f32,
+    /// trail length in cells
     len: i64,
     hue: usize,
 }
 
 impl Column {
-    fn new(x: i64, height: usize, rng: &mut Rng) -> Column {
+    fn new(col: i64, rows: i64, rng: &mut Rng) -> Column {
         Column {
-            x,
-            y: -(rng.below(height as u64) as f32),
-            speed: 1.0 + rng.below(3) as f32,
-            len: 4 + rng.below(14) as i64,
+            col,
+            y: -(rng.below(rows.max(1) as u64) as f32),
+            speed: (1.0 + rng.below(4) as f32) * 0.055,
+            len: 6 + rng.below(25) as i64,
             hue: rng.below(HUES.len() as u64) as usize,
         }
     }
 
-    fn step(&mut self, height: usize, rng: &mut Rng) {
+    fn step(&mut self, rows: i64, rng: &mut Rng) {
         self.y += self.speed;
-        if self.y - self.len as f32 > height as f32 {
+        if self.y - self.len as f32 > rows as f32 {
             // respawn above the top with fresh stats
-            self.y = -(rng.below(height as u64 / 2 + 1) as f32);
-            self.speed = 1.0 + rng.below(3) as f32;
-            self.len = 4 + rng.below(14) as i64;
+            self.y = -(rng.below(rows.max(1) as u64 / 2 + 1) as f32);
+            self.speed = (1.0 + rng.below(4) as f32) * 0.055;
+            self.len = 6 + rng.below(25) as i64;
             self.hue = rng.below(HUES.len() as u64) as usize;
         } else if rng.pct(10) {
             self.hue = rng.below(HUES.len() as u64) as usize;
@@ -124,22 +150,45 @@ impl Column {
     }
 
     fn draw(&self, frame: &mut Frame, time: f32) {
-        // tail fades behind the head; hue drifts along the tail so long
-        // streaks sweep purple -> cyan like the template's columns
+        let (cw, ch) = cell_metrics(frame.height);
+        let rows = frame.height as i64 / ch;
+        // the glyph box: ~3/4 of the cell wide, cell height minus a row
+        // gap, so stacked cells read as separate glyphs on a character grid
+        let gw = (cw * 3 / 4).max(2);
+        let gh = (ch * 5 / 6).max(2);
+        let gx = self.col * cw * 2 + (cw - gw) / 2;
+        // flicker re-rolls ~12x/s; the same tick for the whole frame keeps
+        // every cell stable within the frame (a pure function of scene+time)
+        let tick = (time * 12.0) as u64;
         for i in 0..self.len {
-            let y = self.y as i64 - i;
-            if y < 0 || y >= frame.height as i64 {
+            let row = self.y as i64 - i;
+            if row < 0 || row >= rows {
                 continue;
             }
-            let t = i as f32 / self.len as f32; // 0 at head
             let color = if i == 0 {
                 HEAD
             } else {
+                let t = i as f32 / self.len as f32; // 0 at head
+                // per-cell flicker, deterministic per (column, row, tick):
+                // ~1 in 5 tail cells stays dark (the missing-glyph texture
+                // of the template's columns), the rest ride the fade
+                let n = Rng::with_seed(
+                    (self.col as u64).rotate_left(32) ^ (row as u64).rotate_left(16) ^ tick,
+                )
+                .below(100);
+                if n < 18 {
+                    continue;
+                }
+                let flick = 0.6 + (n - 18) as f32 * (0.4 / 82.0);
+                // hue drifts along the tail so long streaks sweep
+                // purple -> cyan like the template's columns
                 let idx =
                     (self.hue as f32 + t * 6.0 + time * 0.35) as usize % HUES.len();
-                shade(rgb(HUES[idx]), 1.0 - t * 0.85)
+                shade(rgb(HUES[idx]), (1.0 - t * 0.85) * flick)
             };
-            frame.pixel(self.x, y, color);
+            for dy in 0..gh {
+                frame.span(row * ch + dy, gx, gx + gw, color);
+            }
         }
     }
 }
@@ -147,15 +196,11 @@ impl Column {
 impl Scene {
     pub fn new(tris: Vec<Tri>, extent: f32, with_rain: bool, frame_w: usize, frame_h: usize) -> Scene {
         let mut rng = Rng::with_seed(RAIN_SEED);
-        // a column every `step` px at a half-step offset, like the template's
-        // wide-char `step_by(2)`; ~60 columns looks right at any resolution
-        let step = (frame_w / 60).clamp(16, 48);
+        // one column every two cell columns, like the template's wide-char
+        // `step_by(2)`; density tracks the cell, so the rain looks the same
+        // at any resolution (~80 columns on 16:9)
         let rain = if with_rain {
-            (0..)
-                .map(|i| i as i64 * step as i64 + step as i64 / 2)
-                .take_while(|&x| x < frame_w as i64)
-                .map(|x| Column::new(x, frame_h, &mut rng))
-                .collect()
+            rain_columns(frame_w, frame_h, &mut rng)
         } else {
             Vec::new()
         };
@@ -163,25 +208,30 @@ impl Scene {
             tris,
             extent,
             rain,
+            center_x: frame_w as f32 / 2.0,
         }
     }
 
     /// Rebuild the rain when the frame size changes (template: handle_resize).
     pub fn resize_rain(&mut self, frame_w: usize, frame_h: usize, with_rain: bool) {
-        let step = (frame_w / 60).clamp(16, 48);
         let want = if with_rain {
-            (frame_w as i64 + step as i64 - 1) / step as i64
+            let (cw, _) = cell_metrics(frame_h);
+            (frame_w as i64 / (cw * 2)).max(0) as usize
         } else {
             0
         };
-        if want as usize != self.rain.len() {
+        if want != self.rain.len() {
             let mut rng = Rng::with_seed(RAIN_SEED);
-            self.rain = (0..want)
-                .map(|i| i * step as i64 + step as i64 / 2)
-                .map(|x| Column::new(x, frame_h, &mut rng))
-                .collect();
+            self.rain = rain_columns(frame_w, frame_h, &mut rng);
         }
     }
+}
+
+fn rain_columns(frame_w: usize, frame_h: usize, rng: &mut Rng) -> Vec<Column> {
+    let (cw, ch) = cell_metrics(frame_h);
+    let rows = (frame_h as i64 / ch).max(1);
+    let cols = frame_w as i64 / (cw * 2);
+    (0..cols).map(|col| Column::new(col, rows, rng)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +254,7 @@ pub fn backdrop(frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool
     if with_rain {
         let mut rng = Rng::with_seed(time.to_bits() as u64 ^ RAIN_SEED);
         for col in &mut scene.rain {
-            col.step(frame.height, &mut rng);
+            col.step(frame.height as i64, &mut rng);
             col.draw(frame, time);
         }
     }
@@ -271,7 +321,10 @@ impl Renderer {
         let focal = 0.72 * frame.height.min(frame.width) as f32 * dist / scene.extent;
         let (cy, sy) = (yaw.cos(), yaw.sin());
         let (cp, sp) = (pitch.cos(), pitch.sin());
-        let cx = frame.width as f32 / 2.0;
+        // horizontal center comes from the scene: mid-frame by default,
+        // quarter width in the live screensaver (dead right half of the
+        // panel); see `Scene::center_x`
+        let cx = scene.center_x;
         let cypix = frame.height as f32 / 2.0;
 
         self.scratch.clear();
