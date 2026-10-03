@@ -43,6 +43,7 @@ assume local git operations work.
 | this repo, on the box | `/src/github.com/netoneko/akuma-cli-wgpu` (GitHub: `netoneko/akuma-cli-wgpu`) |
 | the kernel repo, on the box | `/src/github.com/netoneko/akuma` |
 | **the plan** (read it) | [`docs/fbdev-wgpu-plan.md`](docs/fbdev-wgpu-plan.md) in this repo — a copy of `docs/runbooks/amd64-fbdev-wgpu-demo.md` from branch `cats/meow/fbdev-wgpu-plan` of `netoneko/akuma-litter` |
+| the fbdev C probe | [`probes/fbprobe.c`](probes/fbprobe.c) — build command in its header comment |
 | the kernel's framebuffer code | `amd64/src/multiboot2.rs` (`kmain_mb2`, `map_wc`), `crates/akuma-fbcon/`, `docs/runbooks/amd64-console-shell.md` |
 | the `/dev` device model to copy | `FileDescriptor::DevDsp` (`/dev/dsp`) in `crates/akuma-syscalls-glue` |
 
@@ -66,9 +67,14 @@ cargo build --release --target x86_64-unknown-linux-musl
   `python3` on `PATH`. The shell has no process substitution (`<(...)` fails with
   `/dev/fd/…: No such file`); use temp files.
 - The binary is called `akuma-wgpu` (the package is `akuma-cli-wgpu`).
-- `/dev/fb0` **does not exist yet** (see "The kernel side"). So `akuma-wgpu screensaver` and
-  `akuma-wgpu matrix` will print `cannot open /dev/fb0`. That is expected today, not a bug in
-  this repo. `selftest` needs no device and is the test you can always run.
+- `/dev/fb0` **exists now** (it appeared mid-session 2026-10-03; char dev 29:0). `screensaver`
+  and `matrix` run on metal: ~46-50 fps at 4K including the present pass (the selftest math
+  predicted ~45), write rate 1.5-1.8 GB/s effective. `selftest` needs no device and remains
+  the test you can always run.
+- SIGINT/SIGTERM kill the process immediately with exit status 0 — see the kernel
+  signal-delivery bug in the done-log (a handler returning to userspace is not survivable on
+  this kernel yet). There is **no metrics report on a signal death**; use `--timeout N` for a
+  graceful self-terminated run with the full report. `q`/Esc also exit gracefully.
 - It also builds on a Mac or Linux laptop with `cargo build --release` for the host, and
   `selftest` runs there too.
 - `selftest` measures **render only**. On metal, each frame additionally pays `present` — a
@@ -88,8 +94,8 @@ ANSI-terminal screensaver with the same subcommands, `--latin`, arrow keys to sw
 | `src/catlogo.rs` | turns the ASCII cat (`akuma_*.txt`, density ramp ` .:-=+*#%@`) into a height field and extrudes it into a 3D triangle mesh |
 | `src/softrender.rs` | the software rasterizer: rotate → perspective project → cull → shade (lambert + purple-blue hue wave) → z-buffered spans; plus the Matrix-rain backdrop. The z-buffer is refilled with +inf at the top of `render()` **every frame** — this refill is load-bearing (see done-log) |
 | `src/rng.rs` | xorshift64* with a splitmix64-seeded `with_seed` constructor; the render path never touches wall-clock or ASLR entropy (rule 5) |
-| `src/input.rs` | termios raw mode, `poll(2)` and escape-sequence decoding; SIGINT/SIGTERM set a quit flag |
-| `src/clock.rs` | `Pacer` (sleeps out the frame budget) and `FpsMeter` (live fps, over-budget count, slowest frame) |
+| `src/input.rs` | termios raw mode, `poll(2)` and escape-sequence decoding; SIGINT/SIGTERM exit the process immediately (kernel signal bug — see done-log) |
+| `src/clock.rs` | `Pacer` (sleeps out the frame budget) and `FpsMeter` (live fps, over-budget count, slowest frame) — EINTR-tolerant `CLOCK_MONOTONIC`/`nanosleep`, never std `Instant` (kernel note in `input.rs`) |
 | `src/wgpu_backend.rs` | placeholder for milestone M3; `--wgpu` prints its status and exits |
 | `src/akuma_{20,40,79,120}.txt` | the logo at four sizes; `akuma_40.txt` is byte-identical to the kernel's boot-banner asset |
 
@@ -108,6 +114,9 @@ these to change — update this table and say why in your report.
 |---|---|---|---|---|---|
 | 1280×720, 120 frames | `1fb62b0e` | `106fe365` | `2000460c` | `d9cef3ca` | 1.46 ms/frame (686 fps) |
 | 3840×2160, 120 frames | `6ad3744e` | `caf9295f` | `38f2e499` | `45c6878d` | 10.65–10.74 ms/frame (~94 fps) |
+
+Re-verified 2026-10-03 after the fb.rs u16 fix, the clock hardening and the signal-handler
+change: **checksums identical**, `SELFTEST OK` on every build.
 
 Where the 4K render milliseconds go (probe measurements): the two 33.2 MB fills — `frame.clear`
 (~3.5 ms) and the z-buffer refill (~3.4 ms) — are ~64% of the frame; the raster is the rest
@@ -144,9 +153,67 @@ absence does.
   the present pass changes that on metal (see "Working on the box"). No optimisation was done,
   per the task's instructions.
 
+### Task 3 — a raw C probe for `/dev/fb0` — DONE 2026-10-03
+
+- `probes/fbprobe.c`, exactly as specified: open `/dev/fb0`, print every field of both
+  `FBIOGET_*` structs (hand-declared ABI, `_Static_assert` size checks 160/80, so no kernel
+  headers needed anywhere), `mmap` `MAP_SHARED` RW, fill a self-identifying gradient
+  (word i = `0xFF000000|i`) timed with `CLOCK_MONOTONIC`, read every word back and compare
+  (prints sampled pixels too), exit 0 only on an all-pass verdict.
+- `/dev/fb0` appeared on the box mid-task, so the probe ran against the real thing — PASS
+  twice: fill 35,389,440 B in 12.35/12.36 ms = **2866/2863 MB/s** → the user mapping is
+  write-combining (kernel S2 works; ~71 MB/s would have meant UC). Read-back
+  8,847,360/8,847,360 words match (S5 device mmap works); reads run ~4 MB/s, expected from WC
+  memory. Struct dump matches plan §2: `id="akuma-fb"`, 3840x2160, 32 bpp 8/8/8 (r16 g8 b0),
+  TRUECOLOR, PACKED_PIXEL, `line_length` 16384, `smem_len` 35389440.
+- Build: host `gcc -O1 -static -Wall -Wextra`, 0 warnings. `x86_64-linux-musl-gcc` is **not
+  installed** on the box, so the exact build line from the task is unverified; the musl gcc
+  also is not needed for correctness (no headers, no libakuma), but run it once when it
+  exists. Calibration against a real Linux control box with a framebuffer: **not done**
+  (none available from here).
+
+### Found while running Task 3 — fb.rs ABI fix + kernel signal bug + clock hardening
+
+- **fb.rs ABI bug, FIXED.** `FbFixScreeninfo` declared `xpanstep`/`ypanstep`/`ywrapstep` as
+  `u32`; the Linux ABI (`<linux/fb.h>`, and the C probe's declaration) uses `__u16`. The u32s
+  pushed `line_length` to offset 52 — where the real ABI keeps alignment padding — so the
+  demo would have read pitch 0 the moment S4 landed. Now `u16`, byte-identical to the probe.
+  Rendering untouched: selftest checksums identical to the baseline table, re-verified after
+  every change below.
+- **First on-metal runs of the demo** (possible because `/dev/fb0` exists): `[fb]` line
+  correct (`akuma-fb 3840x2160 pitch 16384 bpp 32`), **46-50 fps at 4K including present**
+  (selftest's math predicted ~45), write rate 1.5-1.8 GB/s effective. A 90-second run and a
+  60-second run with no signals: no failures.
+- **Kernel bug — signal delivery (kernel-repo work; documented here because the demo had to
+  work around it).** Symptoms, before the workaround: every SIGTERM'd run died as a
+  `clock_gettime` EINTR abort (`Instant::now` unwrap), an impossible out-of-bounds index
+  (softrender.rs:359: len 8294400, index ~2.73e8 — unreachable through the clamped code for
+  any f32 input), or a silent segfault; no-signal runs never crashed. Probes run on the box:
+  (a) `sigprocmask(SIG_BLOCK)` with no handler → TERM truly silent, process survives; (b) the
+  same block with `signal(SIGTERM, h)` installed → the in-flight syscall EINTRs anyway (mask
+  verified set) — the mask gates handler invocation, not the EINTR; (c) 172 mid-SSE-loop
+  deliveries restore xmm/GPR state perfectly; (d) `sigpending`/`sigtimedwait`/`signalfd` are
+  ENOSYS; `ppoll` exists, honors its mask, but does not deliver pending signals; (e) with the
+  clock EINTR-hardened, remaining TERMs died as SEGV_MAPERR at definitely-mapped VAs (fb map
+  `0x40037xxx` x3, heap `0x10xxxxxx`), instantly, with the handler having run. Reading: the
+  EINTR is one symptom; the address space itself is not intact across a delivery that returns
+  to userspace. **Workaround in this repo:** the INT/TERM handler `_exit(0)`s immediately —
+  delivery → handler → exit never returns to the broken continuation. 10/10 direct TERMs,
+  matrix TERM, and `--timeout` self-exit all clean afterwards; checksums unchanged. Kernel
+  repo should look at: EINTR-on-masked-signals, the delivery/return address-space corruption,
+  missing sigpending/sigtimedwait/signalfd, the interval timer not reloading (one delivery
+  per setitimer), and a ucontext layout that differs from musl's (RIP read as 0 from the
+  documented musl offsets).
+- **clock.rs hardened:** `monotonic()`/`sleep_until()` replace std `Instant`/`thread::sleep`
+  on the render path — raw `CLOCK_MONOTONIC`/`nanosleep` that retry EINTR instead of
+  unwrapping it (std's `Instant::now` aborts on EINTR; that was the original crash signature).
+  selftest numbers unchanged.
+
 ## Tasks, in order
 
-### Task 3 — a raw C probe for `/dev/fb0` (kernel-side preparation) — NEXT
+### Task 3 — a raw C probe for `/dev/fb0` (kernel-side preparation) — DONE 2026-10-03 (see done-log; the probe found a live `/dev/fb0` and an fb.rs ABI bug)
+
+The task, as written when it was NEXT:
 
 Write `probes/fbprobe.c`: a plain C program (no libakuma) built with
 `x86_64-linux-musl-gcc -O1 -static`. It should:
@@ -174,7 +241,14 @@ framebuffer, which is how its expected output gets calibrated.
 
 ## The kernel side (not in this repo)
 
-The kernel does not expose a framebuffer to userspace yet. The plan's slices, all in the kernel
+**Status update 2026-10-03:** `/dev/fb0` exists on the box now (char dev 29:0) and the demo
+plus `probes/fbprobe.c` exercise S2 (WC at ~2866 MB/s user-side), S3 (single-open device) and
+S4/S5 (ioctls byte-identical to the plan §2 dump, device-backed mmap). The kernel-side signal
+bugs found while getting the demo to survive SIGTERM are listed in the done-log — they are
+kernel-repo work, this repo carries only the `_exit(0)` handler workaround in `input.rs`.
+The slice list below is kept as reference:
+
+The plan's slices, all in the kernel
 repo:
 
 1. **S1:** keep the framebuffer's geometry in a static at boot.

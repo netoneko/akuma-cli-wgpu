@@ -18,56 +18,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static QUIT_FLAG: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
-    QUIT_FLAG.store(true, Ordering::SeqCst);
-}
-
-// TEMP DIAGNOSTIC (remove once the SIGTERM segv is understood): print
-// sig/code/fault addr + RIP so silent segfaults become diagnosable.
-extern "C" fn on_segv(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-    unsafe {
-        let addr = (*info).si_addr() as usize;
-        // musl x86_64 ucontext_t: uc_flags(8) uc_link(8) uc_stack(24)
-        // uc_sigmask(128) => uc_mcontext at +168; gregs[16] = REG_RIP.
-        let rip = *((ctx as *const u8).add(168 + 16 * 8) as *const usize);
-        let msg = format!(
-            "[dbg] sig={} code={} addr=0x{:x} rip=0x{:x}\n",
-            sig, (*info).si_code, addr, rip
-        );
-        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        libc::_exit(139);
-    }
+    // Kernel note (Akuma, probed on the box 2026-10-03): a signal that has a
+    // user handler EINTRs the syscall in flight on arrival — even when the
+    // signal is masked (sigprocmask verifies 0 and the mask reads back set;
+    // the EINTR happens anyway). Hardening every syscall got rid of the
+    // aborts (see clock.rs), but TERMs landing mid-userspace-render still
+    // died as segfaults with SEGV_MAPERR at definitely-mapped addresses —
+    // heap and framebuffer VAs, stable across runs (0x4003701e/22/162 x3).
+    // C probes with 172 mid-computation deliveries proved xmm/GPR state
+    // restores fine, so the breakage is below registers: the user address
+    // space itself is not intact across the delivery-return. Verified
+    // workarounds, in increasing desirability:
+    //   * masked with NO handler: the signal is truly silent (but then
+    //     nothing observes the quit request either);
+    //   * handler that exits: delivery -> handler -> _exit() never returns
+    //     to the broken userspace continuation, so the process dies
+    //     deterministically with a clean exit code.
+    // So: SIGINT/SIGTERM stop the screensaver immediately here. The kernel
+    // hands the screen back to the console on process teardown (slice S6),
+    // exactly as for any other death. Graceful exits with the metrics
+    // report stay available via q/Esc (console line discipline delivers
+    // ^C as a 0x03 byte in raw mode; see decode()) and --timeout.
+    unsafe { libc::_exit(0) };
 }
 
 /// Install SIGINT/SIGTERM handlers. Idempotent; harmless if stdin is not a
 /// tty.
-///
-/// Kernel note (Akuma, probed on the box 2026-10-03): the arrival of a
-/// signal that has a user handler EINTRs the syscall in flight — even when
-/// the signal is masked. A minimal repro in this crate proved the split:
-/// `sigprocmask(SIG_BLOCK)` with NO handler and the process shrugged TERM
-/// off; the same block with `signal(SIGTERM, h)` installed died in
-/// `Instant::now`'s clock_gettime unwrap. The mask gates handler
-/// invocation, not the EINTR, so masking is not a tool we have. The
-/// handlers stay installed — on delivery they do run (verified) and set
-/// the quit flag — and instead every syscall on the render path tolerates
-/// EINTR: see clock.rs, which replaces std's Instant/thread::sleep
-/// precisely because std unwraps the EINTR and aborts. Probe record for
-/// this bug, all 2026-10-03: every unhardened SIGTERM'd run of the demo
-/// died as a clock_gettime-EINTR abort, an impossible out-of-bounds index
-/// (softrender.rs:359, an index no f32 input can produce) or a plain
-/// segfault; masked with no handler, the same binary shrugged every TERM
-/// off; nanosleep was already safe (std retries EINTR there).
 pub fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        // TEMP DIAGNOSTIC
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_segv as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
     }
 }
 
