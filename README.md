@@ -206,38 +206,61 @@ projection, atlas `textureLoad`), through the same pipeline layout rio uses, pix
 rio's checkout, not vendored here). `shader-check` on all of sugarloaf's WGSL:
 **15 of 15 entry points lower and JIT.**
 
-### The remaining problem: fragment cost at 4K
+### Performance work, 2026-10-04 (fps), and what is left
 
-`akuma-wgpu gpu-bench` (same `AKUMA_SUGARLOAF`) times 3840×2144 passes on the trashcan, JIT:
+Demo, the trashcan, 3840×2160, JIT, bit-identical to softrender throughout:
 
-| pass | ms/frame | per fragment |
+| | start of the day | now |
 |---|---|---|
-| constant-colour shader, no blend | 536 | 65 ns |
-| constant-colour shader, premultiplied blend | 600 | 73 ns |
-| sugarloaf cell backgrounds (382-instruction fragment shader) | 1590 | 195 ns |
-| + a glyph in every cell (16k instanced quads) | 1700 | — |
+| wgpu path render (selftest) | seconds/frame (254 ms already at 256×144) | **14 ms** (software 10 ms) |
+| live `screensaver --wgpu` on `/dev/fb0` | < 1 fps | **35.6 fps** (software 46.7) |
 
-A full 4K redraw in ~1.6 s is correct but far too slow for interactive use; rio redraws the
-whole grid background on any change. What the numbers say, and what has been tried:
+What got it there (each step measured, checksums unchanged): compile + VM + JIT (the executors
+section); per-frame full-buffer copies cut (render **in place** into the frame's memory —
+the colour texture's storage is pointed at `frame.buf` for the pass, so there is no upload,
+readback copy or blit); unread stage inputs pruned so a flat position-independent fragment
+shader runs once per triangle (raster 18.6 → 4.6 ms); a `memcpy` call per 4-byte texel store
+replaced by fixed-size stores (musl's `memcpy` is not free for tiny sizes: 25 → 8 ns/fragment);
+render-pass clears as a doubling `copy_within` instead of a per-pixel loop (4K empty pass 128 → 7 ms —
+yes, "just replace it with a new canvas" was the right instinct); transcendental result caches.
 
-* **~65 ns is pure per-fragment pipeline overhead** (edge setup, depth check, varyings
-  copy, `run_fragment` marshalling, decode + blend + encode) before the shader runs a single
-  instruction. That fixed cost is the first target: it dominates anything simple and
-  caps everything else.
-* The shader itself is ~130 ns for 382 template-JIT instructions. It was ~230 ns until a
-  **per-call-site result cache for transcendentals** (`Inst::CallC`: last arguments → last
-  result in persistent registers) removed most of the 6 `powf` calls per fragment, which
-  repeat their arguments across a flat cell. The same cache helps the demo, where
-  `sin`/`cos` of per-frame uniforms were recomputed for every vertex.
-* Not yet done, in expected-value order: (1) cut the fixed per-fragment cost — span-level
-  loops that skip the depth/blend machinery when it is a no-op, no per-pixel varyings copy
-  for flat-only shaders, cheaper encode; (2) specialize the program per draw on the
-  (constant) uniform buffer — folds `input_colorspace`/`padding_extend`/cursor branches
-  away; (3) evaluate fragments in batches of 4-8 lanes with SSE/AVX in the JIT (uniform
-  branches stay fast, divergence falls back to scalar); (4) parallelize over tiles if the
-  kernel's threads are usable; (5) real register allocation in the JIT.
-  The box has no `/proc/cpuinfo`; check SSE4.1/AVX2 with `is_x86_feature_detected!` before
-  designing (3).
+`gpu-bench` (rio-scale work, 3840×2144, sugarloaf's real `grid.wgsl`), same box:
+
+| pass | was | now |
+|---|---|---|
+| cell backgrounds, 1 thread | 2796 ms | 784 ms |
+| cell backgrounds, 4 threads | — | **223 ms** (4.5 fps) |
+| + a glyph in every cell (16k instances), 4 threads | — | 320 ms |
+| constant-colour fill | 536 ms | 34 ms |
+
+The levers, in the order they paid off:
+
+* **Tile-parallel rasterization.** The box really has 4 cores and std threads scale ~4×
+  (`akuma-wgpu thread-probe`). Vertex stage and primitive assembly are serial; the target is cut
+  into row bands, a queue hands them to workers (each with its own fragment invoker), and draw
+  order is preserved inside every band so blending stays correct. `AKUMA_THREADS=n`.
+* **A 4-lane wide JIT** (`jit.rs::compile_wide`, SSE4.1 — the box has SSE4.2 and **no AVX**).
+  Registers hold 4 lanes; hot instructions have vector templates (arithmetic, compares, select,
+  `roundps`, `cvttps2dq`/`cvtdq2ps` with a rare-case fixup, a vector-wide libm result cache);
+  everything else reuses the scalar template once per lane. Control flow stays uniform: a branch
+  whose lanes disagree makes the batch return `STATUS_DIVERGED` and the caller reruns it lane by
+  lane (zero divergences on the grid shader). The rasterizer gathers 4 covered pixels per
+  fragment call; the vertex stage is batched the same way. `exec-selftest` now has `jitw` as a
+  third executor and it is bit-identical to `jit`/`vm` on all 18 snippets. `AKUMA_WIDE=0` turns it off.
+* Fixed per-pixel costs: `floor()` in the unorm encode was a libm call per channel; barycentrics
+  / depth / 1/w are only computed when something reads them; the opaque-source premultiplied blend
+  is a plain store.
+
+What is left, honestly: a full 4K redraw is still ~220 ms, i.e. ~4.5 fps. Per fragment that is
+about 40 ns of pipeline overhead (gather, marshalling, encode) plus ~60 ns of shader. Next, in order:
+(1) **memoize pure shader regions** — the grid shader's colour maths depends only on the loaded cell
+word, which is the same for the 16×32 pixels of a cell, so a "same live-in registers as last time →
+reuse the live-out registers" region (chosen statically, disabled adaptively if it misses) would skip
+~250 of its 382 instructions for ~99% of pixels; (2) cut the remaining per-fragment overhead
+(vectorize the encode, avoid per-lane marshalling); (3) specialize the program per draw on the
+constant uniform buffer (folds colour-space/padding/cursor branches); (4) parallelize the vertex stage.
+The demo itself is within ~25% of software and present-bound (the 33 MB write-combined copy to
+`/dev/fb0` is ~11 ms per frame).
 
 ## Baseline: selftest checksums and timings (re-measured 2026-10-04)
 
@@ -485,13 +508,26 @@ what its absence does.
   path; mipmaps; HDR formats; that bilinear sampling matches a real GPU's rounding bit for
   bit (it does not claim to).
 
+### Task 10 — fps: in-place rendering, threads, a wide JIT — DONE 2026-10-04
+
+- Live demo through wgpu: < 1 fps → 35.6 fps at 4K (software 46.7); rio-scale grid pass 2.8 s →
+  0.22 s. Details and per-step numbers in "Performance work" under M4.
+- Found by measuring, not guessing: the demo's fragment shader declares an unused
+  `@builtin(position)` so the "position-independent" test never fired; `floor()` and 4-byte
+  `memcpy` are real function calls on musl; a render-pass clear was 128 ms because it ran
+  per pixel.
+- **Could not verify:** the picture on the panel after the threading/wide-JIT work (the demo
+  uses the legacy single-threaded raster path, so it is unaffected, but nobody looked); wide
+  JIT on anything but this CPU (SSE4.1 only — falls back to the scalar JIT without it).
+- Environment switches added: `AKUMA_THREADS`, `AKUMA_WIDE`, `AKUMA_EXEC=jitw`.
+
 ## Next steps (updated 2026-10-04, branch `jit-shader-executor`)
 
 Done: the compiler/VM/JIT executors (M3 speed), the standard-mode GPU and its test suite
 (M4), real sugarloaf shaders running on the trashcan. In order:
 
-1. **Fragment throughput** — see "The remaining problem" above; this is what stands between
-   the current backend and a usable 4K rio. Re-run `gpu-bench` after every change.
+1. **Fragment throughput** — see "Performance work" above; region memoization is the next big
+   lever for rio-style passes. Re-run `gpu-bench` after every change.
 2. **Verify on `/dev/fb0`** that the demo still looks right with everything above (only
    headless `selftest` and `screensaver --timeout` runs were done this session, no human
    looked at the panel).

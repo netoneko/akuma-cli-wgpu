@@ -73,7 +73,9 @@ fn unorm(b: u8) -> f32 {
 fn to_unorm(c: f32) -> u8 {
     // WebGPU: clamp, scale, round to nearest (ties away from zero is fine
     // here: x*255 is never exactly .5 for the representable inputs we care about)
-    (c.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8
+    // the value is non-negative after the clamp, so truncation is the floor;
+    // `f32::floor` would be a libm call per channel on a baseline x86-64 build
+    (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 /// stored texel -> (r, g, b, a) as the shader/blender sees it; missing

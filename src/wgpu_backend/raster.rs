@@ -222,7 +222,7 @@ impl Raster<'_> {
         let constant_fs = fs.constant_per_primitive();
         let mut cached: Option<Option<[u32; 4]>> = None;
         // barycentrics, depth and 1/w only matter if something consumes them
-        let need_geom = self.depth.is_some() || !constant_fs;
+        let need_geom = self.depth.is_some() || !flat_all || fs.uses_position_zw();
         let plan = PixelPlan::new(&self.color, self.blend_constant);
         // with a constant fragment result the final texel (or the blend
         // factors) can be computed once per triangle
@@ -231,7 +231,9 @@ impl Raster<'_> {
         // wide stages shade up to `lanes` pixels per call: covered pixels are
         // gathered here and flushed when full and at the end of the triangle
         let lanes = if constant_fs { 1 } else { fs.lanes() };
-        let mut pend = [Pending { idx: 0, zf: 0.0, pos: [0.0; 4], var: [[0; 4]; MAX_LOC] }; 4];
+        let mut pend = [Pending { idx: 0, zf: 0.0, pos: [0.0; 4] }; 4];
+        // per-pixel varyings, only for stages with non-flat inputs
+        let mut pend_var = [[[0u32; 4]; MAX_LOC]; 4];
         let mut np = 0usize;
 
         for py in min_y..max_y {
@@ -265,11 +267,14 @@ impl Raster<'_> {
                             idx,
                             zf,
                             pos: [px as f32 + 0.5, py as f32 + 0.5, zf, invw as f32],
-                            var,
                         };
+                        // flat-only: every pixel shares the triangle's varyings
+                        if !flat_all {
+                            pend_var[np] = var;
+                        }
                         np += 1;
                         if np == lanes {
-                            self.flush(fs, &plan, &pend[..np]);
+                            self.flush(fs, &plan, &pend[..np], &pend_var, &var, flat_all);
                             np = 0;
                         }
                     } else if pass {
@@ -305,15 +310,23 @@ impl Raster<'_> {
             }
         }
         if np > 0 {
-            self.flush(fs, &plan, &pend[..np]);
+            self.flush(fs, &plan, &pend[..np], &pend_var, &var, flat_all);
         }
     }
 
     /// shade the gathered pixels in one batch, then depth-write and blend each
-    fn flush(&mut self, fs: &mut Invoker<'_>, plan: &PixelPlan, pend: &[Pending]) {
-        let mut ins: [([f32; 4], &Varyings); 4] = [([0.0; 4], &pend[0].var); 4];
+    fn flush(
+        &mut self,
+        fs: &mut Invoker<'_>,
+        plan: &PixelPlan,
+        pend: &[Pending],
+        pend_var: &[Varyings; 4],
+        tri_var: &Varyings,
+        flat: bool,
+    ) {
+        let mut ins: [([f32; 4], &Varyings); 4] = [([0.0; 4], tri_var); 4];
         for (i, p) in pend.iter().enumerate() {
-            ins[i] = (p.pos, &p.var);
+            ins[i] = (p.pos, if flat { tri_var } else { &pend_var[i] });
         }
         let mut outs = [None; 4];
         fs.run_fragment_batch(&ins[..pend.len()], &mut outs[..pend.len()]);
@@ -500,7 +513,6 @@ struct Pending {
     idx: usize,
     zf: f32,
     pos: [f32; 4],
-    var: Varyings,
 }
 
 /// Everything about writing a pixel that does not change within a triangle,

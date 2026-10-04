@@ -844,6 +844,28 @@ pub fn bench() -> i32 {
             let ms = (crate::clock::monotonic() - t0) * 1000.0 / 3.0;
             println!("{w}x{h}, constant shader, no clear, no blend: {ms:.1} ms/frame ({:.0} ns/fragment)", ms * 1e6 / (w * h) as f64);
         }
+        // a trivial shader that is NOT constant per primitive (reads position):
+        // isolates the per-fragment pipeline cost of the batched/wide path
+        {
+            let src2 = format!(
+                "{FULL_TRI}
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{ return vec4<f32>(p.x / 3840.0, p.y / 2144.0, 0.5, 1.0); }}"
+            );
+            let m2 = g.module(&src2);
+            let fmt = wgpu::TextureFormat::Bgra8Unorm;
+            let tex = g.texture(w, h, fmt);
+            let p = g.pipeline(&m2, &g.empty_layout(), fmt, None, wgpu::PrimitiveTopology::TriangleList, None, &[]);
+            let t0 = crate::clock::monotonic();
+            for _ in 0..3 {
+                g.pass(&tex, None, |rp| {
+                    rp.set_pipeline(&p);
+                    rp.draw(0..3, 0..1);
+                });
+            }
+            let ms = (crate::clock::monotonic() - t0) * 1000.0 / 3.0;
+            println!("{w}x{h}, position-dependent shader (4 insts), no blend: {ms:.1} ms/frame ({:.0} ns/fragment)", ms * 1e6 / (w * h) as f64);
+        }
         for (what, blend) in [
             ("constant shader, no blend", None),
             ("constant shader, premultiplied blend", Some(wgpu::BlendState { color: c, alpha: c })),

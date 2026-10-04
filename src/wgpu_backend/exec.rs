@@ -347,6 +347,21 @@ impl Invoker<'_> {
         }
     }
 
+    /// Does the stage read `@builtin(position)` z or w (the depth / 1/w
+    /// components, which cost a barycentric evaluation to produce)? x and y
+    /// are free.
+    pub fn uses_position_zw(&self) -> bool {
+        let prog = match self {
+            Invoker::Vm { p, .. } => p,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Jit { p, .. } => p,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Wide { p, .. } => p,
+            Invoker::Interp { .. } => return true,
+        };
+        prog.inputs.iter().any(|(_, s)| matches!(s, Src::Position(2) | Src::Position(3)))
+    }
+
     /// invocations this invoker prefers to be handed at once
     pub fn lanes(&self) -> usize {
         match self {
