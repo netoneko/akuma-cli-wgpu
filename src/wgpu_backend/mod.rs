@@ -37,6 +37,7 @@ pub mod compile;
 pub mod exec;
 pub mod exec_selftest;
 pub mod format;
+pub mod gpu_selftest;
 pub mod interp;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod jit;
@@ -59,7 +60,7 @@ use crate::softrender::{self, Scene};
 // noop-waker poll loop is all a single-threaded program needs (no pollster)
 // ---------------------------------------------------------------------------
 
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     unsafe fn noop(_: *const ()) {}
     unsafe fn clone(_: *const ()) -> RawWaker {

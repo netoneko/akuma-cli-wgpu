@@ -1007,6 +1007,12 @@ pub fn run_vertex(
     }
     let out = run_entry(sh, entry, res, args).expect("interp: vertex entry must return");
     let result_ty = f.result.as_ref().expect("interp: vertex result").ty;
+    // a bare `-> @builtin(position) vec4<f32>` return has no struct around it
+    if let Some(res) = &f.result {
+        if matches!(res.binding, Some(naga::Binding::BuiltIn(BuiltIn::Position { .. }))) {
+            return VertexOut { position: vec4_f32(&out), varyings: Vec::new() };
+        }
+    }
     let out = match out {
         Value::Struct(m) => m,
         other => panic!("interp: vertex returned {other:?} (expected struct)"),

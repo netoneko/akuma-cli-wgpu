@@ -66,6 +66,9 @@ enum Shape {
 enum Ptr {
     /// a sub-tree of a local variable's registers
     Local(Lv),
+    /// a local aggregate indexed by a run-time value: the candidates, each
+    /// with the register holding "this is the selected one"
+    LocalDyn(Vec<(R, Lv)>),
     Buf { buf: u32, imm: u32, dynr: Option<R>, shape: Shape },
 }
 
@@ -597,6 +600,13 @@ impl<'m> Lowerer<'m> {
                 let v = self.val(ctx, *value)?;
                 match self.get(ctx, *pointer)? {
                     Val::P(Ptr::Local(dst)) => self.store_lv(&dst, &v)?,
+                    Val::P(Ptr::LocalDyn(cands)) => {
+                        // conditional store into each candidate:
+                        // dst = flag ? value : dst
+                        for (flag, dst) in &cands {
+                            self.store_lv_if(*flag, dst, &v)?;
+                        }
+                    }
                     other => bail!("store through {other:?}"),
                 }
             }
@@ -627,6 +637,22 @@ impl<'m> Lowerer<'m> {
             (Lv::A(a), Lv::A(b)) if a.len() == b.len() => {
                 for (x, y) in a.iter().zip(b) {
                     self.store_lv(x, y)?;
+                }
+                Ok(())
+            }
+            _ => bail!("store shape mismatch"),
+        }
+    }
+
+    fn store_lv_if(&mut self, flag: R, dst: &Lv, src: &Lv) -> Res<()> {
+        match (dst, src) {
+            (Lv::S(d, _), Lv::S(s, _)) => {
+                self.push(Inst::Select { d: *d, c: flag, a: *s, b: *d });
+                Ok(())
+            }
+            (Lv::A(a), Lv::A(b)) if a.len() == b.len() => {
+                for (x, y) in a.iter().zip(b) {
+                    self.store_lv_if(flag, x, y)?;
                 }
                 Ok(())
             }
@@ -682,6 +708,14 @@ impl<'m> Lowerer<'m> {
             Expression::LocalVariable(l) => Val::P(Ptr::Local(ctx.locals[l.index()].clone())),
             Expression::Load { pointer } => match self.get(ctx, *pointer)? {
                 Val::P(Ptr::Local(lv)) => Val::V(self.copy_lv(&lv)),
+                Val::P(Ptr::LocalDyn(cands)) => {
+                    // select chain over the candidates (the first is the default)
+                    let mut acc = self.copy_lv(&cands[0].1);
+                    for (flag, lv) in &cands[1..] {
+                        acc = self.select(&Lv::S(*flag, K::B), lv, &acc)?;
+                    }
+                    Val::V(acc)
+                }
                 Val::P(Ptr::Buf { buf, imm, dynr, shape }) => {
                     Val::V(self.load_buf(buf, imm, dynr, shape)?)
                 }
@@ -873,6 +907,19 @@ impl<'m> Lowerer<'m> {
                 .map(|l| Val::P(Ptr::Local(l)))
                 .ok_or_else(|| "static index out of range".to_string()),
             Val::P(Ptr::Local(_)) => bail!("index into scalar pointer"),
+            Val::P(Ptr::LocalDyn(cands)) => {
+                let mut out = Vec::new();
+                for (flag, lv) in cands {
+                    match lv {
+                        Lv::A(items) => out.push((
+                            flag,
+                            items.get(index as usize).cloned().ok_or("static index out of range")?,
+                        )),
+                        Lv::S(..) => bail!("index into scalar pointer"),
+                    }
+                }
+                Ok(Val::P(Ptr::LocalDyn(out)))
+            }
             Val::P(Ptr::Buf { buf, imm, dynr, shape }) => {
                 let (off, shape) = self.buf_step(shape, index)?;
                 Ok(Val::P(Ptr::Buf { buf, imm: imm.wrapping_add(off), dynr, shape }))
@@ -946,6 +993,33 @@ impl<'m> Lowerer<'m> {
                     }
                 };
                 Ok(Val::P(Ptr::Buf { buf, imm, dynr: Some(total), shape }))
+            }
+            Val::P(Ptr::Local(Lv::A(items))) => {
+                let mut cands = Vec::new();
+                for (k, it) in items.iter().enumerate() {
+                    let Lv::S(kc, _) = self.konst(k as u32, K::U) else { unreachable!() };
+                    let t = self.nr();
+                    self.push(Inst::Cmp { d: t, a: ir, b: kc, c: Cmp::IEq });
+                    cands.push((t, it.clone()));
+                }
+                Ok(Val::P(Ptr::LocalDyn(cands)))
+            }
+            Val::P(Ptr::LocalDyn(prev)) => {
+                // a second dynamic index on an already-dynamic pointer:
+                // candidates are the product, flags are ANDed
+                let mut cands = Vec::new();
+                for (flag, lv) in prev {
+                    let Lv::A(items) = lv else { bail!("dynamic index into scalar pointer") };
+                    for (k, it) in items.iter().enumerate() {
+                        let Lv::S(kc, _) = self.konst(k as u32, K::U) else { unreachable!() };
+                        let t = self.nr();
+                        self.push(Inst::Cmp { d: t, a: ir, b: kc, c: Cmp::IEq });
+                        let f = self.nr();
+                        self.push(Inst::And { d: f, a: flag, b: t });
+                        cands.push((f, it.clone()));
+                    }
+                }
+                Ok(Val::P(Ptr::LocalDyn(cands)))
             }
             _ => bail!("dynamic index on this base"),
         }

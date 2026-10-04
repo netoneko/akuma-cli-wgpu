@@ -154,6 +154,17 @@ const CASES: &[Case] = &[
         let pos = k * u;
         let a = vec4<u32>(u32(any(vec3<bool>(k.x != k.x, k.y > 0.0, k.z < 0.0))), u32(all(k.xy == k.xy)), vi, 0u);
         let b = vec4<f32>(u.w, k.w, 0.0, 0.0);"# },
+    Case { name: "dynamic index into a local array (load + store)", interp: true, body: r#"
+        var arr = array<f32, 4>(1.0, 2.0, 3.0, 4.0);
+        let i = vi % 4u;
+        arr[i] = p.x;
+        arr[(i + 1u) % 4u] = arr[(i + 2u) % 4u] + q.y;
+        var v = array<vec2<f32>, 3>(vec2<f32>(1.0, 2.0), vec2<f32>(3.0, 4.0), vec2<f32>(5.0, 6.0));
+        let j = vi % 3u;
+        v[j].y = q.z;
+        let pos = vec4<f32>(arr[0], arr[1], arr[2], arr[3]);
+        let a = vec4<u32>(i, j, 0u, 0u);
+        let b = vec4<f32>(v[0].x + v[0].y, v[1].y, v[2].y, v[j].x);"# },
     Case { name: "matrix * vector, vector * matrix, matrix * matrix", interp: false, body: r#"
         let m = mat3x3<f32>(p.xyz, q.xyz, vec3<f32>(1.0, 2.0, 3.0));
         let n = mat3x3<f32>(q.xyz, p.xyz, vec3<f32>(3.0, 2.0, 1.0));
