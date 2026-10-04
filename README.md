@@ -292,8 +292,9 @@ from a terminal with Alt/Option-as-Meta, real Alt works too.)
 **CRT look** = `[renderer] filters = ["akuma-crt-2"]` (curved glass, scanlines, vignette, beam
 spread — `src/wgpu_backend/crt.rs`, applied while presenting; two tubes = one per pane;
 `"akuma-crt"` = one tube) plus the green-phosphor `[colors]` table. Cost ~35 ms effect + 11 ms
-copy per 4K frame. **Currently the warp is commented out** in the panel config (colours and
-cursor kept); uncomment the two `[renderer]`/`filters` lines to bring it back. **To turn it off**, delete the block between `# --- CRT look` and
+copy per 4K frame. **The panel config uses `"akuma-crt-2-flat"`**: `-flat` turns the
+curvature (fish-eye) off and keeps scanlines, vignette and beam softness (~13 ms effect);
+drop `-flat` for curved tubes. **To turn it off**, delete the block between `# --- CRT look` and
 `# end CRT look` and restart rio; to keep the colours but get a flat picture, delete just
 the `[renderer]` table. rio's own librashader CRT (`filters = ["newpixiecrt"]`) now *runs*
 (`var<private>` globals were added to the compiler and interpreter) but takes 10-20 s per 4K

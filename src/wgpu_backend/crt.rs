@@ -10,9 +10,10 @@
 //! The screen can be split into side-by-side tubes (one per pane of a
 //! two-way split). Off by default; rio turns it on through its filter list
 //! (`filters = ["akuma-crt"]` or `["akuma-crt-2"]`, see the rio fork's
-//! sugarloaf), anything else sets it with [`set_tubes`].
+//! sugarloaf; a `-flat` suffix turns the curvature off and keeps the rest),
+//! anything else sets it with [`set_tubes`] / [`set_curved`].
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// 0 = off, n = n side-by-side tubes
@@ -24,6 +25,18 @@ pub fn set_tubes(n: u32) {
 
 pub fn tubes() -> u32 {
     TUBES.load(Ordering::Relaxed)
+}
+
+/// Barrel curvature on (the default) or off: off keeps the scanlines,
+/// vignette, soft edges and beam spread on a flat picture.
+static CURVED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_curved(on: bool) {
+    CURVED.store(on, Ordering::Relaxed);
+}
+
+pub fn curved() -> bool {
+    CURVED.load(Ordering::Relaxed)
 }
 
 /// Curvature: how far the sampled point is pushed out at the far edge.
@@ -43,6 +56,7 @@ pub struct Crt {
     w: usize,
     h: usize,
     tubes: usize,
+    curved: bool,
     /// per output pixel: source pixel index, or NONE
     map: Vec<u32>,
     /// per output pixel: brightness, 0..=256
@@ -56,7 +70,8 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 impl Crt {
-    pub fn new(w: usize, h: usize, tubes: usize) -> Crt {
+    pub fn new(w: usize, h: usize, tubes: usize, curved: bool) -> Crt {
+        let (bend_x, bend_y) = if curved { (BEND_X, BEND_Y) } else { (0.0, 0.0) };
         let tubes = tubes.clamp(1, 8);
         let mut map = vec![NONE; w * h];
         let mut gain = vec![0u16; w * h];
@@ -71,8 +86,8 @@ impl Crt {
                     let u = ((x - x0) as f32 + 0.5) / tw * 2.0 - 1.0;
                     // barrel: sample further out towards the edges, so the
                     // picture bulges and its border curves inward
-                    let su = u * (1.0 + BEND_X * v * v);
-                    let sv = v * (1.0 + BEND_Y * u * u);
+                    let su = u * (1.0 + bend_x * v * v);
+                    let sv = v * (1.0 + bend_y * u * u);
                     if su.abs() >= 1.0 || sv.abs() >= 1.0 {
                         continue;
                     }
@@ -86,11 +101,11 @@ impl Crt {
                 }
             }
         }
-        Crt { w, h, tubes, map, gain, out: vec![0u8; w * h * 4] }
+        Crt { w, h, tubes, curved, map, gain, out: vec![0u8; w * h * 4] }
     }
 
-    pub fn fits(&self, w: usize, h: usize, tubes: usize) -> bool {
-        self.w == w && self.h == h && self.tubes == tubes.clamp(1, 8)
+    pub fn fits(&self, w: usize, h: usize, tubes: usize, curved: bool) -> bool {
+        self.w == w && self.h == h && self.tubes == tubes.clamp(1, 8) && self.curved == curved
     }
 
     /// The CRT image of `src` (4 bytes per pixel, any channel order; the
@@ -158,7 +173,7 @@ mod tests {
     #[test]
     fn centre_maps_to_centre_and_corners_are_black() {
         let (w, h) = (64, 48);
-        let crt = Crt::new(w, h, 1);
+        let crt = Crt::new(w, h, 1, true);
         let c = (h / 2) * w + w / 2;
         let s = crt.map[c] as usize;
         assert!((s % w).abs_diff(w / 2) <= 1 && (s / w).abs_diff(h / 2) <= 1);
@@ -167,9 +182,18 @@ mod tests {
     }
 
     #[test]
+    fn flat_maps_pixels_to_themselves() {
+        let (w, h) = (64, 48);
+        let crt = Crt::new(w, h, 2, false);
+        for i in 0..w * h {
+            assert_eq!(crt.map[i], i as u32);
+        }
+    }
+
+    #[test]
     fn two_tubes_sample_their_own_half() {
         let (w, h) = (64, 32);
-        let crt = Crt::new(w, h, 2);
+        let crt = Crt::new(w, h, 2, true);
         for y in 0..h {
             for x in 0..w {
                 let s = crt.map[y * w + x];
@@ -183,10 +207,10 @@ mod tests {
     #[test]
     fn deterministic_and_flat_white_stays_bright_in_the_middle() {
         let (w, h) = (40, 30);
-        let mut a = Crt::new(w, h, 1);
+        let mut a = Crt::new(w, h, 1, true);
         let src = vec![255u8; w * h * 4];
         let out_a = a.apply(&src).to_vec();
-        let mut b = Crt::new(w, h, 1);
+        let mut b = Crt::new(w, h, 1, true);
         assert_eq!(out_a, b.apply(&src));
         let mid = ((h / 2 - 2) * w + w / 2) * 4; // row 13: a scanline, not a gap
         assert!(out_a[mid] > 200, "centre too dark: {}", out_a[mid]);

@@ -299,8 +299,9 @@ impl SurfaceOutputDetail {
                 if tubes > 0 && bpt == 4 {
                     // the CRT look (crt.rs): curvature, scanlines, vignette
                     let mut cache = super::crt::CACHE.lock().unwrap();
-                    if !cache.as_ref().is_some_and(|c| c.fits(w, h, tubes)) {
-                        *cache = Some(super::crt::Crt::new(w, h, tubes));
+                    let curved = super::crt::curved();
+                    if !cache.as_ref().is_some_and(|c| c.fits(w, h, tubes, curved)) {
+                        *cache = Some(super::crt::Crt::new(w, h, tubes, curved));
                     }
                     let t0 = crate::clock::monotonic();
                     let out = cache.as_mut().unwrap().apply(&bytes);
