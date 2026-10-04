@@ -51,11 +51,14 @@ internal; userspace "draws" only by *writing text* into the channel.
 
 Two more facts that shape the plan:
 
-- **The kernel refuses W^X** (`mm.rs`: `PROT_WRITE|PROT_EXEC` → `EINVAL`, "a JIT is
-  not something this target supports"). This matters for the wgpu backend's shader
-  execution — see §5.
-- **No `memfd_create`.** Needed later by the JIT-via-dual-mapping option and by any
-  Mesa/lavapipe escape hatch.
+- **The kernel refuses a page that is writable and executable at once** (`mm.rs`:
+  `PROT_WRITE|PROT_EXEC` in one `mmap`/`mprotect` call → `EINVAL`). **But a JIT does not
+  need one — measured 2026-10-04** with `userspace/jitprobe/c/jit_probe.c` in the
+  kernel repo, on the trashcan: mmap RW → emit code → `mprotect(R+X)` → call works,
+  RX→RW→rewrite→RX re-JIT cycles work (no stale code), an RX page survives `fork`, and
+  a JITed loop runs at native speed (0.39 ns/iter). See §5b.
+- **No `memfd_create`.** Only needed by any Mesa/lavapipe escape hatch now (the
+  dual-mapping JIT it was once listed for is unnecessary).
 - **QEMU `microvm` has no framebuffer at all** (`run.sh` proves this: `FBTRACE`
   writes what the screen *would* show to port 0xE9). The fb rig is the trashcan, or a
   new QEMU rig booted through GRUB (§7).
@@ -153,9 +156,9 @@ check), no `PROT_EXEC` (W^X untouched). Teardown: existing munmap/exit paths.
 
 **S6 — ownership + handoff.** §3. Includes the panic path.
 
-**S7 — optional, later: `memfd_create`** (x86-64 #319). Only needed for the JIT
-option (§5 B) or a Mesa escape hatch (§5 C). Small, known-shaped syscall; not on the
-critical path.
+**S7 — optional, later: `memfd_create`** (x86-64 #319). *No longer needed for the JIT*
+(§5b B works with plain `mprotect`, measured 2026-10-04); only a Mesa escape hatch
+(§5 C) would want it. Small, known-shaped syscall; not on the critical path.
 
 **Verification harness.**
 
@@ -201,8 +204,8 @@ vendor code from it.
 
 | option | mechanism | verdict |
 |---|---|---|
-| **A. interpret, don't JIT** | backend parses WGSL with `naga` (`wgsl-in`, pure Rust) and walks the IR per-vertex/fragment in Rust; no executable memory at all | **do this first.** Slow (maybe 10-50x) but the demo's shaders are trivial and rio's sugarloaf shaders are simple (glyph-atlas quads + SDF). Zero kernel changes beyond §4 |
-| **B. JIT via dual mapping** | cranelift needs W+X or a W/RX pair on the same code. Kernel refuses W\|X by policy. Escape: `memfd_create` + two `MAP_SHARED` maps (one RW to write, one RX to run) — fpcache already shares file frames across mappings (that is what `fbstest`/`fpcpoison` prove) | viable but a policy conversation + S7; defer |
+| **A. interpret, don't JIT** | backend parses WGSL with `naga` (`wgsl-in`, pure Rust) and walks the IR per-vertex/fragment in Rust; no executable memory at all | **done first (M3); now the slow path to replace.** Slow (maybe 10-50x) but the demo's shaders are trivial and rio's sugarloaf shaders are simple (glyph-atlas quads + SDF). Zero kernel changes beyond §4 |
+| **B. JIT via RW→RX `mprotect`** | emit code into an RW anonymous page, `mprotect` it to R+X, run it; to patch, flip back to RW. **No W+X page ever exists, so the kernel's W^X policy is not violated and no kernel change or `memfd_create` is needed.** Originally written up here as "needs dual mapping"; that was wrong — `jit_probe` (kernel repo, `userspace/jitprobe/c/`) passed every arm on the trashcan on 2026-10-04, native-speed loop included | **viable today.** Cost is userspace only: someone must lower naga IR to machine code (hand-rolled x86-64 emitter for the few ops sugarloaf needs, or cranelift — which strains the tiny-deps rule and its on-box musl build is unverified) |
 | **C. Mesa lavapipe + stock wgpu** | CPU Vulkan ICD; wgpu's normal Vulkan backend talks to it | no custom-backend work at all, but a large foreign dependency, needs `memfd_create` and more ABI surface; keep as an escape hatch, not the plan |
 
 The demo therefore has **two render paths behind one screen**:
@@ -301,4 +304,4 @@ PVH boot likewise has none (`map_wc` is not even exercised there). Options:
 - **WGSL interpreter completeness** (option A) is scoped to what sugarloaf needs
   (fragment shaders over an atlas, simple uniforms) — enumerate sugarloaf's shaders
   before promising M3 dates.
-- **`memfd_create`** only if option B or the Mesa escape hatch is ever taken (S7).
+- **`memfd_create`** only if the Mesa escape hatch is ever taken (S7); option B does not need it.

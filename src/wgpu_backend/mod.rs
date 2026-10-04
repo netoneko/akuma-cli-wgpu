@@ -2,7 +2,7 @@
 //!
 //! Layout of this module:
 //!
-//! * `interp`   — the naga IR interpreter (no JIT: kernel W^X, plan §5b A)
+//! * `interp`   — the naga IR interpreter (no JIT yet: plan §5b A; RW->RX JIT is feasible)
 //! * `backend`  — the `wgpu::custom::*` implementations, including the
 //!   fixed-function rasterizer whose contract is softrender's scanline walk
 //! * `shaders`  — the WGSL programs, line-for-line ports of softrender's math
@@ -305,7 +305,10 @@ impl WgpuRenderer {
     pub fn render(&mut self, frame: &mut Frame, scene: &mut Scene, time: f32, with_rain: bool) {
         // 1. the shared backdrop: clear + rain, identical code to the other
         // path — identical bits by construction
+        let t0 = crate::clock::monotonic();
         softrender::backdrop(frame, scene, time, with_rain);
+        prof::add_ns(0, crate::clock::monotonic() - t0);
+        prof::inc(10, 1);
 
         let n = scene.tris.len();
         if n > 0 {
@@ -326,6 +329,7 @@ impl WgpuRenderer {
             // right after c, at +44. (The original code packed the 12 floats
             // contiguously — b/c then read shifted by one float, which is
             // the squashed-cat M3 parity bug.)
+            let t0 = crate::clock::monotonic();
             let mut mesh = vec![0u8; n * TRI_WGSL_STRIDE];
             for (i, t) in scene.tris.iter().enumerate() {
                 let o = i * TRI_WGSL_STRIDE;
@@ -339,9 +343,11 @@ impl WgpuRenderer {
             }
             let (tris_buf, _) = self.tris.as_ref().unwrap();
             self.queue.write_buffer(tris_buf, 0, &mesh);
+            prof::add_ns(1, crate::clock::monotonic() - t0);
 
             // 3. the current frame (BG + rain so far) becomes the load
             // contents of the color target
+            let t0 = crate::clock::monotonic();
             let mut pixels = Vec::with_capacity(frame.buf.len() * 4);
             for &px in &frame.buf {
                 pixels.extend_from_slice(&px.to_le_bytes());
@@ -361,6 +367,7 @@ impl WgpuRenderer {
                 },
                 extent(self.w, self.h),
             );
+            prof::add_ns(2, crate::clock::monotonic() - t0);
 
             // 4. render pass: draw the logo over the loaded backdrop
             let mut enc = self
@@ -411,6 +418,7 @@ impl WgpuRenderer {
                 },
                 extent(self.w, self.h),
             );
+            let t0 = crate::clock::monotonic();
             let done = self.queue.submit([enc.finish()]);
 
             self.device.poll(wgpu::PollType::Wait {
@@ -418,6 +426,8 @@ impl WgpuRenderer {
                 timeout: None,
             })
             .expect("wgpu: poll failed");
+            prof::add_ns(3, crate::clock::monotonic() - t0);
+            let t0 = crate::clock::monotonic();
 
             let (tx, rx) = std::sync::mpsc::channel();
             self.readback
@@ -444,6 +454,7 @@ impl WgpuRenderer {
                         u32::from_le_bytes([row[o], row[o + 1], row[o + 2], 0]);
                 }
             }
+            prof::add_ns(7, crate::clock::monotonic() - t0);
         }
     }
 }
@@ -453,5 +464,66 @@ fn extent(w: usize, h: usize) -> wgpu::Extent3d {
         width: w as u32,
         height: h as u32,
         depth_or_array_layers: 1,
+    }
+}
+
+/// Phase counters for `AKUMA_PROF=1` (stderr report when a `WgpuRenderer`
+/// drops). Plain atomics so the backend's executor can bump them from
+/// wherever it runs; nanoseconds via `clock::monotonic`, never std `Instant`.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const NAMES: [&str; 11] = [
+        "backdrop (cpu rain)",
+        "pack mesh",
+        "upload color tex",
+        "submit+poll total",
+        "  vertex stage",
+        "  raster excl. fragment",
+        "  fragment stage",
+        "readback copy+blit",
+        "vertex invocations",
+        "fragment invocations",
+        "frames",
+    ];
+    pub static C: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+    pub fn add_ns(i: usize, secs: f64) {
+        C[i].fetch_add((secs * 1e9) as u64, Relaxed);
+    }
+    pub fn inc(i: usize, n: u64) {
+        C[i].fetch_add(n, Relaxed);
+    }
+    pub fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var_os("AKUMA_PROF").is_some())
+    }
+    pub fn report() {
+        let frames = C[10].load(Relaxed).max(1);
+        eprintln!("[prof] {frames} frames");
+        for i in 0..8 {
+            let mut ns = C[i].load(Relaxed);
+            if i == 5 {
+                // slot 5 holds the whole raster loop; fragment time is nested in it
+                ns = ns.saturating_sub(C[6].load(Relaxed));
+            }
+            eprintln!("[prof] {:<26} {:>9.3} ms/frame", NAMES[i], ns as f64 / 1e6 / frames as f64);
+        }
+        let v = C[8].load(Relaxed);
+        let f = C[9].load(Relaxed);
+        eprintln!("[prof] vertex invocations   {:>9}/frame, {:.0} ns each", v / frames, C[4].load(Relaxed) as f64 / v.max(1) as f64);
+        eprintln!("[prof] fragment invocations {:>9}/frame, {:.0} ns each", f / frames, C[6].load(Relaxed) as f64 / f.max(1) as f64);
+        for c in C.iter() {
+            c.store(0, Relaxed);
+        }
+    }
+}
+
+impl Drop for WgpuRenderer {
+    fn drop(&mut self) {
+        if prof::enabled() {
+            prof::report();
+        }
     }
 }

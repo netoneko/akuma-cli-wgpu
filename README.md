@@ -102,7 +102,7 @@ ANSI-terminal screensaver with the same subcommands, `--latin`, arrow keys to sw
 | `src/rng.rs` | xorshift64* with a splitmix64-seeded `with_seed` constructor; the render path never touches wall-clock or ASLR entropy (rule 5) |
 | `src/input.rs` | termios raw mode, `poll(2)` and escape-sequence decoding; SIGINT/SIGTERM exit the process immediately (kernel signal bug — see done-log) |
 | `src/clock.rs` | `Pacer` (sleeps out the frame budget) and `FpsMeter` (live fps, over-budget count, slowest frame) — EINTR-tolerant `CLOCK_MONOTONIC`/`nanosleep`, never std `Instant` (kernel note in `input.rs`) |
-| `src/wgpu_backend/` | **milestone M3, the wgpu custom backend — exists now.** `mod.rs`: `WgpuRenderer`, the exact `new(w, h)`/`render(&mut frame, &mut scene, time, with_rain)` surface of the software `Renderer`, so `--wgpu` swaps paths in one place. `backend.rs`: the `wgpu::custom::*` device/adapter/queue plus the fixed-function rasterizer under contract to mirror softrender's scanline walk. `interp.rs`: the naga-IR interpreter — no JIT, the kernel refuses W^X (plan §5b A). `shaders.rs`: the WGSL, line-for-line ports of softrender's per-frame math. Status: runs, rain identical, **mesh not yet frame-identical** — see "The wgpu backend (M3)" |
+| `src/wgpu_backend/` | **milestone M3, the wgpu custom backend — exists now.** `mod.rs`: `WgpuRenderer`, the exact `new(w, h)`/`render(&mut frame, &mut scene, time, with_rain)` surface of the software `Renderer`, so `--wgpu` swaps paths in one place. `backend.rs`: the `wgpu::custom::*` device/adapter/queue plus the fixed-function rasterizer under contract to mirror softrender's scanline walk. `interp.rs`: the naga-IR interpreter — no JIT *yet* (plan §5b A; a JIT is feasible, see "Next steps"). `shaders.rs`: the WGSL, line-for-line ports of softrender's per-frame math. Status: runs, rain identical, **mesh not yet frame-identical** — see "The wgpu backend (M3)" |
 | `src/akuma_{20,40,79,120}.txt` | the logo at four sizes; `akuma_40.txt` is byte-identical to the kernel's boot-banner asset |
 
 Composing each frame in ordinary RAM and copying whole rows into the mapping is deliberate. The
@@ -114,7 +114,7 @@ box) and slow for scattered writes (~71 MB/s). Keep that property in anything yo
 `--wgpu` renders any mode through the custom backend instead of the software rasterizer:
 `wgpu::Instance::from_custom(backend::Instance)` (wgpu 30, `features = ["custom", "wgsl"]`, no
 real GPU backends in the build), WGSL parsed by naga into IR and *interpreted* (`interp.rs`) —
-no JIT, the kernel refuses writable-and-executable memory (plan §5b option A). Rasterization is
+no JIT yet (plan §5b option A). The kernel refuses writable-and-executable pages, but a JIT does not need one — see "Next steps". Rasterization is
 fixed-function in `backend.rs`, under contract to mirror softrender's scanline walk exactly
 (same `mul_add` area test and `-0.01` cull, same edge/z interpolation, strict `z <` depth test).
 
@@ -336,6 +336,39 @@ what its absence does.
   `selftest --dump` last frames at `--frames 40` vs `--frames 100`: trails advance several
   rows deeper over the extra second (frozen rain dumps were identical). Live
   `matrix --timeout 2`: 113 frames @ 54 fps on the panel.
+
+## Next steps (2026-10-04) — the wgpu path is too slow; here is the order
+
+**Finding:** the kernel's W^X policy does **not** block a JIT. `userspace/jitprobe/c/jit_probe.c`
+in the kernel repo ran on the trashcan and passed: mmap RW → write code → `mprotect(R+X)` →
+call; RX→RW→rewrite→RX re-JIT cycles (fresh code each time); an RX page surviving `fork`; a
+JITed loop at 0.39 ns/iter. Only a single call asking for W+X together is refused (`EINVAL`),
+and no JIT needs that. So no kernel work and no `memfd_create` — the plan's old "option B
+needs dual mapping" was wrong (corrected in `docs/fbdev-wgpu-plan.md` §5b).
+
+Order matters; each step makes the next one verifiable:
+
+1. **Fix the mesh defect first** (M3 section above; repro is cheap at 256×144). Without frame
+   equality with softrender, no speedup can be checked against the baseline checksums.
+2. **Profile the wgpu path** (per-frame time split: vertex interp, fragment interp, rasterizer,
+   buffer clones/allocations). The slowness is attributed to the interpreter by inference,
+   not measurement — measure before building anything.
+3. **Introduce a shader-executor interface** between `backend.rs` and the executor, with the
+   current tree-walking interpreter as one implementation. Later steps become swappable
+   and diffable against it.
+4. **A faster, no-executable-memory executor:** compile the naga IR once at pipeline creation
+   into a flat register bytecode or closures. Expect several-fold; also the fallback if the
+   JIT is ever unavailable.
+5. **A JIT executor** behind the same interface, W^X-clean (RW→RX flips). Choice to make:
+   a small hand-written x86-64 emitter covering only the ops sugarloaf's shaders use (keeps
+   rule 2 — three dependencies — intact), versus `cranelift` (more general, but breaks rule 2
+   and its build on the on-box musl nightly is unverified; spike that on the box before
+   committing). First enumerate sugarloaf's actual WGSL so the op set is known.
+6. **Then rio** (`rio-window` framebuffer platform + this backend). rio redraws on change
+   with 2D quads and a glyph atlas, so it needs far less than full-screen 60 fps shading.
+
+Run the probe again after any kernel memory-management change: `userspace/jitprobe/c/build.sh
+--push-akuma && ssh akuma /tmp/jit_probe` (kernel repo).
 
 ## Tasks, in order
 

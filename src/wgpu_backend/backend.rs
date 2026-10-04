@@ -916,6 +916,7 @@ fn execute_render(data: RenderPassData) {
                 };
                 for inst in instances.clone() {
                     // vertex stage: one interpreter invocation per corner
+                    let tv = crate::clock::monotonic();
                     let mut verts = Vec::with_capacity((vertices.end - vertices.start) as usize);
                     for vi in vertices.clone() {
                         verts.push(interp::run_vertex(
@@ -926,9 +927,14 @@ fn execute_render(data: RenderPassData) {
                             inst,
                         ));
                     }
+                    super::prof::add_ns(4, crate::clock::monotonic() - tv);
+                    super::prof::inc(8, verts.len() as u64);
+                    let tr = crate::clock::monotonic();
                     for tri in verts.chunks_exact(3) {
                         raster_tri(tri, pipe, &res, depth_st, &mut zbuf, &mut color, w, h);
                     }
+                    // raster total minus the fragment time raster_tri booked
+                    super::prof::add_ns(5, crate::clock::monotonic() - tr);
                 }
             }
         }
@@ -1037,13 +1043,17 @@ fn raster_tri(
                 *zi = z;
                 // fragment stage for this pixel; it returns the four raw
                 // target-component values
-                if let Some(px) = interp::run_fragment(
+                let tf = crate::clock::monotonic();
+                let frag = interp::run_fragment(
                     &fs.shader,
                     fs.entry,
                     res,
                     provoking,
                     [x as f32 + 0.5, yy, z, 1.0],
-                ) {
+                );
+                super::prof::add_ns(6, crate::clock::monotonic() - tf);
+                super::prof::inc(9, 1);
+                if let Some(px) = frag {
                     let o = (row + x as usize) * 4;
                     color[o..o + 4].copy_from_slice(&[
                         px[0] as u8,
