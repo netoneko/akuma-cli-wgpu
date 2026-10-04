@@ -38,6 +38,7 @@ pub fn optimize(p: &mut Program, bufs: Option<&[&[u8]]>) -> Vec<Folded> {
     for _ in 0..12 {
         let mut ch = fold(p, bufs, &mut folded);
         ch |= prune(p);
+        ch |= ifconv(p);
         ch |= dce(p);
         if !ch {
             break;
@@ -456,4 +457,157 @@ fn dce(p: &mut Program) -> bool {
         return changed_any | dce(p);
     }
     changed_any
+}
+
+
+/// Calls cheap enough to run speculatively.
+fn cheap_call(f: super::program::Fun) -> bool {
+    use super::program::Fun::*;
+    matches!(f, Ceil | Floor | Round | Trunc | Sign | FMin | FMax | Clamp01 | IsInf | F2I | F2U | IAbs | ISign)
+}
+
+/// If-conversion. A small `if` / `if else` whose arms are straight-line pure
+/// code becomes both arms executed unconditionally plus a `Select` per
+/// register they assign. A conditional branch is a liability for the wide
+/// JIT — a branch whose lanes disagree throws the whole batch back to
+/// one-lane-at-a-time execution — and WGSL's short-circuit `||` / `&&` (which
+/// the front end turns into a branch and a temporary) disagree all the time:
+/// every vertex batch of sugarloaf's glyph shader used to diverge on
+/// `vid == 1u || vid == 3u`.
+///
+/// Arms may only assign registers through single-destination pure
+/// instructions (no texture fetches, no result-cached libm calls), so
+/// speculating them is safe: out-of-range buffer loads yield 0 and nothing
+/// traps. Registers written once in total (arm-local temporaries) are kept as
+/// they are; any other register an arm assigns gets a fresh temporary per arm
+/// and a `Select` after the arms.
+fn ifconv(p: &mut Program) -> bool {
+    let mut any = false;
+    for _ in 0..256 {
+        if !ifconv_once(p) {
+            break;
+        }
+        any = true;
+    }
+    any
+}
+
+fn ifconv_once(p: &mut Program) -> bool {
+    const MAX_ARM: usize = 16;
+    let n = p.code.len();
+    let mut tcount = vec![0u32; n + 1];
+    for i in &p.code {
+        if let Some(t) = jump_target(i) {
+            tcount[t as usize] += 1;
+        }
+    }
+    let nw = write_counts(p);
+    for i in 0..n {
+        let (c, e, jz) = match p.code[i] {
+            Inst::Jz { c, t } => (c, t as usize, true),
+            Inst::Jnz { c, t } => (c, t as usize, false),
+            _ => continue,
+        };
+        if e <= i + 1 || e >= n {
+            continue;
+        }
+        // diamond (then-arm ends in a jump over the else-arm) or triangle
+        let (then_end, else_arm, m) = match p.code[e - 1] {
+            Inst::Jmp { t } if (t as usize) > e && (t as usize) < n => (e - 1, Some(e..t as usize), t as usize),
+            _ => (e, None, e),
+        };
+        if else_arm.is_some() && tcount[e] != 1 {
+            continue;
+        }
+        // nothing else may enter the arms
+        if (i + 1..m).any(|k| k != e && tcount[k] > 0) {
+            continue;
+        }
+        let arm_ok = |r: std::ops::Range<usize>| -> bool {
+            r.len() <= MAX_ARM
+                && p.code[r.clone()].iter().all(|x| match *x {
+                    Inst::Call { f, .. } => cheap_call(f),
+                    Inst::CallC { .. } | Inst::Tex { .. } => false,
+                    ref other => pure_dst(other).is_some(),
+                })
+        };
+        let then_r = i + 1..then_end;
+        let else_r = else_arm.clone().unwrap_or(e..e);
+        if !arm_ok(then_r.clone()) || !arm_ok(else_r.clone()) {
+            continue;
+        }
+        // the condition must survive the arms
+        let mut writes_c = false;
+        for k in then_r.clone().chain(else_r.clone()) {
+            writes(p, &p.code[k], |d| writes_c |= d == c);
+        }
+        if writes_c {
+            continue;
+        }
+
+        // rename the multiply-assigned registers each arm writes
+        let mut next = p.nregs;
+        let mut rename = |arm: std::ops::Range<usize>| -> (Vec<Inst>, Vec<(R, R)>) {
+            let mut map: Vec<(R, R)> = Vec::new();
+            let mut out = Vec::new();
+            for k in arm {
+                let mut inst = p.code[k];
+                inst.map_reads(|r| map.iter().find(|(o, _)| *o == r).map_or(r, |(_, t)| *t));
+                if let Some(d) = pure_dst(&inst) {
+                    if nw[d as usize] > 1 {
+                        let t = match map.iter().find(|(o, _)| *o == d) {
+                            Some((_, t)) => *t,
+                            None => {
+                                let t = next;
+                                next += 1;
+                                map.push((d, t));
+                                t
+                            }
+                        };
+                        inst.set_dst(t);
+                    }
+                }
+                out.push(inst);
+            }
+            (out, map)
+        };
+        let (then_code, then_map) = rename(then_r);
+        let (else_code, else_map) = rename(else_r);
+        let mut regs: Vec<R> = then_map.iter().chain(else_map.iter()).map(|(d, _)| *d).collect();
+        regs.sort_unstable();
+        regs.dedup();
+        let mut new_code: Vec<Inst> = Vec::new();
+        new_code.extend(then_code);
+        new_code.extend(else_code);
+        for d in regs {
+            let tv = then_map.iter().find(|(o, _)| *o == d).map_or(d, |(_, t)| *t);
+            let ev = else_map.iter().find(|(o, _)| *o == d).map_or(d, |(_, t)| *t);
+            // Jz: c != 0 runs the then-arm; Jnz: c != 0 jumps to the else label
+            let (a, b) = if jz { (tv, ev) } else { (ev, tv) };
+            new_code.push(Inst::Select { d, c, a, b });
+        }
+        // splice [i, m) := new_code
+        let len = new_code.len();
+        let old = m - i;
+        let mut code: Vec<Inst> = Vec::with_capacity(n + len);
+        code.extend_from_slice(&p.code[..i]);
+        code.extend_from_slice(&new_code);
+        code.extend_from_slice(&p.code[m..]);
+        for (k, inst) in code.iter_mut().enumerate() {
+            if k >= i && k < i + len {
+                continue;
+            }
+            if let Some(t) = jump_target(inst) {
+                let t = t as usize;
+                let nt = if t >= m { t + len - old } else { t };
+                set_target(inst, nt as u32);
+            }
+        }
+        p.code = code;
+        let extra = (next - p.nregs) as usize;
+        p.nregs = next;
+        p.init.resize(p.init.len() + extra, 0);
+        return true; // indices moved: the caller's next round starts afresh
+    }
+    false
 }

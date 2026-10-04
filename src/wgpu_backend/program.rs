@@ -270,6 +270,20 @@ impl Inst {
         }
     }
 
+    /// redirect the single destination register (no-op for instructions without one)
+    pub fn set_dst(&mut self, r: R) {
+        use Inst::*;
+        match self {
+            Mov { d, .. } | Const { d, .. } | FAdd { d, .. } | FSub { d, .. } | FMul { d, .. }
+            | FDiv { d, .. } | FNeg { d, .. } | FAbs { d, .. } | Sqrt { d, .. } | IAdd { d, .. }
+            | ISub { d, .. } | IMul { d, .. } | And { d, .. } | Or { d, .. } | Xor { d, .. }
+            | Not { d, .. } | Shl { d, .. } | ShrS { d, .. } | ShrU { d, .. } | Cmp { d, .. }
+            | Select { d, .. } | I2F { d, .. } | U2F { d, .. } | Call { d, .. } | CallC { d, .. }
+            | LoadBuf { d, .. } => *d = r,
+            Tex { .. } | Jmp { .. } | Jz { .. } | Jnz { .. } | MemoGet { .. } | MemoPut { .. } | Kill | Ret => {}
+        }
+    }
+
     /// rewrite every register operand this instruction reads (not a `CallC`'s
     /// cache registers, and not texture coordinates, which live in `tex_ops`)
     pub fn map_reads(&mut self, mut f: impl FnMut(R) -> R) {
