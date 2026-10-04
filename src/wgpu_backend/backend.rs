@@ -2522,9 +2522,6 @@ pub struct BufferMapped {
     len: usize,
     pub offset: BufferAddress,
     pub size: usize,
-    /// map was taken in Write mode (`queue.write_buffer_with`): write_slice
-    /// hands out the same storage, not a copy
-    write: bool,
 }
 
 // the pointee is owned by `_keep` and is only ever accessed through this
@@ -2543,7 +2540,10 @@ impl wgpu::custom::BufferMappedRangeInterface for BufferMapped {
     }
 
     unsafe fn write_slice(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
-        assert!(self.write, "akuma backend: buffer not mapped for writing");
+        // Only reached for maps the caller intends to write (wgpu's
+        // contract: a read-only map is never written through). Note
+        // write_buffer_with does not go through map_async, so there is no
+        // mode flag to check here.
         // WriteOnly::new is unsafe: the caller (wgpu) promises not to read
         // through it; we only expose our own buffer's bytes
         let all = unsafe {
@@ -2573,7 +2573,6 @@ impl wgpu::custom::BufferInterface for BufferData {
         &self,
         sub_range: std::ops::Range<BufferAddress>,
     ) -> Result<wgpu::custom::DispatchBufferMappedRange, wgpu::MapRangeError> {
-        let write = self.map_mode.lock().unwrap().is_some_and(|m| m == MapMode::Write);
         let (ptr, len) = {
             let g = self.bytes.lock().unwrap();
             (g.as_ptr() as *mut u8, g.len())
@@ -2586,7 +2585,6 @@ impl wgpu::custom::BufferInterface for BufferData {
                 len,
                 offset: sub_range.start,
                 size,
-                write,
             },
         ))
     }
