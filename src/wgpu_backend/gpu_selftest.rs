@@ -1110,7 +1110,20 @@ struct U { pad: vec4<f32>, dims: vec4<u32> };
                     crate::wgpu_backend::runs::ENABLED.store(false, Relaxed);
                     let want = run(vs, fs, topo, verts, geo, spec);
                     crate::wgpu_backend::runs::ENABLED.store(true, Relaxed);
+                    let before = crate::wgpu_backend::raster::RUN_PIXELS.load(Relaxed);
                     let got = run(vs, fs, topo, verts, geo, spec);
+                    let replicated = crate::wgpu_backend::raster::RUN_PIXELS.load(Relaxed) - before;
+                    // x86-64 only (the wide JIT): the grid shader must really
+                    // take the run path, the leaky one must not
+                    if cfg!(all(target_arch = "x86_64", target_os = "linux")) && geo[2] >= 5.0 {
+                        let leaky = fs == leaky_fs;
+                        if (replicated == 0) != leaky {
+                            return Err(format!(
+                                "{name}, {} shader, cells {geo:?}: {replicated} pixels replicated",
+                                if leaky { "leaky" } else { "grid" }
+                            ));
+                        }
+                    }
                     if got != want {
                         let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap() / 4;
                         return Err(format!(

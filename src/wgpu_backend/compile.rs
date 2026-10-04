@@ -194,7 +194,8 @@ pub fn compile_with_template(sh: &Shader, entry: usize) -> Res<(Program, Program
     super::opt::optimize(&mut prog, None);
     let template = prog.clone();
     if ep.stage == naga::ShaderStage::Fragment {
-        super::memo::apply(&mut prog);
+        let pre = super::runs::analyze(&prog);
+        super::memo::apply(&mut prog, pre.needs_until);
         prog.runs = super::runs::analyze(&prog);
     }
     Ok((prog, template))

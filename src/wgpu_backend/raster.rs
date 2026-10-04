@@ -23,6 +23,9 @@ use super::exec::{Invoker, RawVertex, Varyings, MAX_LOC};
 use super::format;
 use super::program::Interp;
 
+/// pixels produced by run replication (tests check the mechanism is exercised)
+pub static RUN_PIXELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// sub-pixel precision: coordinates are snapped to 1/256 pixel
 const SUB: i64 = 256;
 /// clip x/y to this many times w (NDC ±GUARD): keeps snapped coordinates
@@ -371,6 +374,7 @@ impl Raster<'_> {
                             let src = ((py - 1 - self.row0) * cw + min_x + olo) as usize * 4;
                             let dst = ((py - self.row0) * cw + min_x + olo) as usize * 4;
                             self.color.data.copy_within(src..src + (ohi - olo) as usize * 4, dst);
+                            RUN_PIXELS.fetch_add((ohi - olo) as u64, std::sync::atomic::Ordering::Relaxed);
                             if ohi < hi {
                                 pure &= row(self, fs, ohi, hi);
                             }
@@ -568,6 +572,7 @@ impl Raster<'_> {
                             for q in self.color.data[at..at + extra * 4].chunks_exact_mut(4) {
                                 q.copy_from_slice(&t);
                             }
+                            RUN_PIXELS.fetch_add(extra as u64, std::sync::atomic::Ordering::Relaxed);
                             done += extra;
                         }
                     }

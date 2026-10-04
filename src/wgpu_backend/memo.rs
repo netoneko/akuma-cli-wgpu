@@ -89,14 +89,16 @@ struct Pick {
     outs: Vec<R>,
 }
 
-pub fn apply(p: &mut Program) {
+/// Memoize the best region that starts at or after instruction `min_start`
+/// (code before it — e.g. what run detection needs — must always execute).
+pub fn apply(p: &mut Program, min_start: usize) {
     if std::env::var("AKUMA_MEMO").as_deref() == Ok("0") {
         return;
     }
     if !p.memos.is_empty() {
         return;
     }
-    if let Some(pick) = select(p) {
+    if let Some(pick) = select(p, min_start) {
         if std::env::var_os("AKUMA_EXEC_VERBOSE").is_some() {
             eprintln!(
                 "[memo] region {}..{} of {}: keys {:?}, results {:?}",
@@ -107,7 +109,7 @@ pub fn apply(p: &mut Program) {
     }
 }
 
-fn select(p: &Program) -> Option<Pick> {
+fn select(p: &Program, min_start: usize) -> Option<Pick> {
     let n = p.code.len();
     if n < 8 || !matches!(p.code[n - 1], Inst::Ret) {
         return None;
@@ -138,7 +140,7 @@ fn select(p: &Program) -> Option<Pick> {
     };
 
     let mut best: Option<(i64, Pick)> = None;
-    for s in 1..e {
+    for s in min_start.max(1)..e {
         let Some(pick) = try_region(p, s, e, &written, &is_input, &out_regs) else { continue };
         let weight_sum: u32 = p.code[s..e].iter().map(weight).sum();
         let overhead = 25 + 15 * pick.ins.len() as u32 + 4 * pick.outs.len() as u32;

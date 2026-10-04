@@ -276,7 +276,8 @@ impl Stage {
         }
         let was = prog.code.len();
         if self.is_fragment_program(&prog) {
-            super::memo::apply(&mut prog);
+            let pre = super::runs::analyze(&prog);
+            super::memo::apply(&mut prog, pre.needs_until);
             prog.runs = super::runs::analyze(&prog);
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

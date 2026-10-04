@@ -76,6 +76,10 @@ pub struct Axis {
 pub struct RunInfo {
     pub x: Option<Axis>,
     pub y: Option<Axis>,
+    /// one past the last instruction a site depends on: code before this must
+    /// run for the extents to be known, so a memoized region may not start
+    /// earlier
+    pub needs_until: usize,
 }
 
 /// tests flip this to compare the same draw with and without runs
@@ -385,14 +389,23 @@ pub fn analyze(p: &Program) -> RunInfo {
         }
         at
     };
-    let build = |a: &Analysis, other: &Analysis| -> Option<Axis> {
+    let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
+    let build = |a: &Analysis, other: &Analysis, needed: &mut usize| -> Option<Axis> {
         if !a.ok {
+            if verbose {
+                eprintln!("[runs]   position reaches an output, branch or texture coordinate");
+            }
             return None;
         }
         let mut sites = Vec::new();
         for (idx, s) in &a.sites {
+            // the chain operands' definitions are before the site; record the site
+            *needed = (*needed).max(*idx + 1);
             // the site must run on every path
             if *idx >= first_branch {
+                if verbose {
+                    eprintln!("[runs]   site at {idx} is not on every path (first branch at {first_branch})");
+                }
                 return None;
             }
             for op in &s.chain {
@@ -403,6 +416,9 @@ pub fn analyze(p: &Program) -> RunInfo {
                 // chain operands: position-independent in *both* axes, and
                 // computed before the site (or never written: a constant)
                 if a.cls[r] != Some(Cls::Clean) || other.cls[r] != Some(Cls::Clean) || nw[r] > 1 {
+                    if verbose {
+                        eprintln!("[runs]   chain operand r{r} is not constant: {:?} / {:?}, {} writes", a.cls[r], other.cls[r], nw[r]);
+                    }
                     return None;
                 }
                 if let Some(d) = def_idx(op.r) {
@@ -415,5 +431,12 @@ pub fn analyze(p: &Program) -> RunInfo {
         }
         Some(Axis { sites })
     };
-    RunInfo { x: build(&ax, &ay), y: build(&ay, &ax) }
+    let mut needed = 0usize;
+    let info = RunInfo { x: build(&ax, &ay, &mut needed), y: build(&ay, &ax, &mut needed), needs_until: 0 };
+    let info = RunInfo { needs_until: needed, ..info };
+    if std::env::var_os("AKUMA_EXEC_VERBOSE").is_some() {
+        let d = |a: &Option<Axis>| a.as_ref().map_or("no".to_string(), |a| format!("yes ({} sites)", a.sites.len()));
+        eprintln!("[runs] x: {}, y: {}", d(&info.x), d(&info.y));
+    }
+    info
 }
