@@ -43,6 +43,9 @@ use wgpu::{
 pub struct BufferData {
     pub bytes: Arc<Mutex<Vec<u8>>>,
     pub size: BufferAddress,
+    /// the mode map_async was last called with, so get_mapped_range knows
+    /// whether it must hand out a read-only or a writable view
+    pub map_mode: Mutex<Option<wgpu::MapMode>>,
 }
 
 #[derive(Debug)]
@@ -589,6 +592,7 @@ impl wgpu::custom::DeviceInterface for Device {
         wgpu::custom::DispatchBuffer::custom(BufferData {
             bytes: Arc::new(Mutex::new(vec![0u8; desc.size as usize])),
             size: desc.size,
+            map_mode: Mutex::new(None),
         })
     }
 
@@ -2511,16 +2515,20 @@ pub struct BufferMapped {
     _keep: Arc<Mutex<Vec<u8>>>,
     /// start of the buffer's bytes. Stable: buffers are allocated once at
     /// their full size and never resized, and this backend is
-    /// single-threaded with a synchronous "GPU" — nothing writes a buffer
+    /// single-threaded with a synchronous "GPU" — nothing touches a buffer
     /// while it is mapped (wgpu's own contract forbids it). Avoids copying
     /// the whole buffer on every map (33 MB per frame at 4K).
-    ptr: *const u8,
+    ptr: *mut u8,
     len: usize,
     pub offset: BufferAddress,
     pub size: usize,
+    /// map was taken in Write mode (`queue.write_buffer_with`): write_slice
+    /// hands out the same storage, not a copy
+    write: bool,
 }
 
-// the pointee is owned by `_keep` and is only ever read through this handle
+// the pointee is owned by `_keep` and is only ever accessed through this
+// handle while the map is live (wgpu's exclusivity contract)
 unsafe impl Send for BufferMapped {}
 unsafe impl Sync for BufferMapped {}
 
@@ -2535,19 +2543,29 @@ impl wgpu::custom::BufferMappedRangeInterface for BufferMapped {
     }
 
     unsafe fn write_slice(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
-        panic!("akuma backend: write mappings unused");
+        assert!(self.write, "akuma backend: buffer not mapped for writing");
+        // WriteOnly::new is unsafe: the caller (wgpu) promises not to read
+        // through it; we only expose our own buffer's bytes
+        let all = unsafe {
+            std::slice::from_raw_parts_mut(self.ptr, self.len)
+        };
+        let start = self.offset as usize;
+        let end = start + self.size;
+        unsafe { wgpu::WriteOnly::new(std::ptr::NonNull::from(&mut all[start..end])) }
     }
 }
 
 impl wgpu::custom::BufferInterface for BufferData {
     fn map_async(
         &self,
-        _mode: MapMode,
+        mode: MapMode,
         _range: std::ops::Range<BufferAddress>,
         callback: wgpu::custom::BufferMapCallback,
     ) {
         // the GPU is synchronous: by map time submit() has finished, so the
-        // map always succeeds immediately
+        // map always succeeds immediately; remember the mode for
+        // get_mapped_range (write_buffer_with maps in Write mode)
+        *self.map_mode.lock().unwrap() = Some(mode);
         callback(Ok(()));
     }
 
@@ -2555,9 +2573,10 @@ impl wgpu::custom::BufferInterface for BufferData {
         &self,
         sub_range: std::ops::Range<BufferAddress>,
     ) -> Result<wgpu::custom::DispatchBufferMappedRange, wgpu::MapRangeError> {
+        let write = self.map_mode.lock().unwrap().is_some_and(|m| m == MapMode::Write);
         let (ptr, len) = {
             let g = self.bytes.lock().unwrap();
-            (g.as_ptr(), g.len())
+            (g.as_ptr() as *mut u8, g.len())
         };
         let size = (sub_range.end.min(self.size) - sub_range.start) as usize;
         Ok(wgpu::custom::DispatchBufferMappedRange::custom(
@@ -2567,11 +2586,14 @@ impl wgpu::custom::BufferInterface for BufferData {
                 len,
                 offset: sub_range.start,
                 size,
+                write,
             },
         ))
     }
 
-    fn unmap(&self) {}
+    fn unmap(&self) {
+        *self.map_mode.lock().unwrap() = None;
+    }
 
     fn destroy(&self) {}
 }
