@@ -93,6 +93,12 @@ struct Asm {
     /// scalar fallback templates just run with lane = 0..4.
     stride: u32,
     lane: u32,
+    /// wide code: the register whose 4 lanes xmm0 holds on entry to the
+    /// instruction being emitted (None at jump targets and after anything
+    /// that is not a plain "result left in xmm0 and stored" template)
+    held_in: Option<u32>,
+    /// the same, for the instruction just emitted
+    held: Option<u32>,
 }
 
 impl Asm {
@@ -371,6 +377,8 @@ fn compile_impl(p: &Program, wide: bool) -> Result<Jit, String> {
         b: Vec::with_capacity(p.code.len() * if wide { 64 } else { 24 } + 64),
         stride: if wide { 4 } else { 1 },
         lane: 0,
+        held_in: None,
+        held: None,
     };
     // prologue
     a.u8(0x53); // push rbx
@@ -387,8 +395,17 @@ fn compile_impl(p: &Program, wide: bool) -> Result<Jit, String> {
     let mut fixups: Vec<(usize, u32)> = Vec::new(); // (rel32 position, target inst)
     let mut bail_jumps: Vec<usize> = Vec::new(); // rel32 positions to point at the bail stub
 
-    for inst in &p.code {
+    let mut is_target = vec![false; p.code.len() + 1];
+    for i in &p.code {
+        match *i {
+            Inst::Jmp { t } | Inst::Jz { t, .. } | Inst::Jnz { t, .. } | Inst::MemoGet { t, .. } => is_target[t as usize] = true,
+            _ => {}
+        }
+    }
+    for (k, inst) in p.code.iter().enumerate() {
         starts.push(a.b.len());
+        a.held_in = if is_target[k] || std::env::var_os("AKUMA_NOFWD").is_some() { None } else { a.held };
+        a.held = None;
         if wide {
             emit_wide(&mut a, p, inst, &mut fixups, &mut bail_jumps)?;
         } else {
@@ -597,8 +614,11 @@ fn emit_wide(
 ) -> Result<(), String> {
     match *inst {
         Inst::Mov { d, s } => {
-            a.vload(0, s);
+            if a.held_in != Some(s) {
+                a.vload(0, s);
+            }
             a.vstore(0, d);
+            a.held = Some(d);
         }
         Inst::Const { d, v } => {
             if v == 0 {
@@ -615,43 +635,57 @@ fn emit_wide(
                 }
             }
         }
-        Inst::FAdd { d, a: x, b } => vbin(a, &[], 0x58, d, x, b),
+        Inst::FAdd { d, a: x, b } => vbin_c(a, &[], 0x58, d, x, b, true),
         Inst::FSub { d, a: x, b } => vbin(a, &[], 0x5C, d, x, b),
-        Inst::FMul { d, a: x, b } => vbin(a, &[], 0x59, d, x, b),
+        Inst::FMul { d, a: x, b } => vbin_c(a, &[], 0x59, d, x, b, true),
         Inst::FDiv { d, a: x, b } => vbin(a, &[], 0x5E, d, x, b),
         Inst::Sqrt { d, a: x } => {
             a.vm(&[], &[0x51], 0, x); // sqrtps xmm0,[x]
             a.vstore(0, d);
+            a.held = Some(d);
         }
         Inst::FNeg { d, a: x } => {
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.v_signbit(1);
             a.vr(&[], &[0x57], 0, 1); // xorps xmm0,xmm1
             a.vstore(0, d);
+            a.held = Some(d);
         }
         Inst::FAbs { d, a: x } => {
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.v_ones(1);
             a.bytes(&[0x66, 0x0F, 0x72, 0xD1, 1]); // psrld xmm1,1
             a.vr(&[], &[0x54], 0, 1); // andps xmm0,xmm1
             a.vstore(0, d);
+            a.held = Some(d);
         }
-        Inst::IAdd { d, a: x, b } => vbin(a, &[0x66], 0xFE, d, x, b),
+        Inst::IAdd { d, a: x, b } => vbin_c(a, &[0x66], 0xFE, d, x, b, true),
         Inst::ISub { d, a: x, b } => vbin(a, &[0x66], 0xFA, d, x, b),
         Inst::IMul { d, a: x, b } => {
-            a.vload(0, x);
+            let (x, b) = if a.held_in == Some(b) && a.held_in != Some(x) { (b, x) } else { (x, b) };
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.bytes(&[0x66, 0x0F, 0x38, 0x40, 0x83]); // pmulld xmm0,[b]
             a.u32(b * 16);
             a.vstore(0, d);
+            a.held = Some(d);
         }
-        Inst::And { d, a: x, b } => vbin(a, &[0x66], 0xDB, d, x, b),
-        Inst::Or { d, a: x, b } => vbin(a, &[0x66], 0xEB, d, x, b),
-        Inst::Xor { d, a: x, b } => vbin(a, &[0x66], 0xEF, d, x, b),
+        Inst::And { d, a: x, b } => vbin_c(a, &[0x66], 0xDB, d, x, b, true),
+        Inst::Or { d, a: x, b } => vbin_c(a, &[0x66], 0xEB, d, x, b, true),
+        Inst::Xor { d, a: x, b } => vbin_c(a, &[0x66], 0xEF, d, x, b, true),
         Inst::Not { d, a: x } => {
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.v_ones(1);
             a.vr(&[0x66], &[0xEF], 0, 1); // pxor xmm0,xmm1
             a.vstore(0, d);
+            a.held = Some(d);
         }
         // shifts by a constant count: one vector op; variable counts need AVX2,
         // so those go lane by lane
@@ -664,9 +698,12 @@ fn emit_wide(
                 Inst::ShrS { .. } => 0xE0,   // /4 psrad
                 _ => 0xD0,                   // /2 psrld
             };
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.bytes(&[0x66, 0x0F, 0x72, op, n as u8]);
             a.vstore(0, d);
+            a.held = Some(d);
         }
         Inst::Cmp { d, a: x, b, c } => vcmp(a, c, d, x, b),
         Inst::Select { d, c, a: x, b } => {
@@ -681,6 +718,7 @@ fn emit_wide(
         Inst::I2F { d, a: x } => {
             a.vm(&[], &[0x5B], 0, x); // cvtdq2ps xmm0,[x]
             a.vstore(0, d);
+            a.held = Some(d);
         }
         // a load at a constant offset is the same word in every lane: load
         // once and broadcast
@@ -735,6 +773,7 @@ fn emit_wide(
             a.u32(x * 16);
             a.u8(mode);
             a.vstore(0, d);
+            a.held = Some(d);
         }
         // f32 -> i32: cvttps2dq is exact except for NaN / out of range, where it
         // yields 0x80000000; Rust saturates (NaN -> 0), so those rare batches
@@ -871,9 +910,19 @@ fn emit_wide(
 }
 
 fn vbin(a: &mut Asm, prefix: &[u8], op: u8, d: u32, x: u32, b: u32) {
-    a.vload(0, x);
+    vbin_c(a, prefix, op, d, x, b, false);
+}
+
+/// `comm`: the operation is commutative, so if xmm0 already holds the second
+/// operand it can serve as the first
+fn vbin_c(a: &mut Asm, prefix: &[u8], op: u8, d: u32, x: u32, b: u32, comm: bool) {
+    let (x, b) = if comm && a.held_in == Some(b) && a.held_in != Some(x) { (b, x) } else { (x, b) };
+    if a.held_in != Some(x) {
+        a.vload(0, x);
+    }
     a.vm(prefix, &[op], 0, b);
     a.vstore(0, d);
+    a.held = Some(d);
 }
 
 /// lane-wise compare, result 0/1 per lane
@@ -887,19 +936,25 @@ fn vcmp(a: &mut Asm, c: Cmp, d: u32, x: u32, b: u32) {
                 FLe => 2,
                 _ => 4, // not-equal, true for unordered like Rust's !=
             };
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.vm(&[], &[0xC2], 0, b); // cmpps xmm0,[b],pred
             a.u8(pred);
         }
         FGt | FGe => {
             // a > b  <=>  b < a
-            a.vload(0, b);
+            if a.held_in != Some(b) {
+                a.vload(0, b);
+            }
             a.vm(&[], &[0xC2], 0, x);
             a.u8(if c == FGt { 1 } else { 2 });
         }
         _ => {
             let unsigned = matches!(c, ULt | ULe | UGt | UGe);
-            a.vload(0, x);
+            if a.held_in != Some(x) {
+                a.vload(0, x);
+            }
             a.vload(1, b);
             if unsigned {
                 // flip the sign bit of both so the signed compare orders them
@@ -938,4 +993,5 @@ fn vcmp(a: &mut Asm, c: Cmp, d: u32, x: u32, b: u32) {
     // mask (all ones / zero) -> 1 / 0
     a.bytes(&[0x66, 0x0F, 0x72, 0xD0, 31]); // psrld xmm0,31
     a.vstore(0, d);
+    a.held = Some(d);
 }
