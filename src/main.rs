@@ -26,12 +26,11 @@
 #![recursion_limit = "512"]
 
 mod catlogo;
-mod clock;
-mod fb;
 mod input;
-mod rng;
-mod softrender;
-mod wgpu_backend;
+
+// Everything else lives in the library target now (src/lib.rs) so the rio
+// patch can depend on it; re-export under the same names the bin used.
+use akuma_cli_wgpu::{clock, fb, softrender, wgpu_backend};
 
 use std::io::Write as _;
 use clock::{monotonic, FpsMeter, Pacer};

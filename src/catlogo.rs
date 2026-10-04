@@ -12,7 +12,7 @@
 //! `akuma_40.txt` is byte-identical to `amd64/src/akuma_40.txt`, the asset the
 //! kernel banner and splash paint.
 
-use crate::softrender::{Tri, KIND_FRONT, KIND_WALL};
+use akuma_cli_wgpu::softrender::{Tri, KIND_FRONT, KIND_WALL};
 
 /// Ink density ramp, darkest last. Every non-space character in the assets is
 /// in here; anything unknown maps to mid density so future assets degrade
