@@ -140,9 +140,17 @@ and Rust-vs-CPU-divergent ops go through shared `extern "C"` helpers, so VM and 
 construction). Anything it does not understand returns `Err` and the stage silently uses the
 interpreter — the compiler can grow feature by feature without ever being a correctness gate.
 
+Around the lowering sit four more passes/helpers, all `Program → Program` or pure helpers so that
+the VM stays the oracle for them: `opt.rs` (optimizer + per-draw specialization), `memo.rs`
+(region memoization), `runs.rs` (run detection, see "rio-scale passes"), `pool.rs` (the worker
+pool). Switches: `AKUMA_OPT=0`, `AKUMA_SPEC=0`, `AKUMA_MEMO=0`, `AKUMA_RUNS=0` turn each off
+(for A/B timing and for differential tests), `AKUMA_MEMO_BITS=n` sizes the memo table,
+`AKUMA_DUMP=<entry>` (with `shader-check`) and `AKUMA_DUMP_SPEC=1` print programs.
+
 Tools and switches:
 
-* `akuma-wgpu exec-selftest` — **the differential test.** 17 WGSL snippets (float/int/bit ops,
+* `akuma-wgpu exec-selftest` — **the differential test.** 18 WGSL snippets, each also run
+  specialized to its buffers (`+spec`), (float/int/bit ops,
   casts, comparisons with NaN, transcendentals, aggregates, swizzles, if/loop/switch, locals,
   function calls, uniform + dynamic buffer indexing, matrix products) run through interp, VM and
   JIT over 300 vertices fed pseudo-random data including NaN/±inf/±0; results must be
@@ -224,43 +232,100 @@ replaced by fixed-size stores (musl's `memcpy` is not free for tiny sizes: 25 �
 render-pass clears as a doubling `copy_within` instead of a per-pixel loop (4K empty pass 128 → 7 ms —
 yes, "just replace it with a new canvas" was the right instinct); transcendental result caches.
 
-`gpu-bench` (rio-scale work, 3840×2144, sugarloaf's real `grid.wgsl`), same box:
+#### rio-scale passes: `gpu-bench` (3840×2144, sugarloaf's real `grid.wgsl`)
 
-| pass | was | now |
+`akuma-wgpu gpu-bench` with `AKUMA_SUGARLOAF=<rio>/sugarloaf/src`. "Colourful" gives every cell
+its own colour and a glyph (the worst case, 16k cells, 16k glyph instances); "terminal-like" is
+a dark background with runs of three highlight colours and glyphs in 60% of the cells.
+
+| pass | start of session 2 | now |
 |---|---|---|
-| cell backgrounds, 1 thread | 2796 ms | 784 ms |
-| cell backgrounds, 4 threads | — | **223 ms** (4.5 fps) |
-| + a glyph in every cell (16k instances), 4 threads | — | 320 ms |
-| constant-colour fill | 536 ms | 34 ms |
+| cell backgrounds, 4 threads | 211–223 ms | **5 ms** |
+| cell backgrounds, 1 thread | 784 ms | (not re-measured) |
+| bg + a glyph in every cell | 303–320 ms | **34 ms** |
+| terminal-like, backgrounds | — | **4.4 ms** |
+| terminal-like, backgrounds + 60% glyphs (a full redraw) | — | **23 ms (≈ 43 fps)** |
+| trivial position-dependent shader, whole 4K | 87.6 ms | 19.9 ms |
+| constant-colour fill, whole 4K | 29–34 ms | 3.3–6 ms |
 
-The levers, in the order they paid off:
+The target was a full redraw under ~50 ms; it is at ~23–25 ms. Where it came from, in the order
+it was built (each step measured on the box; `exec-selftest`, `gpu-selftest` and the demo's
+`selftest --wgpu` checksums stayed green at every step):
 
-* **Tile-parallel rasterization.** The box really has 4 cores and std threads scale ~4×
-  (`akuma-wgpu thread-probe`). Vertex stage and primitive assembly are serial; the target is cut
-  into row bands, a queue hands them to workers (each with its own fragment invoker), and draw
-  order is preserved inside every band so blending stays correct. `AKUMA_THREADS=n`.
-* **A 4-lane wide JIT** (`jit.rs::compile_wide`, SSE4.1 — the box has SSE4.2 and **no AVX**).
-  Registers hold 4 lanes; hot instructions have vector templates (arithmetic, compares, select,
-  `roundps`, `cvttps2dq`/`cvtdq2ps` with a rare-case fixup, a vector-wide libm result cache);
-  everything else reuses the scalar template once per lane. Control flow stays uniform: a branch
-  whose lanes disagree makes the batch return `STATUS_DIVERGED` and the caller reruns it lane by
-  lane (zero divergences on the grid shader). The rasterizer gathers 4 covered pixels per
-  fragment call; the vertex stage is batched the same way. `exec-selftest` now has `jitw` as a
-  third executor and it is bit-identical to `jit`/`vm` on all 18 snippets. `AKUMA_WIDE=0` turns it off.
-* Fixed per-pixel costs: `floor()` in the unorm encode was a libm call per channel; barycentrics
-  / depth / 1/w are only computed when something reads them; the opaque-source premultiplied blend
-  is a plain store.
+1. **Exact per-row coverage spans + a straight-line "span" path** (`raster.rs::fill`,
+   `fast_span`). The per-pixel inside test became an interval per row (each edge function is
+   linear in x, so each edge bounds the interval from one side — same top-left rule, same
+   pixels). For wide stages the covered pixels are shaded four at a time with *no* gather,
+   marshalling or format dispatch: the input registers are written directly, results are
+   encoded with SSE2 (`format::encode4_unorm8`, bit-identical to the scalar `encode`) and stored
+   as one 16-byte unit. Varyings are evaluated as per-triangle planes. Premultiplied / straight
+   "over" blending is vectorized too (`blend_over4_unorm8`, bit-identical, tested against the
+   scalar definition on random destinations). 87.6 → 19.9 ms for a trivial shader, 211 → 148 ms
+   for the grid pass.
+2. **A program optimizer** (`opt.rs`): constant and copy propagation, constant folding (done by
+   running the VM on the instruction, so folded values are bit-identical to what any executor
+   computes), constant-branch folding, unreachable-code removal, jump threading, dead code by
+   liveness. Run at pipeline creation (384 → 304 instructions for the grid fragment shader) and
+   again **per draw, specialized to the draw's buffers**: every load at a constant offset from a
+   bound buffer (uniforms: padding, cell size, colour-space flags, cursor) becomes a constant,
+   which folds the colour-space branches, the cursor overlay and the padding-extension logic
+   (302 → 100 instructions, 1.4 ms to build on the box). Specializations are cached by the
+   *values* of the words they folded, so a new frame with unchanged uniforms reuses the machine
+   code; a changed uniform recompiles. Only draws big enough to repay it are specialized
+   (estimated fragments × program length ≥ 2·10⁷). Vertex stages are specialized the same way.
+3. **Region memoization** (`memo.rs`, `MemoGet`/`MemoPut`): the grid shader's colour maths is a
+   pure function of the 32-bit cell word it loaded. The pass finds a single-entry/single-exit
+   region whose live-in registers are few, never rewritten and not stage inputs, and brackets it
+   with a lookup in a 1024-entry direct-mapped cache kept in the persistent register file
+   (private to the invoker/thread). Keys loaded from memory are preferred over keys computed
+   from the position. The lookup is inlined in the wide JIT (single key); other shapes call
+   `program::memo_get`, so VM and JITs agree by construction. 148 → 113 → 69 ms (with the
+   optimizer) → 40 ms.
+4. **Run detection** (`runs.rs`) — the big one. If a fragment program's dependence on
+   `@builtin(position).x` flows only through quantization (`floor((x - pad) / cell_w)` and the
+   like), the result is constant over runs of pixels. A conservative per-axis classification
+   (clean / affine chain / step / bad) proves it; at run time the exact end of the run is found by
+   re-evaluating the affine chain with the program's own f32 operations (exponential + binary
+   search; all f32 ops are monotone). Horizontally the result is replicated over the run;
+   vertically a row identical in its quantized y is *copied* from the row above (only the few
+   pixels at a slanted edge are shaded). Applies when the pixels were produced by plain stores
+   (no blending with the destination, no discard). 40 → 5 ms for the background pass.
+   `gpu-selftest` renders cell grids with awkward sizes/offsets (7.3×13.9 cells at half-pixel
+   offsets, a slanted two-triangle quad, ...) with runs on and off and demands identical bytes —
+   and asserts the mechanism really was exercised for the grid shader and not for one that
+   leaks the position into the colour.
+5. **Everything around the shader**: a lazy render-pass clear folded into the first draw's per-band
+   work (the band is still in cache; one trip to memory instead of two); primitives binned per
+   band (every band used to set up every triangle); the vertex stage parallelized in recycled
+   chunks; constant-colour spans filled directly; a wide `textureLoad`; xmm0 forwarding and an
+   inlined, broadcasting `LoadBuf` in the wide JIT.
+6. **A persistent worker pool** (`pool.rs`). Measured on this kernel (see below): creating a
+   thread costs ~1.5 ms, and a *woken* thread only gets a CPU at the next scheduler tick
+   (~4 ms) because idle CPUs are not kicked. `std::thread::scope` per phase therefore cost ~8 ms
+   per draw. Workers are now started once, spin for 50 ms after the last job (picking one up in
+   microseconds) and only then sleep; `begin_render_pass` calls `pool::warm()` so the first
+   parallel phase of a pass finds them spinning.
 
-What is left, honestly: a full 4K redraw is still ~220 ms, i.e. ~4.5 fps. Per fragment that is
-about 40 ns of pipeline overhead (gather, marshalling, encode) plus ~60 ns of shader. Next, in order:
-(1) **memoize pure shader regions** — the grid shader's colour maths depends only on the loaded cell
-word, which is the same for the 16×32 pixels of a cell, so a "same live-in registers as last time →
-reuse the live-out registers" region (chosen statically, disabled adaptively if it misses) would skip
-~250 of its 382 instructions for ~99% of pixels; (2) cut the remaining per-fragment overhead
-(vectorize the encode, avoid per-lane marshalling); (3) specialize the program per draw on the
-constant uniform buffer (folds colour-space/padding/cursor branches); (4) parallelize the vertex stage.
-The demo itself is within ~25% of software and present-bound (the 33 MB write-combined copy to
-`/dev/fb0` is ~11 ms per frame).
+What is left, honestly: the **glyph pass** is now most of a frame (≈ 18–28 ms): per glyph quad
+~4 µs of CPU for ~50 pixels — two triangles' setup, ~12 four-pixel batches with a texture fetch
+and an alpha blend each, and the serial-ish vertex stage (316 instructions/vertex). Ideas, in
+order: cross-row lane gathering for tiny triangles (6-pixel-wide rows leave half of every
+4-lane batch empty), a cheaper `fetch_attrs`, hoisting `PixelPlan::new` and the libm calls
+(`round`/`ceil`) out of per-triangle setup, 8-lane (two-register-file) JIT code for ILP, and a
+real register allocator for the wide JIT (it is still load-op-store; ~5 cycles per instruction).
+Run detection could also be taught about the glyph shader's atlas lookups (a glyph is an
+affine texture window, not a quantization — different problem).
+
+#### Things this kernel taught us (for the kernel repo)
+
+* **Thread wake-up latency is a scheduler tick.** `thread-probe` (pool rounds): a freshly woken or
+  created thread starts ~4.3 ms late if its CPU is busy and stays that way until balanced;
+  four spinning workers converge to four CPUs after ~3 rounds. `sched_setaffinity` returns -1.
+  Idle CPUs are evidently not sent an IPI when a thread becomes runnable.
+* **Thread creation is ~1.5 ms.**
+* **First-touch page faults cost several µs each** (a 2.3 MB `Vec` filled by a worker was 3–5 ms),
+  so per-draw temporaries (vertex output, attribute arrays) are recycled or kept small.
+* Memory write bandwidth tops out around 5–10 GB/s: a 4K clear is 3–6 ms no matter how many threads.
 
 ## Baseline: selftest checksums and timings (re-measured 2026-10-04)
 
