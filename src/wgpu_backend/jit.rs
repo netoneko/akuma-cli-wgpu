@@ -20,7 +20,7 @@
 //! the VM. The VM and the JIT call the very same `Fun` helpers, and the
 //! inline sequences are IEEE-exact, so they agree bit for bit.
 
-use super::program::{Cmp, Inst, Program};
+use super::program::{Cmp, Fun, Inst, Program};
 use super::texture::{SmpRef, TexRef};
 
 #[repr(C)]
@@ -36,7 +36,16 @@ pub struct Jit {
     mem: *mut u8,
     len: usize,
     entry: Entry,
+    pub wide: bool,
 }
+
+/// returned by wide entry points besides 0 (ok) and 1 (killed, all lanes)
+pub const STATUS_DIVERGED: u32 = 2;
+
+/// one register's 4 lanes; 16-aligned so the vector templates can use `movaps`
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct L4(pub [u32; 4]);
 
 // the code is immutable once flipped to R+X
 unsafe impl Send for Jit {}
@@ -63,6 +72,15 @@ impl Jit {
         (self.entry)(regs.as_mut_ptr(), bufs.as_ptr(), texs.as_ptr(), smps.as_ptr()) != 0
     }
 
+    /// Run one batch of up to 4 lanes (wide code only). 0 = ok, 1 = killed,
+    /// `STATUS_DIVERGED` = the lanes branched differently; nothing about the
+    /// outputs may be trusted in that case.
+    #[inline]
+    pub fn run_wide(&self, regs: &mut [L4], bufs: &[BufRef], texs: &[TexRef], smps: &[SmpRef]) -> u32 {
+        debug_assert!(self.wide);
+        (self.entry)(regs.as_mut_ptr() as *mut u32, bufs.as_ptr(), texs.as_ptr(), smps.as_ptr())
+    }
+
     pub fn code_len(&self) -> usize {
         self.len
     }
@@ -70,6 +88,11 @@ impl Jit {
 
 struct Asm {
     b: Vec<u8>,
+    /// register file layout: register r, lane l lives at (r*stride + l)*4.
+    /// Scalar code: stride 1, lane 0. Wide code: stride 4; the per-lane
+    /// scalar fallback templates just run with lane = 0..4.
+    stride: u32,
+    lane: u32,
 }
 
 impl Asm {
@@ -86,7 +109,7 @@ impl Asm {
     fn rm(&mut self, op: &[u8], reg: u8, r: u32) {
         self.bytes(op);
         self.u8(0x80 | (reg << 3) | 3);
-        self.u32(r * 4);
+        self.u32((r * self.stride + self.lane) * 4);
     }
     fn load_eax(&mut self, r: u32) {
         self.rm(&[0x8B], 0, r);
@@ -119,10 +142,14 @@ impl Asm {
         self.rm(&[0xF3, 0x0F, 0x11], 0, r);
     }
     fn epilogue(&mut self, killed: bool) {
-        if killed {
-            self.bytes(&[0xB8, 1, 0, 0, 0]); // mov eax,1
-        } else {
+        self.epilogue_code(killed as u32);
+    }
+    fn epilogue_code(&mut self, code: u32) {
+        if code == 0 {
             self.bytes(&[0x31, 0xC0]); // xor eax,eax
+        } else {
+            self.u8(0xB8); // mov eax, imm32
+            self.u32(code);
         }
         self.bytes(&[0x48, 0x83, 0xC4, 0x08]); // add rsp,8
         self.bytes(&[0x41, 0x5E]); // pop r14
@@ -133,31 +160,16 @@ impl Asm {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Jk {
-    Jmp,
-    Jz,
-    Jnz,
-}
 
-pub fn compile(p: &Program) -> Result<Jit, String> {
-    let mut a = Asm { b: Vec::with_capacity(p.code.len() * 24 + 64) };
-    // prologue
-    a.u8(0x53); // push rbx
-    a.bytes(&[0x41, 0x54]); // push r12
-    a.bytes(&[0x41, 0x55]); // push r13
-    a.bytes(&[0x41, 0x56]); // push r14
-    a.bytes(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp,8   (rsp 16-aligned at calls)
-    a.bytes(&[0x48, 0x89, 0xFB]); // mov rbx,rdi   regs
-    a.bytes(&[0x49, 0x89, 0xF4]); // mov r12,rsi   bufs
-    a.bytes(&[0x49, 0x89, 0xD5]); // mov r13,rdx   texs
-    a.bytes(&[0x49, 0x89, 0xCE]); // mov r14,rcx   smps
-
-    let mut starts = Vec::with_capacity(p.code.len() + 1);
-    let mut fixups: Vec<(usize, u32)> = Vec::new(); // (rel32 position, target inst)
-
-    for inst in &p.code {
-        starts.push(a.b.len());
+/// One instruction, scalar form, for the register layout `a` is set up for
+/// (stride/lane). Used directly by the scalar JIT, and once per lane by the
+/// wide JIT for instructions that are not worth vectorizing.
+fn emit_scalar(
+    a: &mut Asm,
+    p: &Program,
+    inst: &Inst,
+    fixups: &mut Vec<(usize, u32)>,
+) -> Result<(), String> {
         match *inst {
             Inst::Mov { d, s } => {
                 a.load_eax(s);
@@ -167,10 +179,10 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
                 a.rm(&[0xC7], 0, d);
                 a.u32(v);
             }
-            Inst::FAdd { d, a: x, b } => fbin(&mut a, 0x58, d, x, b),
-            Inst::FSub { d, a: x, b } => fbin(&mut a, 0x5C, d, x, b),
-            Inst::FMul { d, a: x, b } => fbin(&mut a, 0x59, d, x, b),
-            Inst::FDiv { d, a: x, b } => fbin(&mut a, 0x5E, d, x, b),
+            Inst::FAdd { d, a: x, b } => fbin(a, 0x58, d, x, b),
+            Inst::FSub { d, a: x, b } => fbin(a, 0x5C, d, x, b),
+            Inst::FMul { d, a: x, b } => fbin(a, 0x59, d, x, b),
+            Inst::FDiv { d, a: x, b } => fbin(a, 0x5E, d, x, b),
             Inst::FNeg { d, a: x } => {
                 a.load_eax(x);
                 a.u8(0x35); // xor eax, imm32
@@ -187,25 +199,25 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
                 a.rm(&[0xF3, 0x0F, 0x51], 0, x); // sqrtss xmm0,[x]
                 a.movss_store(d);
             }
-            Inst::IAdd { d, a: x, b } => ibin(&mut a, 0x03, d, x, b),
-            Inst::ISub { d, a: x, b } => ibin(&mut a, 0x2B, d, x, b),
+            Inst::IAdd { d, a: x, b } => ibin(a, 0x03, d, x, b),
+            Inst::ISub { d, a: x, b } => ibin(a, 0x2B, d, x, b),
             Inst::IMul { d, a: x, b } => {
                 a.load_eax(x);
                 a.rm(&[0x0F, 0xAF], 0, b);
                 a.store_eax(d);
             }
-            Inst::And { d, a: x, b } => ibin(&mut a, 0x23, d, x, b),
-            Inst::Or { d, a: x, b } => ibin(&mut a, 0x0B, d, x, b),
-            Inst::Xor { d, a: x, b } => ibin(&mut a, 0x33, d, x, b),
+            Inst::And { d, a: x, b } => ibin(a, 0x23, d, x, b),
+            Inst::Or { d, a: x, b } => ibin(a, 0x0B, d, x, b),
+            Inst::Xor { d, a: x, b } => ibin(a, 0x33, d, x, b),
             Inst::Not { d, a: x } => {
                 a.load_eax(x);
                 a.bytes(&[0xF7, 0xD0]);
                 a.store_eax(d);
             }
-            Inst::Shl { d, a: x, b } => shift(&mut a, &[0xD3, 0xE0], d, x, b),
-            Inst::ShrS { d, a: x, b } => shift(&mut a, &[0xD3, 0xF8], d, x, b),
-            Inst::ShrU { d, a: x, b } => shift(&mut a, &[0xD3, 0xE8], d, x, b),
-            Inst::Cmp { d, a: x, b, c } => cmp(&mut a, c, d, x, b),
+            Inst::Shl { d, a: x, b } => shift(a, &[0xD3, 0xE0], d, x, b),
+            Inst::ShrS { d, a: x, b } => shift(a, &[0xD3, 0xF8], d, x, b),
+            Inst::ShrU { d, a: x, b } => shift(a, &[0xD3, 0xE8], d, x, b),
+            Inst::Cmp { d, a: x, b, c } => cmp(a, c, d, x, b),
             Inst::Select { d, c, a: x, b } => {
                 a.load_eax(b);
                 a.load_ecx(c);
@@ -279,7 +291,12 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
             }
             Inst::Tex { op } => {
                 // tex_helper(regs, texs, smps, &tex_ops[op])
-                a.bytes(&[0x48, 0x89, 0xDF]); // mov rdi,rbx
+                // regs pointer for this lane, and the register stride, so the
+                // helper finds register r at r*stride (scalar: stride 1)
+                a.bytes(&[0x48, 0x8D, 0xBB]); // lea rdi,[rbx+disp32]
+                a.u32(a.lane * 4);
+                a.bytes(&[0x41, 0xB8]); // mov r8d, imm32
+                a.u32(a.stride);
                 a.bytes(&[0x4C, 0x89, 0xEE]); // mov rsi,r13
                 a.bytes(&[0x4C, 0x89, 0xF2]); // mov rdx,r14
                 let opref = p.tex_ops.get(op as usize).ok_or("tex op out of range")?;
@@ -309,10 +326,62 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
             Inst::Kill => a.epilogue(true),
             Inst::Ret => a.epilogue(false),
         }
+    Ok(())
+}
+
+pub fn compile(p: &Program) -> Result<Jit, String> {
+    compile_impl(p, false)
+}
+
+/// 4 lanes per instruction with SSE4.1 (needs `pmulld`/`blendvps`). Control flow
+/// stays uniform across lanes: a branch whose lanes disagree makes the whole
+/// batch return `STATUS_DIVERGED` so the caller can run the lanes one by one.
+pub fn compile_wide(p: &Program) -> Result<Jit, String> {
+    if !is_x86_feature_detected!("sse4.1") {
+        return Err("no SSE4.1".into());
+    }
+    compile_impl(p, true)
+}
+
+fn compile_impl(p: &Program, wide: bool) -> Result<Jit, String> {
+    let mut a = Asm {
+        b: Vec::with_capacity(p.code.len() * if wide { 64 } else { 24 } + 64),
+        stride: if wide { 4 } else { 1 },
+        lane: 0,
+    };
+    // prologue
+    a.u8(0x53); // push rbx
+    a.bytes(&[0x41, 0x54]); // push r12
+    a.bytes(&[0x41, 0x55]); // push r13
+    a.bytes(&[0x41, 0x56]); // push r14
+    a.bytes(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp,8   (rsp 16-aligned at calls)
+    a.bytes(&[0x48, 0x89, 0xFB]); // mov rbx,rdi   regs
+    a.bytes(&[0x49, 0x89, 0xF4]); // mov r12,rsi   bufs
+    a.bytes(&[0x49, 0x89, 0xD5]); // mov r13,rdx   texs
+    a.bytes(&[0x49, 0x89, 0xCE]); // mov r14,rcx   smps
+
+    let mut starts = Vec::with_capacity(p.code.len() + 1);
+    let mut fixups: Vec<(usize, u32)> = Vec::new(); // (rel32 position, target inst)
+    let mut bail_jumps: Vec<usize> = Vec::new(); // rel32 positions to point at the bail stub
+
+    for inst in &p.code {
+        starts.push(a.b.len());
+        if wide {
+            emit_wide(&mut a, p, inst, &mut fixups, &mut bail_jumps)?;
+        } else {
+            emit_scalar(&mut a, p, inst, &mut fixups)?;
+        }
     }
     starts.push(a.b.len());
-    let _ = Jk::Jmp; // (kept for symmetry with the fixup kinds above)
-    let _ = (Jk::Jz, Jk::Jnz);
+    if wide {
+        // bail stub: lanes disagreed at a branch
+        let stub = a.b.len();
+        a.epilogue_code(2);
+        for pos in bail_jumps {
+            let rel = (stub as i64 - (pos as i64 + 4)) as i32;
+            a.b[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+    }
 
     for (pos, t) in fixups {
         let target = *starts.get(t as usize).ok_or("jump target out of range")?;
@@ -321,7 +390,9 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
         a.b[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
     }
 
-    finalize(&a.b)
+    let mut j = finalize(&a.b)?;
+    j.wide = wide;
+    Ok(j)
 }
 
 fn fbin(a: &mut Asm, op: u8, d: u32, x: u32, b: u32) {
@@ -419,6 +490,398 @@ fn finalize(code: &[u8]) -> Result<Jit, String> {
             mem: mem as *mut u8,
             len,
             entry: std::mem::transmute::<*mut libc::c_void, Entry>(mem),
+            wide: false,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// wide (4-lane SSE4.1) emission
+// ---------------------------------------------------------------------------
+
+impl Asm {
+    /// `cmp dword [valid], 0` for a wide cache's lane-0 valid word
+    fn rm_valid_cmp(&mut self, c: u32) {
+        self.rm(&[0x83], 7, c);
+        self.u8(0);
+    }
+    /// SSE op with a memory operand: [prefix] 0F op /r, ModRM(mod=10, rm=rbx)
+    /// addressing register `r`'s 16-byte lane block
+    fn vm(&mut self, prefix: &[u8], op: &[u8], xmm: u8, r: u32) {
+        self.bytes(prefix);
+        self.u8(0x0F);
+        self.bytes(op);
+        self.u8(0x80 | (xmm << 3) | 3);
+        self.u32(r * 16);
+    }
+    /// SSE op, register-register
+    fn vr(&mut self, prefix: &[u8], op: &[u8], dst: u8, src: u8) {
+        self.bytes(prefix);
+        self.u8(0x0F);
+        self.bytes(op);
+        self.u8(0xC0 | (dst << 3) | src);
+    }
+    fn vload(&mut self, xmm: u8, r: u32) {
+        self.vm(&[], &[0x28], xmm, r); // movaps xmm,[r]
+    }
+    fn vstore(&mut self, xmm: u8, r: u32) {
+        self.vm(&[], &[0x29], xmm, r); // movaps [r],xmm
+    }
+    /// xmm = all ones
+    fn v_ones(&mut self, xmm: u8) {
+        self.vr(&[0x66], &[0x76], xmm, xmm); // pcmpeqd xmm,xmm
+    }
+    /// xmm = 0x80000000 in every lane
+    fn v_signbit(&mut self, xmm: u8) {
+        self.v_ones(xmm);
+        self.bytes(&[0x66, 0x0F, 0x72, 0xF0 | xmm, 31]); // pslld xmm,31
+    }
+}
+
+/// the register holds a hoisted constant (never written by code): its value
+fn const_reg(p: &Program, r: u32) -> Option<u32> {
+    if r == 0 {
+        return Some(0);
+    }
+    // a register is constant iff nothing in the code writes it and the init
+    // value is the one it always has; cheap scan, memoized by the caller's
+    // program size being small relative to JIT cost
+    let written = p.code.iter().any(|i| match *i {
+        Inst::Mov { d, .. } | Inst::Const { d, .. } | Inst::FAdd { d, .. } | Inst::FSub { d, .. }
+        | Inst::FMul { d, .. } | Inst::FDiv { d, .. } | Inst::FNeg { d, .. } | Inst::FAbs { d, .. }
+        | Inst::Sqrt { d, .. } | Inst::IAdd { d, .. } | Inst::ISub { d, .. } | Inst::IMul { d, .. }
+        | Inst::And { d, .. } | Inst::Or { d, .. } | Inst::Xor { d, .. } | Inst::Not { d, .. }
+        | Inst::Shl { d, .. } | Inst::ShrS { d, .. } | Inst::ShrU { d, .. } | Inst::Cmp { d, .. }
+        | Inst::Select { d, .. } | Inst::I2F { d, .. } | Inst::U2F { d, .. } | Inst::Call { d, .. }
+        | Inst::CallC { d, .. } | Inst::LoadBuf { d, .. } => d == r,
+        _ => false,
+    });
+    // registers written by Tex ops (4 consecutive from `d`, or 2) are not constants either
+    let tex = p.tex_ops.iter().any(|t| r >= t.d && r < t.d + 4);
+    if written || tex {
+        None
+    } else {
+        Some(p.init[r as usize])
+    }
+}
+
+fn emit_wide(
+    a: &mut Asm,
+    p: &Program,
+    inst: &Inst,
+    fixups: &mut Vec<(usize, u32)>,
+    bail: &mut Vec<usize>,
+) -> Result<(), String> {
+    match *inst {
+        Inst::Mov { d, s } => {
+            a.vload(0, s);
+            a.vstore(0, d);
+        }
+        Inst::Const { d, v } => {
+            if v == 0 {
+                a.vr(&[], &[0x57], 0, 0); // xorps xmm0,xmm0
+                a.vstore(0, d);
+            } else {
+                for k in 0..4 {
+                    a.rm(&[0xC7], 0, d); // mov dword [d lane k], imm32 (stride 4 layout)
+                    a.u32(v);
+                    // rm() used lane 0: patch the displacement for lane k
+                    let at = a.b.len() - 8;
+                    let disp = (d * 16 + k * 4) as i32;
+                    a.b[at..at + 4].copy_from_slice(&disp.to_le_bytes());
+                }
+            }
+        }
+        Inst::FAdd { d, a: x, b } => vbin(a, &[], 0x58, d, x, b),
+        Inst::FSub { d, a: x, b } => vbin(a, &[], 0x5C, d, x, b),
+        Inst::FMul { d, a: x, b } => vbin(a, &[], 0x59, d, x, b),
+        Inst::FDiv { d, a: x, b } => vbin(a, &[], 0x5E, d, x, b),
+        Inst::Sqrt { d, a: x } => {
+            a.vm(&[], &[0x51], 0, x); // sqrtps xmm0,[x]
+            a.vstore(0, d);
+        }
+        Inst::FNeg { d, a: x } => {
+            a.vload(0, x);
+            a.v_signbit(1);
+            a.vr(&[], &[0x57], 0, 1); // xorps xmm0,xmm1
+            a.vstore(0, d);
+        }
+        Inst::FAbs { d, a: x } => {
+            a.vload(0, x);
+            a.v_ones(1);
+            a.bytes(&[0x66, 0x0F, 0x72, 0xD1, 1]); // psrld xmm1,1
+            a.vr(&[], &[0x54], 0, 1); // andps xmm0,xmm1
+            a.vstore(0, d);
+        }
+        Inst::IAdd { d, a: x, b } => vbin(a, &[0x66], 0xFE, d, x, b),
+        Inst::ISub { d, a: x, b } => vbin(a, &[0x66], 0xFA, d, x, b),
+        Inst::IMul { d, a: x, b } => {
+            a.vload(0, x);
+            a.bytes(&[0x66, 0x0F, 0x38, 0x40, 0x83]); // pmulld xmm0,[b]
+            a.u32(b * 16);
+            a.vstore(0, d);
+        }
+        Inst::And { d, a: x, b } => vbin(a, &[0x66], 0xDB, d, x, b),
+        Inst::Or { d, a: x, b } => vbin(a, &[0x66], 0xEB, d, x, b),
+        Inst::Xor { d, a: x, b } => vbin(a, &[0x66], 0xEF, d, x, b),
+        Inst::Not { d, a: x } => {
+            a.vload(0, x);
+            a.v_ones(1);
+            a.vr(&[0x66], &[0xEF], 0, 1); // pxor xmm0,xmm1
+            a.vstore(0, d);
+        }
+        // shifts by a constant count: one vector op; variable counts need AVX2,
+        // so those go lane by lane
+        Inst::Shl { d, a: x, b } | Inst::ShrS { d, a: x, b } | Inst::ShrU { d, a: x, b }
+            if const_reg(p, b).is_some() =>
+        {
+            let n = const_reg(p, b).unwrap() & 31;
+            let op = match inst {
+                Inst::Shl { .. } => 0xF0u8,  // /6 pslld
+                Inst::ShrS { .. } => 0xE0,   // /4 psrad
+                _ => 0xD0,                   // /2 psrld
+            };
+            a.vload(0, x);
+            a.bytes(&[0x66, 0x0F, 0x72, op, n as u8]);
+            a.vstore(0, d);
+        }
+        Inst::Cmp { d, a: x, b, c } => vcmp(a, c, d, x, b),
+        Inst::Select { d, c, a: x, b } => {
+            // mask = 0 - c  (c is 0/1 per lane)  ->  xmm0 (implicit blendvps mask)
+            a.vr(&[], &[0x57], 0, 0); // xorps xmm0,xmm0
+            a.vm(&[0x66], &[0xFA], 0, c); // psubd xmm0,[c]
+            a.vload(1, b);
+            a.bytes(&[0x66, 0x0F, 0x38, 0x14, 0x8B]); // blendvps xmm1,[x]
+            a.u32(x * 16);
+            a.vstore(1, d);
+        }
+        Inst::I2F { d, a: x } => {
+            a.vm(&[], &[0x5B], 0, x); // cvtdq2ps xmm0,[x]
+            a.vstore(0, d);
+        }
+        // a load at a constant offset is the same word in every lane: load
+        // once and broadcast
+        Inst::LoadBuf { d, buf, off: 0, imm } => {
+            a.lane = 0;
+            let saved = a.stride;
+            a.stride = 4;
+            emit_scalar(a, p, &Inst::LoadBuf { d, buf, off: 0, imm }, fixups)?;
+            // emit_scalar stored the loaded word into lane 0 of d; broadcast it
+            a.stride = saved;
+            a.vload(0, d);
+            a.bytes(&[0x66, 0x0F, 0x70, 0xC0, 0x00]); // pshufd xmm0,xmm0,0
+            a.vstore(0, d);
+        }
+        // rounding: one vector op (SSE4.1 roundps)
+        Inst::Call { d, a: x, f: f @ (Fun::Floor | Fun::Ceil | Fun::Trunc), .. } => {
+            let mode = match f {
+                Fun::Floor => 0x09,
+                Fun::Ceil => 0x0A,
+                _ => 0x0B,
+            };
+            a.bytes(&[0x66, 0x0F, 0x3A, 0x08, 0x83]); // roundps xmm0,[x],mode
+            a.u32(x * 16);
+            a.u8(mode);
+            a.vstore(0, d);
+        }
+        // f32 -> i32: cvttps2dq is exact except for NaN / out of range, where it
+        // yields 0x80000000; Rust saturates (NaN -> 0), so those rare batches
+        // rerun lane by lane through the helper
+        Inst::Call { d, a: x, b, f: Fun::F2I } => {
+            a.vm(&[0xF3], &[0x5B], 0, x); // cvttps2dq xmm0,[x]
+            a.vstore(0, d);
+            a.v_signbit(1);
+            a.vr(&[0x66], &[0x76], 1, 0); // pcmpeqd xmm1,xmm0
+            a.vr(&[], &[0x50], 0, 1); // movmskps eax,xmm1
+            a.bytes(&[0x85, 0xC0, 0x0F, 0x84]); // test eax,eax; jz done
+            let skip = a.b.len();
+            a.u32(0);
+            for lane in 0..4 {
+                a.lane = lane;
+                emit_scalar(a, p, &Inst::Call { d, a: x, b, f: Fun::F2I }, fixups)?;
+            }
+            a.lane = 0;
+            let rel = (a.b.len() - (skip + 4)) as i32;
+            a.b[skip..skip + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // u32 -> f32: cvtdq2ps is right while bit 31 is clear in every lane
+        Inst::U2F { d, a: x } => {
+            a.vload(0, x);
+            a.vr(&[], &[0x50], 0, 0); // movmskps eax,xmm0 (sign bits = bit 31)
+            a.bytes(&[0x85, 0xC0, 0x0F, 0x85]); // test eax,eax; jnz slow
+            let to_slow = a.b.len();
+            a.u32(0);
+            a.vm(&[], &[0x5B], 0, x); // cvtdq2ps xmm0,[x]
+            a.vstore(0, d);
+            a.u8(0xE9); // jmp done
+            let to_done = a.b.len();
+            a.u32(0);
+            let rel = (a.b.len() - (to_slow + 4)) as i32;
+            a.b[to_slow..to_slow + 4].copy_from_slice(&rel.to_le_bytes());
+            for lane in 0..4 {
+                a.lane = lane;
+                emit_scalar(a, p, &Inst::U2F { d, a: x }, fixups)?;
+            }
+            a.lane = 0;
+            let rel = (a.b.len() - (to_done + 4)) as i32;
+            a.b[to_done..to_done + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // cached libm call, vector-wide: all four lanes' arguments equal to the
+        // cached ones (typical for a flat cell) -> one vector load; otherwise
+        // the helper per lane, then refill the cache
+        Inst::CallC { d, a: x, b, f, c } => {
+            a.rm_valid_cmp(c); // cmp dword [valid lane 0],0
+            a.bytes(&[0x0F, 0x84]); // je miss
+            let m0 = a.b.len();
+            a.u32(0);
+            a.vload(0, x);
+            a.vm(&[0x66], &[0x76], 0, c + 1); // pcmpeqd xmm0,[key a]
+            a.vload(1, b);
+            a.vm(&[0x66], &[0x76], 1, c + 2); // pcmpeqd xmm1,[key b]
+            a.vr(&[0x66], &[0xDB], 0, 1); // pand xmm0,xmm1
+            a.vr(&[], &[0x50], 0, 0); // movmskps eax,xmm0
+            a.bytes(&[0x83, 0xF8, 0x0F, 0x0F, 0x85]); // cmp eax,15; jne miss
+            let m1 = a.b.len();
+            a.u32(0);
+            a.vload(0, c + 3);
+            a.vstore(0, d);
+            a.u8(0xE9); // jmp done
+            let done = a.b.len();
+            a.u32(0);
+            // miss
+            let rel = (a.b.len() - (m0 + 4)) as i32;
+            a.b[m0..m0 + 4].copy_from_slice(&rel.to_le_bytes());
+            let rel = (a.b.len() - (m1 + 4)) as i32;
+            a.b[m1..m1 + 4].copy_from_slice(&rel.to_le_bytes());
+            for lane in 0..4 {
+                a.lane = lane;
+                emit_scalar(a, p, &Inst::Call { d, a: x, b, f }, fixups)?;
+            }
+            a.lane = 0;
+            a.vload(0, x);
+            a.vstore(0, c + 1);
+            a.vload(0, b);
+            a.vstore(0, c + 2);
+            a.vload(0, d);
+            a.vstore(0, c + 3);
+            a.stride = 4;
+            a.rm(&[0xC7], 0, c); // mov dword [valid lane 0], 1
+            a.u32(1);
+            let rel = (a.b.len() - (done + 4)) as i32;
+            a.b[done..done + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        Inst::Jmp { t } => {
+            a.u8(0xE9);
+            fixups.push((a.b.len(), t));
+            a.u32(0);
+        }
+        Inst::Jz { c, t } | Inst::Jnz { c, t } => {
+            let jz = matches!(inst, Inst::Jz { .. });
+            a.vload(0, c);
+            a.bytes(&[0x66, 0x0F, 0x72, 0xF0, 31]); // pslld xmm0,31
+            a.vr(&[], &[0x50], 0, 0); // movmskps eax,xmm0: bit k = lane k true
+            a.bytes(&[0x85, 0xC0]); // test eax,eax
+            if jz {
+                // all lanes false -> jump; all true -> fall through; mixed -> bail
+                a.bytes(&[0x0F, 0x84]); // je t
+                fixups.push((a.b.len(), t));
+                a.u32(0);
+                a.bytes(&[0x83, 0xF8, 0x0F]); // cmp eax,15
+                a.bytes(&[0x0F, 0x85]); // jne bail
+                bail.push(a.b.len());
+                a.u32(0);
+            } else {
+                // all lanes false -> fall through; all true -> jump; mixed -> bail
+                a.bytes(&[0x74, 14]); // jz +14 (over: cmp 3 + jne 6 + jmp 5)
+                a.bytes(&[0x83, 0xF8, 0x0F]); // cmp eax,15
+                a.bytes(&[0x0F, 0x85]); // jne bail
+                bail.push(a.b.len());
+                a.u32(0);
+                a.u8(0xE9); // jmp t
+                fixups.push((a.b.len(), t));
+                a.u32(0);
+            }
+        }
+        Inst::Kill => a.epilogue(true),
+        Inst::Ret => a.epilogue(false),
+        // everything else: the scalar template, once per lane
+        _ => {
+            for lane in 0..4 {
+                a.lane = lane;
+                emit_scalar(a, p, inst, fixups)?;
+            }
+            a.lane = 0;
+        }
+    }
+    Ok(())
+}
+
+fn vbin(a: &mut Asm, prefix: &[u8], op: u8, d: u32, x: u32, b: u32) {
+    a.vload(0, x);
+    a.vm(prefix, &[op], 0, b);
+    a.vstore(0, d);
+}
+
+/// lane-wise compare, result 0/1 per lane
+fn vcmp(a: &mut Asm, c: Cmp, d: u32, x: u32, b: u32) {
+    use Cmp::*;
+    match c {
+        FEq | FNe | FLt | FLe => {
+            let pred = match c {
+                FEq => 0,
+                FLt => 1,
+                FLe => 2,
+                _ => 4, // not-equal, true for unordered like Rust's !=
+            };
+            a.vload(0, x);
+            a.vm(&[], &[0xC2], 0, b); // cmpps xmm0,[b],pred
+            a.u8(pred);
+        }
+        FGt | FGe => {
+            // a > b  <=>  b < a
+            a.vload(0, b);
+            a.vm(&[], &[0xC2], 0, x);
+            a.u8(if c == FGt { 1 } else { 2 });
+        }
+        _ => {
+            let unsigned = matches!(c, ULt | ULe | UGt | UGe);
+            a.vload(0, x);
+            a.vload(1, b);
+            if unsigned {
+                // flip the sign bit of both so the signed compare orders them
+                a.v_signbit(2);
+                a.vr(&[0x66], &[0xEF], 0, 2); // pxor xmm0,xmm2
+                a.vr(&[0x66], &[0xEF], 1, 2); // pxor xmm1,xmm2
+            }
+            // result lands in xmm0
+            match c {
+                IEq => a.vr(&[0x66], &[0x76], 0, 1), // pcmpeqd xmm0,xmm1
+                INe => {
+                    a.vr(&[0x66], &[0x76], 0, 1);
+                    a.v_ones(3);
+                    a.vr(&[0x66], &[0xEF], 0, 3); // invert
+                }
+                SGt | UGt => a.vr(&[0x66], &[0x66], 0, 1), // pcmpgtd xmm0,xmm1  (a > b)
+                SLe | ULe => {
+                    a.vr(&[0x66], &[0x66], 0, 1);
+                    a.v_ones(3);
+                    a.vr(&[0x66], &[0xEF], 0, 3);
+                }
+                SLt | ULt => {
+                    a.vr(&[0x66], &[0x66], 1, 0); // pcmpgtd xmm1,xmm0  (b > a)
+                    a.vr(&[], &[0x28], 0, 1); // movaps xmm0,xmm1
+                }
+                _ => {
+                    // SGe | UGe: not (a < b)
+                    a.vr(&[0x66], &[0x66], 1, 0);
+                    a.v_ones(3);
+                    a.vr(&[0x66], &[0xEF], 1, 3);
+                    a.vr(&[], &[0x28], 0, 1);
+                }
+            }
+        }
+    }
+    // mask (all ones / zero) -> 1 / 0
+    a.bytes(&[0x66, 0x0F, 0x72, 0xD0, 31]); // psrld xmm0,31
+    a.vstore(0, d);
 }

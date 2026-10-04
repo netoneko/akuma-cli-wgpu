@@ -875,6 +875,9 @@ pub fn bench() -> i32 {
             }
         }
     }
+    if super::prof::enabled() {
+        super::prof::report();
+    }
     0
 }
 

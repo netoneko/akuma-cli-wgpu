@@ -92,11 +92,19 @@ pub struct TexOp {
 /// `regs` must point at the invocation's register file, `texs`/`smps` at the
 /// draw's tables (indexable by every slot this program uses), `op` at a live
 /// `TexOp`.
-pub unsafe extern "C" fn tex_helper(regs: *mut u32, texs: *const TexRef, smps: *const SmpRef, op: *const TexOp) {
+pub unsafe extern "C" fn tex_helper(
+    regs: *mut u32,
+    texs: *const TexRef,
+    smps: *const SmpRef,
+    op: *const TexOp,
+    stride: usize,
+) {
     let op = unsafe { &*op };
     let t = unsafe { *texs.add(op.tex as usize) };
-    let reg = |r: R| unsafe { *regs.add(r as usize) };
-    let mut put = |i: u32, v: u32| unsafe { *regs.add((op.d + i) as usize) = v };
+    // register r of this lane is at regs[r * stride] (scalar code: stride 1;
+    // wide code passes the lane's base pointer and stride 4)
+    let reg = |r: R| unsafe { *regs.add(r as usize * stride) };
+    let mut put = |i: u32, v: u32| unsafe { *regs.add((op.d + i) as usize * stride) = v };
     match op.kind {
         TexKind::Size => {
             put(0, t.w);

@@ -1380,16 +1380,21 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         }
     };
 
-    // ---- vertex stage + primitive assembly (serial) ----
-    let mut verts: Vec<super::exec::RawVertex> = Vec::new();
+    // ---- vertex stage (batched) + primitive assembly ----
+    let mut ids: Vec<(u32, u32)> = Vec::with_capacity(instances.len() * vertex_ids.len());
+    let mut attrs: Vec<super::exec::Varyings> = Vec::with_capacity(ids.capacity());
+    for inst in instances.clone() {
+        for &vid in &vertex_ids {
+            ids.push((vid as u32, inst));
+            attrs.push(fetch_attrs(pipe, st.vbufs, &vb_idx, &locks, vid, inst));
+        }
+    }
+    let mut verts: Vec<super::exec::RawVertex> = Vec::with_capacity(ids.len());
+    vs_inv.run_vertex_batch(&ids, &attrs, &mut verts);
     // (a, b, c, provoking) as indices into `verts`
     let mut prims: Vec<[u32; 4]> = Vec::new();
-    for inst in instances {
-        let base = verts.len() as u32;
-        for &vid in &vertex_ids {
-            let attrs = fetch_attrs(pipe, st.vbufs, &vb_idx, &locks, vid, inst);
-            verts.push(vs_inv.run_vertex(vid as u32, inst, &attrs));
-        }
+    for inst_i in 0..instances.len() as u32 {
+        let base = inst_i * vertex_ids.len() as u32;
         let n = vertex_ids.len() as u32;
         match pipe.topology {
             T::TriangleList => {

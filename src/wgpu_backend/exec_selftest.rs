@@ -227,9 +227,14 @@ fn diff(x: &RawVertex, y: &RawVertex) -> Option<String> {
 
 const N_VERTS: u32 = 300;
 
+/// through the batch entry point, so a wide stage really runs 4 lanes at a time
 fn run_stage(st: &Stage, res: &Resources<'_>) -> Vec<RawVertex> {
     let mut inv = st.begin(res);
-    (0..N_VERTS).map(|vi| inv.run_vertex(vi, 0, &[[0u32; 4]; super::exec::MAX_LOC])).collect()
+    let ids: Vec<(u32, u32)> = (0..N_VERTS).map(|v| (v, 0)).collect();
+    let attrs = vec![[[0u32; 4]; super::exec::MAX_LOC]; N_VERTS as usize];
+    let mut out = Vec::new();
+    inv.run_vertex_batch(&ids, &attrs, &mut out);
+    out
 }
 
 pub fn run() -> i32 {
@@ -265,14 +270,14 @@ pub fn run() -> i32 {
         let want = run_stage(&oracle, &res);
         let mut line = format!("{:<52}", c.name);
         let mut ok = true;
-        for mode in ["vm", "jit"] {
+        for mode in ["vm", "jit", "jitw"] {
             if mode == oracle_name {
                 continue;
             }
             match Stage::build(sh.clone(), 0, mode) {
                 Err(e) => {
-                    if mode == "jit" && !have_jit {
-                        line.push_str("  jit: n/a");
+                    if mode.starts_with("jit") && !have_jit {
+                        line.push_str(&format!("  {mode}: n/a"));
                     } else {
                         line.push_str(&format!("  {mode}: declined ({e})"));
                         declined += 1;

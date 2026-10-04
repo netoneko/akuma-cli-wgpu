@@ -228,6 +228,11 @@ impl Raster<'_> {
         // factors) can be computed once per triangle
         let mut const_texel: Option<[u8; 4]> = None;
         let mut const_blend: Option<([f32; 4], [f32; 4])> = None;
+        // wide stages shade up to `lanes` pixels per call: covered pixels are
+        // gathered here and flushed when full and at the end of the triangle
+        let lanes = if constant_fs { 1 } else { fs.lanes() };
+        let mut pend = [Pending { idx: 0, zf: 0.0, pos: [0.0; 4], var: [[0; 4]; MAX_LOC] }; 4];
+        let mut np = 0usize;
 
         for py in min_y..max_y {
             let mut w = w_row;
@@ -252,7 +257,22 @@ impl Raster<'_> {
                         Some(d) => compare(d.compare, zf, d.data[idx]),
                         None => true,
                     };
-                    if pass {
+                    if pass && lanes > 1 {
+                        if !flat_all {
+                            self.interpolate(&mut var, provoking, &s, &l, invw);
+                        }
+                        pend[np] = Pending {
+                            idx,
+                            zf,
+                            pos: [px as f32 + 0.5, py as f32 + 0.5, zf, invw as f32],
+                            var,
+                        };
+                        np += 1;
+                        if np == lanes {
+                            self.flush(fs, &plan, &pend[..np]);
+                            np = 0;
+                        }
+                    } else if pass {
                         if !flat_all {
                             self.interpolate(&mut var, provoking, &s, &l, invw);
                         }
@@ -282,6 +302,32 @@ impl Raster<'_> {
             }
             for i in 0..3 {
                 w_row[i] += dwdy[i];
+            }
+        }
+        if np > 0 {
+            self.flush(fs, &plan, &pend[..np]);
+        }
+    }
+
+    /// shade the gathered pixels in one batch, then depth-write and blend each
+    fn flush(&mut self, fs: &mut Invoker<'_>, plan: &PixelPlan, pend: &[Pending]) {
+        let mut ins: [([f32; 4], &Varyings); 4] = [([0.0; 4], &pend[0].var); 4];
+        for (i, p) in pend.iter().enumerate() {
+            ins[i] = (p.pos, &p.var);
+        }
+        let mut outs = [None; 4];
+        fs.run_fragment_batch(&ins[..pend.len()], &mut outs[..pend.len()]);
+        let (mut ct, mut cb) = (None, None);
+        for (p, frag) in pend.iter().zip(outs) {
+            if let Some(c) = frag {
+                if let Some(d) = &mut self.depth {
+                    if d.write {
+                        d.data[p.idx] = p.zf;
+                    }
+                }
+                let bpt = plan.bpt;
+                let texel = &mut self.color.data[p.idx * bpt..(p.idx + 1) * bpt];
+                plan.write(texel, c, false, &mut ct, &mut cb);
             }
         }
     }
@@ -448,6 +494,14 @@ fn clip(tri: &[CV; 3], interp: &[(u32, Interp)]) -> Vec<CV> {
 // ---------------------------------------------------------------------------
 // per-triangle pixel write plan
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct Pending {
+    idx: usize,
+    zf: f32,
+    pos: [f32; 4],
+    var: Varyings,
+}
 
 /// Everything about writing a pixel that does not change within a triangle,
 /// resolved once instead of per pixel.

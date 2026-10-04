@@ -48,6 +48,10 @@ pub struct CompiledStage {
     pub prog: Program,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     pub jit: Option<super::jit::Jit>,
+    /// 4-lane SSE4.1 code, when available (always alongside `jit`, which
+    /// handles batches whose lanes diverge)
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub wide: Option<super::jit::Jit>,
 }
 
 #[derive(Debug)]
@@ -71,7 +75,7 @@ impl Stage {
     /// `force`: "" (best available), "interp", "vm" or "jit" (an error if
     /// the shader cannot be compiled / jitted).
     pub fn build(shader: Arc<Shader>, entry: usize, force: &str) -> Result<Stage, String> {
-        let strict = force == "vm" || force == "jit";
+        let strict = force == "vm" || force == "jit" || force == "jitw";
         let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
         let name = shader.module.entry_points[entry].name.clone();
         if force != "interp" {
@@ -111,10 +115,38 @@ impl Stage {
                     if force == "jit" {
                         return Err("jit unavailable on this target".into());
                     }
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    let wide = if jit.is_some()
+                        && force != "jit"
+                        && std::env::var("AKUMA_WIDE").as_deref() != Ok("0")
+                    {
+                        match super::jit::compile_wide(&prog) {
+                            Ok(w) => {
+                                if verbose {
+                                    eprintln!("[exec] {name}: wide jit, {} bytes", w.code_len());
+                                }
+                                Some(w)
+                            }
+                            Err(e) => {
+                                if force == "jitw" {
+                                    return Err(format!("{name}: wide jit declined: {e}"));
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    if force == "jitw" && wide.is_none() {
+                        return Err("wide jit unavailable".into());
+                    }
                     return Ok(Stage::Compiled(CompiledStage {
                         prog,
                         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                         jit,
+                        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                        wide,
                     }));
                 }
                 Err(e) => {
@@ -161,6 +193,8 @@ impl Stage {
         match self {
             Stage::Interp(_) => "interp",
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Stage::Compiled(c) if c.wide.is_some() => "jitw",
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             Stage::Compiled(c) if c.jit.is_some() => "jit",
             Stage::Compiled(_) => "vm",
         }
@@ -191,10 +225,29 @@ impl Stage {
                     .collect();
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 if let Some(j) = &c.jit {
-                    let refs = bufs
+                    let refs: Vec<super::jit::BufRef> = bufs
                         .iter()
                         .map(|b| super::jit::BufRef { ptr: b.as_ptr(), len: b.len() })
                         .collect();
+                    if let Some(w) = &c.wide {
+                        let scalar = Box::new(Invoker::Jit {
+                            p: &c.prog,
+                            j,
+                            regs: c.prog.init.clone(),
+                            refs: refs.clone(),
+                            texs: texs.clone(),
+                            smps: smps.clone(),
+                        });
+                        return Invoker::Wide {
+                            p: &c.prog,
+                            w,
+                            regs: c.prog.init.iter().map(|&v| super::jit::L4([v; 4])).collect(),
+                            refs,
+                            texs,
+                            smps,
+                            scalar,
+                        };
+                    }
                     return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs, texs, smps };
                 }
                 Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs, texs, smps }
@@ -221,6 +274,17 @@ pub enum Invoker<'a> {
         texs: Vec<TexRef>,
         smps: Vec<SmpRef>,
     },
+    /// 4 invocations per call; `scalar` re-runs a batch whose lanes diverged
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    Wide {
+        p: &'a Program,
+        w: &'a super::jit::Jit,
+        regs: Vec<super::jit::L4>,
+        refs: Vec<super::jit::BufRef>,
+        texs: Vec<TexRef>,
+        smps: Vec<SmpRef>,
+        scalar: Box<Invoker<'a>>,
+    },
 }
 
 impl Invoker<'_> {
@@ -239,6 +303,8 @@ impl Invoker<'_> {
                 j.run(regs, refs, texs, smps);
                 vertex_out(p, regs)
             }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Wide { scalar, .. } => scalar.run_vertex(vertex_index, instance_index, attrs),
         }
     }
 
@@ -250,6 +316,8 @@ impl Invoker<'_> {
             Invoker::Vm { p, .. } => p,
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             Invoker::Jit { p, .. } => p,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Wide { p, .. } => p,
             Invoker::Interp { .. } => return false,
         };
         prog.interp.iter().all(|(_, m)| *m == Interp::Flat)
@@ -274,6 +342,126 @@ impl Invoker<'_> {
                 }
                 Some(frag_out(p, regs))
             }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Wide { scalar, .. } => scalar.run_fragment(varyings, frag_pos),
+        }
+    }
+
+    /// invocations this invoker prefers to be handed at once
+    pub fn lanes(&self) -> usize {
+        match self {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Wide { .. } => 4,
+            _ => 1,
+        }
+    }
+
+    /// Run several vertex invocations (`ids` = (vertex index, instance), with
+    /// matching `attrs`), appending results in order. Wide invokers run 4 at
+    /// a time; everyone else loops.
+    pub fn run_vertex_batch(&mut self, ids: &[(u32, u32)], attrs: &[Varyings], out: &mut Vec<RawVertex>) {
+        debug_assert_eq!(ids.len(), attrs.len());
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar } = self {
+            for (ci, chunk) in ids.chunks(4).enumerate() {
+                let base = ci * 4;
+                for &(r, src) in &p.inputs {
+                    let mut lanes = [0u32; 4];
+                    for (k, l) in lanes.iter_mut().enumerate() {
+                        let i = k.min(chunk.len() - 1);
+                        *l = match src {
+                            Src::VertexIndex => chunk[i].0,
+                            Src::InstanceIndex => chunk[i].1,
+                            Src::Location(loc, c) => attrs[base + i][loc as usize][c as usize],
+                            Src::Position(_) => 0,
+                        };
+                    }
+                    regs[r as usize].0 = lanes;
+                }
+                match w.run_wide(regs, refs, texs, smps) {
+                    0 | 1 => {
+                        for k in 0..chunk.len() {
+                            let mut v = RawVertex::default();
+                            for &(d, r) in &p.outputs {
+                                let bits = regs[r as usize].0[k];
+                                match d {
+                                    Dst::Position(i) => v.position[i as usize] = f32::from_bits(bits),
+                                    Dst::Location(l, c) => v.varyings[l as usize][c as usize] = bits,
+                                }
+                            }
+                            out.push(v);
+                        }
+                    }
+                    _ => {
+                        // lanes diverged: one by one
+                        for (k, &(vi, ii)) in chunk.iter().enumerate() {
+                            out.push(scalar.run_vertex(vi, ii, &attrs[base + k]));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        for (i, &(vi, ii)) in ids.iter().enumerate() {
+            out.push(self.run_vertex(vi, ii, &attrs[i]));
+        }
+    }
+
+    /// Fragment counterpart of `run_vertex_batch`: (frag position, varyings)
+    /// per invocation, results into `out` (same length).
+    pub fn run_fragment_batch(&mut self, ins: &[([f32; 4], &Varyings)], out: &mut [Option<[u32; 4]>]) {
+        debug_assert_eq!(ins.len(), out.len());
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar } = self {
+            for (ci, chunk) in ins.chunks(4).enumerate() {
+                let base = ci * 4;
+                for &(r, src) in &p.inputs {
+                    let mut lanes = [0u32; 4];
+                    for (k, l) in lanes.iter_mut().enumerate() {
+                        let i = k.min(chunk.len() - 1);
+                        *l = match src {
+                            Src::Position(c) => chunk[i].0[c as usize].to_bits(),
+                            Src::Location(loc, c) => chunk[i].1[loc as usize][c as usize],
+                            _ => 0,
+                        };
+                    }
+                    regs[r as usize].0 = lanes;
+                }
+                let status = w.run_wide(regs, refs, texs, smps);
+                if super::prof::enabled() {
+                    super::prof::inc(11, 1);
+                    if status == super::jit::STATUS_DIVERGED {
+                        super::prof::inc(12, 1);
+                    }
+                }
+                match status {
+                    0 => {
+                        for k in 0..chunk.len() {
+                            let mut color = [0u32; 4];
+                            for &(d, r) in &p.outputs {
+                                if let Dst::Location(0, c) = d {
+                                    color[c as usize] = regs[r as usize].0[k];
+                                }
+                            }
+                            out[base + k] = Some(color);
+                        }
+                    }
+                    1 => {
+                        for k in 0..chunk.len() {
+                            out[base + k] = None;
+                        }
+                    }
+                    _ => {
+                        for (k, (pos, var)) in chunk.iter().enumerate() {
+                            out[base + k] = scalar.run_fragment(var, *pos);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        for (i, (pos, var)) in ins.iter().enumerate() {
+            out[i] = self.run_fragment(var, *pos);
         }
     }
 }

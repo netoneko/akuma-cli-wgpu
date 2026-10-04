@@ -441,7 +441,7 @@ fn extent(w: usize, h: usize) -> wgpu::Extent3d {
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const NAMES: [&str; 11] = [
+    pub const NAMES: [&str; 13] = [
         "backdrop (cpu rain)",
         "pack mesh",
         "upload color tex",
@@ -453,8 +453,10 @@ pub mod prof {
         "vertex invocations",
         "fragment invocations",
         "frames",
+        "wide batches",
+        "wide batches diverged",
     ];
-    pub static C: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    pub static C: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
     pub fn add_ns(i: usize, secs: f64) {
         C[i].fetch_add((secs * 1e9) as u64, Relaxed);
@@ -491,6 +493,10 @@ pub mod prof {
         let f = C[9].load(Relaxed);
         eprintln!("[prof] vertex invocations   {:>9}/frame, {:.0} ns each", v / frames, C[4].load(Relaxed) as f64 / v.max(1) as f64);
         eprintln!("[prof] fragment invocations {:>9}/frame, {:.0} ns each", f / frames, C[6].load(Relaxed) as f64 / f.max(1) as f64);
+        let (wb, wd) = (C[11].load(Relaxed), C[12].load(Relaxed));
+        if wb > 0 {
+            eprintln!("[prof] wide batches {wb}, diverged {wd} ({:.1}%)", wd as f64 * 100.0 / wb as f64);
+        }
         for c in C.iter() {
             c.store(0, Relaxed);
         }

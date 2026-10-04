@@ -98,6 +98,7 @@ pub fn run(
                     texs.as_ptr(),
                     smps.as_ptr(),
                     &tex_ops[op as usize],
+                    1,
                 );
             },
             Inst::Jmp { t } => {
