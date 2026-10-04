@@ -46,6 +46,7 @@ pub mod raster;
 pub mod vertex;
 pub mod vm;
 pub mod shaders;
+pub mod texture;
 
 /// One-line status of the wgpu path (main.rs prints it when the wgpu path
 /// starts).

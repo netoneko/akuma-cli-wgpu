@@ -189,6 +189,109 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    fn upload(&self, tex: &wgpu::Texture, w: u32, h: u32, bpt: u32, data: &[u8]) {
+        self.queue.write_texture(
+            tex.as_image_copy(),
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * bpt), rows_per_image: None },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
+    fn sampler(&self, filter: wgpu::FilterMode, addr: wgpu::AddressMode) -> wgpu::Sampler {
+        self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: None,
+            address_mode_u: addr,
+            address_mode_v: addr,
+            address_mode_w: addr,
+            mag_filter: filter,
+            min_filter: filter,
+            ..Default::default()
+        })
+    }
+
+    /// group 0: texture at binding 0, sampler at binding 1, both fragment-visible
+    fn tex_layout(&self) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        (bgl, pl)
+    }
+
+    /// draw a fullscreen triangle running `fs_body` (a fragment function body
+    /// with `tex`, `smp` and `uv` in scope) onto a fresh `fmt` target
+    fn draw_textured(
+        &self,
+        src_tex: &wgpu::Texture,
+        smp: &wgpu::Sampler,
+        fs_body: &str,
+        (w, h): (u32, u32),
+        fmt: wgpu::TextureFormat,
+        bpt: u32,
+    ) -> Vec<u8> {
+        let src = format!(
+            "{FULL_TRI}
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+struct V {{ @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> }};
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> V {{
+    var o: V;
+    o.p = full(vi);
+    // (-1,-3) (-1,1) (3,1) -> uv spanning 0..1 over the visible square
+    o.uv = vec2<f32>(o.p.x * 0.5 + 0.5, 0.5 - o.p.y * 0.5);
+    return o;
+}}
+@fragment fn fs(v: V) -> @location(0) vec4<f32> {{
+    let uv = v.uv;
+    {fs_body}
+}}"
+        );
+        let (bgl, pl) = self.tex_layout();
+        let m = self.module(&src);
+        let p = self.pipeline(&m, &pl, fmt, None, wgpu::PrimitiveTopology::TriangleList, None, &[]);
+        let view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(smp) },
+            ],
+        });
+        let target = self.texture(w, h, fmt);
+        self.pass(&target, Some(BLACK), |rp| {
+            rp.set_pipeline(&p);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..3, 0..1);
+        });
+        self.read(&target, w, h, bpt)
+    }
+}
+
 type TestResult = Result<(), String>;
 
 fn expect(cond: bool, what: impl FnOnce() -> String) -> TestResult {
@@ -566,6 +669,119 @@ fn t_formats(g: &Gpu) -> TestResult {
     check(wgpu::TextureFormat::Rgba8UnormSrgb, 4, &[255, 188, 137, 255])
 }
 
+fn rgba(px: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+    let o = ((y * w + x) * 4) as usize;
+    [px[o], px[o + 1], px[o + 2], px[o + 3]]
+}
+
+const QUAD4: [u8; 16] = [
+    255, 0, 0, 255, 0, 255, 0, 255, // red, green
+    0, 0, 255, 255, 255, 255, 255, 255, // blue, white
+];
+
+fn t_texture_load(g: &Gpu) -> TestResult {
+    let tex = g.texture(2, 2, wgpu::TextureFormat::Rgba8Unorm);
+    g.upload(&tex, 2, 2, 4, &QUAD4);
+    let smp = g.sampler(wgpu::FilterMode::Nearest, wgpu::AddressMode::ClampToEdge);
+    let px = g.draw_textured(
+        &tex, &smp,
+        "return textureLoad(tex, vec2<i32>(floor(uv * 2.0)), 0);",
+        (8, 8), wgpu::TextureFormat::Rgba8Unorm, 4,
+    );
+    expect(rgba(&px, 8, 1, 1) == [255, 0, 0, 255], || format!("tl {:?}", rgba(&px, 8, 1, 1)))?;
+    expect(rgba(&px, 8, 6, 1) == [0, 255, 0, 255], || format!("tr {:?}", rgba(&px, 8, 6, 1)))?;
+    expect(rgba(&px, 8, 1, 6) == [0, 0, 255, 255], || format!("bl {:?}", rgba(&px, 8, 1, 6)))?;
+    expect(rgba(&px, 8, 6, 6) == [255, 255, 255, 255], || format!("br {:?}", rgba(&px, 8, 6, 6)))
+}
+
+fn t_texture_sample_nearest(g: &Gpu) -> TestResult {
+    let tex = g.texture(2, 2, wgpu::TextureFormat::Rgba8Unorm);
+    g.upload(&tex, 2, 2, 4, &QUAD4);
+    let smp = g.sampler(wgpu::FilterMode::Nearest, wgpu::AddressMode::ClampToEdge);
+    let px = g.draw_textured(
+        &tex, &smp,
+        "return textureSample(tex, smp, uv);",
+        (8, 8), wgpu::TextureFormat::Rgba8Unorm, 4,
+    );
+    expect(rgba(&px, 8, 1, 1) == [255, 0, 0, 255], || format!("tl {:?}", rgba(&px, 8, 1, 1)))?;
+    expect(rgba(&px, 8, 6, 6) == [255, 255, 255, 255], || format!("br {:?}", rgba(&px, 8, 6, 6)))?;
+    // clamp-to-edge: sampling outside 0..1 repeats the edge texel
+    let px = g.draw_textured(
+        &tex, &smp,
+        "return textureSample(tex, smp, uv * 3.0 - vec2<f32>(1.0, 1.0));",
+        (9, 9), wgpu::TextureFormat::Rgba8Unorm, 4,
+    );
+    expect(rgba(&px, 9, 0, 0) == [255, 0, 0, 255], || format!("clamped corner {:?}", rgba(&px, 9, 0, 0)))?;
+    expect(rgba(&px, 9, 8, 8) == [255, 255, 255, 255], || format!("clamped corner {:?}", rgba(&px, 9, 8, 8)))
+}
+
+/// a 2x1 R8 texture (0, 255): bilinear between the texel centres at u=0.25
+/// and u=0.75 ramps linearly and clamps outside them
+fn t_texture_bilinear(g: &Gpu) -> TestResult {
+    let tex = g.texture(2, 1, wgpu::TextureFormat::R8Unorm);
+    g.upload(&tex, 2, 1, 1, &[0, 255]);
+    let smp = g.sampler(wgpu::FilterMode::Linear, wgpu::AddressMode::ClampToEdge);
+    let (w, h) = (16u32, 2u32);
+    let px = g.draw_textured(&tex, &smp, "return vec4<f32>(textureSample(tex, smp, uv).r, 0.0, 0.0, 1.0);",
+        (w, h), wgpu::TextureFormat::Rgba8Unorm, 4);
+    for x in 0..w {
+        let u = (x as f32 + 0.5) / w as f32;
+        let want = (((u - 0.25) / 0.5).clamp(0.0, 1.0) * 255.0 + 0.5).floor() as i32;
+        let got = rgba(&px, w, x, 0)[0] as i32;
+        expect((got - want).abs() <= 1, || format!("x={x} u={u}: {got}, expected {want}"))?;
+    }
+    Ok(())
+}
+
+fn t_texture_repeat_and_dims(g: &Gpu) -> TestResult {
+    let tex = g.texture(2, 1, wgpu::TextureFormat::R8Unorm);
+    g.upload(&tex, 2, 1, 1, &[10, 200]);
+    let smp = g.sampler(wgpu::FilterMode::Nearest, wgpu::AddressMode::Repeat);
+    // u*2 over 0..1 -> two repeats of (10, 200): texel columns 10 200 10 200
+    let (w, h) = (8u32, 2u32);
+    let px = g.draw_textured(&tex, &smp, "return vec4<f32>(textureSample(tex, smp, vec2<f32>(uv.x * 2.0, 0.5)).r, 0.0, 0.0, 1.0);",
+        (w, h), wgpu::TextureFormat::Rgba8Unorm, 4);
+    let want = [10, 10, 200, 200, 10, 10, 200, 200];
+    for x in 0..w {
+        let got = rgba(&px, w, x, 0)[0];
+        expect(got == want[x as usize], || format!("repeat x={x}: {got}, expected {}", want[x as usize]))?;
+    }
+    // textureDimensions
+    let px = g.draw_textured(&tex, &smp, "let d = textureDimensions(tex); return vec4<f32>(f32(d.x) / 255.0, f32(d.y) / 255.0, 0.0, 1.0);",
+        (4, 4), wgpu::TextureFormat::Rgba8Unorm, 4);
+    expect(rgba(&px, 4, 1, 1)[..2] == [2, 1], || format!("dims {:?}", &rgba(&px, 4, 1, 1)[..2]))
+}
+
+fn t_texture_srgb(g: &Gpu) -> TestResult {
+    let tex = g.texture(1, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
+    g.upload(&tex, 1, 1, 4, &[128, 128, 128, 255]);
+    let smp = g.sampler(wgpu::FilterMode::Nearest, wgpu::AddressMode::ClampToEdge);
+    let px = g.draw_textured(&tex, &smp, "return textureSample(tex, smp, uv);", (2, 2), wgpu::TextureFormat::Rgba8Unorm, 4);
+    // sRGB 128/255 = 0.50196 -> linear 0.2158 -> 55
+    expect(rgba(&px, 2, 0, 0) == [55, 55, 55, 255], || format!("srgb decode {:?}", rgba(&px, 2, 0, 0)))
+}
+
+fn t_texture_copy(g: &Gpu) -> TestResult {
+    // a 4x4 R8 texture filled with its index; copy the 2x2 block at (1,1) to a
+    // second texture at (2,0), and a row buffer->texture; read both back
+    let a = g.texture(4, 4, wgpu::TextureFormat::R8Unorm);
+    let data: Vec<u8> = (0..16).collect();
+    g.upload(&a, 4, 4, 1, &data);
+    let b = g.texture(4, 4, wgpu::TextureFormat::R8Unorm);
+    let mut enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo { texture: &a, mip_level: 0, origin: wgpu::Origin3d { x: 1, y: 1, z: 0 }, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture: &b, mip_level: 0, origin: wgpu::Origin3d { x: 2, y: 0, z: 0 }, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+    );
+    let done = g.queue.submit([enc.finish()]);
+    g.device.poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: None }).expect("poll");
+    let got = g.read(&b, 4, 4, 1);
+    // block from a: (1,1)=5 (2,1)=6 / (1,2)=9 (2,2)=10 -> b at (2,0),(3,0) / (2,1),(3,1)
+    expect(got[2] == 5 && got[3] == 6 && got[4 + 2] == 9 && got[4 + 3] == 10, || format!("copy: {got:?}"))?;
+    expect(got[0] == 0 && got[1] == 0 && got[8] == 0, || "copy touched outside the block".into())
+}
+
 pub fn run() -> i32 {
     let g = Gpu::new();
     let tests: &[(&str, fn(&Gpu) -> TestResult)] = &[
@@ -578,6 +794,12 @@ pub fn run() -> i32 {
         ("premultiplied-alpha blending", t_premultiplied_blend),
         ("scissor rect + viewport", t_scissor_viewport),
         ("target formats (rgba/bgra/r8/rg8/srgb)", t_formats),
+        ("textureLoad", t_texture_load),
+        ("textureSample, nearest, clamp-to-edge", t_texture_sample_nearest),
+        ("textureSample, bilinear", t_texture_bilinear),
+        ("textureSample repeat + textureDimensions", t_texture_repeat_and_dims),
+        ("sRGB texture decode on sample", t_texture_srgb),
+        ("texture-to-texture copy with origins", t_texture_copy),
     ];
     let mut failed = 0;
     for (name, f) in tests {

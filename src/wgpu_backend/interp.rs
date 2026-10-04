@@ -144,6 +144,10 @@ pub struct Resources<'r> {
     /// backend holds the buffers' locks across it, so every stage executor —
     /// interpreter, VM, JIT — reads plain slices)
     pub bufs: HashMap<(u32, u32), &'r [u8]>,
+    /// bound textures / samplers (used by compiled stages; the interpreter
+    /// does not sample)
+    pub texs: HashMap<(u32, u32), super::texture::TexRef>,
+    pub smps: HashMap<(u32, u32), super::texture::SmpRef>,
 }
 
 impl<'r> Resources<'r> {

@@ -21,6 +21,7 @@
 //! inline sequences are IEEE-exact, so they agree bit for bit.
 
 use super::program::{Cmp, Inst, Program};
+use super::texture::{SmpRef, TexRef};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -29,7 +30,7 @@ pub struct BufRef {
     pub len: usize,
 }
 
-type Entry = extern "C" fn(*mut u32, *const BufRef) -> u32;
+type Entry = extern "C" fn(*mut u32, *const BufRef, *const TexRef, *const SmpRef) -> u32;
 
 pub struct Jit {
     mem: *mut u8,
@@ -58,8 +59,8 @@ impl Drop for Jit {
 impl Jit {
     /// Run one invocation; true = killed.
     #[inline]
-    pub fn run(&self, regs: &mut [u32], bufs: &[BufRef]) -> bool {
-        (self.entry)(regs.as_mut_ptr(), bufs.as_ptr()) != 0
+    pub fn run(&self, regs: &mut [u32], bufs: &[BufRef], texs: &[TexRef], smps: &[SmpRef]) -> bool {
+        (self.entry)(regs.as_mut_ptr(), bufs.as_ptr(), texs.as_ptr(), smps.as_ptr()) != 0
     }
 
     pub fn code_len(&self) -> usize {
@@ -109,6 +110,8 @@ impl Asm {
             self.bytes(&[0x31, 0xC0]); // xor eax,eax
         }
         self.bytes(&[0x48, 0x83, 0xC4, 0x08]); // add rsp,8
+        self.bytes(&[0x41, 0x5E]); // pop r14
+        self.bytes(&[0x41, 0x5D]); // pop r13
         self.bytes(&[0x41, 0x5C]); // pop r12
         self.u8(0x5B); // pop rbx
         self.u8(0xC3); // ret
@@ -127,9 +130,13 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
     // prologue
     a.u8(0x53); // push rbx
     a.bytes(&[0x41, 0x54]); // push r12
+    a.bytes(&[0x41, 0x55]); // push r13
+    a.bytes(&[0x41, 0x56]); // push r14
     a.bytes(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp,8   (rsp 16-aligned at calls)
-    a.bytes(&[0x48, 0x89, 0xFB]); // mov rbx,rdi
-    a.bytes(&[0x49, 0x89, 0xF4]); // mov r12,rsi
+    a.bytes(&[0x48, 0x89, 0xFB]); // mov rbx,rdi   regs
+    a.bytes(&[0x49, 0x89, 0xF4]); // mov r12,rsi   bufs
+    a.bytes(&[0x49, 0x89, 0xD5]); // mov r13,rdx   texs
+    a.bytes(&[0x49, 0x89, 0xCE]); // mov r14,rcx   smps
 
     let mut starts = Vec::with_capacity(p.code.len() + 1);
     let mut fixups: Vec<(usize, u32)> = Vec::new(); // (rel32 position, target inst)
@@ -222,6 +229,18 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
                 a.bytes(&[0xEB, 0x02]); // jmp done
                 a.bytes(&[0x31, 0xC0]); // zero: xor eax,eax
                 a.store_eax(d); // done:
+            }
+            Inst::Tex { op } => {
+                // tex_helper(regs, texs, smps, &tex_ops[op])
+                a.bytes(&[0x48, 0x89, 0xDF]); // mov rdi,rbx
+                a.bytes(&[0x4C, 0x89, 0xEE]); // mov rsi,r13
+                a.bytes(&[0x4C, 0x89, 0xF2]); // mov rdx,r14
+                let opref = p.tex_ops.get(op as usize).ok_or("tex op out of range")?;
+                a.bytes(&[0x48, 0xB9]); // mov rcx, imm64
+                a.bytes(&(opref as *const _ as usize as u64).to_le_bytes());
+                a.bytes(&[0x48, 0xB8]); // mov rax, imm64
+                a.bytes(&(super::texture::tex_helper as usize as u64).to_le_bytes());
+                a.bytes(&[0xFF, 0xD0]); // call rax
             }
             Inst::Jmp { t } => {
                 a.u8(0xE9);

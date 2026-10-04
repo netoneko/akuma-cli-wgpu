@@ -4,10 +4,18 @@
 //! builds. It is also the oracle the JIT is diffed against.
 
 use super::program::{cmp, Inst};
+use super::texture::{SmpRef, TexOp, TexRef};
 
 /// Run `code` over `regs` (already holding inputs and hoisted constants).
 /// Returns true if the invocation was killed (`discard`).
-pub fn run(code: &[Inst], regs: &mut [u32], bufs: &[&[u8]]) -> bool {
+pub fn run(
+    code: &[Inst],
+    regs: &mut [u32],
+    bufs: &[&[u8]],
+    texs: &[TexRef],
+    smps: &[SmpRef],
+    tex_ops: &[TexOp],
+) -> bool {
     let mut pc = 0usize;
     macro_rules! fop {
         ($d:expr, $a:expr, $b:expr, $op:tt) => {
@@ -70,6 +78,14 @@ pub fn run(code: &[Inst], regs: &mut [u32], bufs: &[&[u8]]) -> bool {
                     None => 0,
                 };
             }
+            Inst::Tex { op } => unsafe {
+                super::texture::tex_helper(
+                    regs.as_mut_ptr(),
+                    texs.as_ptr(),
+                    smps.as_ptr(),
+                    &tex_ops[op as usize],
+                );
+            },
             Inst::Jmp { t } => {
                 pc = t as usize;
                 continue;

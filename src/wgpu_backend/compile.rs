@@ -34,6 +34,7 @@ use super::interp::{
     align_of, array_stride, member_offsets, size_of, vec_stride, vsize, w, Shader,
 };
 use super::program::{Cmp, Dst, Fun, Inst, Interp, Program, Src, R};
+use super::texture::{Elem, TexKind, TexOp};
 
 type Res<T> = Result<T, String>;
 
@@ -76,6 +77,9 @@ enum Ptr {
 enum Val {
     V(Lv),
     P(Ptr),
+    /// a bound texture (slot, element type) / sampler (slot)
+    Tex(u32, Elem),
+    Smp(u32),
 }
 
 struct Ctx<'m> {
@@ -102,6 +106,9 @@ struct Lowerer<'m> {
     bufs: Vec<(u32, u32)>,
     inputs: Vec<(R, Src)>,
     interp: Vec<(u32, Interp)>,
+    texs: Vec<(u32, u32)>,
+    smps: Vec<(u32, u32)>,
+    tex_ops: Vec<TexOp>,
     labels: Vec<Option<u32>>,
     gmemo: Vec<Option<Lv>>,
 }
@@ -118,6 +125,9 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         bufs: Vec::new(),
         inputs: Vec::new(),
         interp: Vec::new(),
+        texs: Vec::new(),
+        smps: Vec::new(),
+        tex_ops: Vec::new(),
         labels: Vec::new(),
         gmemo: vec![None; m.global_expressions.len()],
     };
@@ -152,6 +162,9 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         inputs: lw.inputs,
         outputs,
         interp: lw.interp,
+        texs: lw.texs,
+        smps: lw.smps,
+        tex_ops: lw.tex_ops,
     })
 }
 
@@ -458,7 +471,7 @@ impl<'m> Lowerer<'m> {
     fn val(&mut self, ctx: &mut Ctx<'m>, h: Handle<Expression>) -> Res<Lv> {
         match self.get(ctx, h)? {
             Val::V(l) => Ok(l),
-            Val::P(_) => bail!("pointer where a value was expected"),
+            _ => bail!("pointer/handle where a value was expected"),
         }
     }
 
@@ -702,6 +715,42 @@ impl<'m> Lowerer<'m> {
                             shape: Shape::Ty(gv.ty),
                         })
                     }
+                    AddressSpace::Handle => {
+                        let b = gv.binding.as_ref().ok_or("resource without binding")?;
+                        let key = (b.group, b.binding);
+                        match &self.m.types[gv.ty].inner {
+                            TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class, .. } => {
+                                let elem = match class {
+                                    naga::ImageClass::Sampled { kind, multi: false } => match kind {
+                                        ScalarKind::Float => Elem::F,
+                                        ScalarKind::Uint => Elem::U,
+                                        ScalarKind::Sint => Elem::I,
+                                        k => bail!("texture of {k:?}"),
+                                    },
+                                    other => bail!("image class {other:?}"),
+                                };
+                                let slot = match self.texs.iter().position(|&x| x == key) {
+                                    Some(i) => i,
+                                    None => {
+                                        self.texs.push(key);
+                                        self.texs.len() - 1
+                                    }
+                                };
+                                Val::Tex(slot as u32, elem)
+                            }
+                            TypeInner::Sampler { comparison: false } => {
+                                let slot = match self.smps.iter().position(|&x| x == key) {
+                                    Some(i) => i,
+                                    None => {
+                                        self.smps.push(key);
+                                        self.smps.len() - 1
+                                    }
+                                };
+                                Val::Smp(slot as u32)
+                            }
+                            other => bail!("handle global of type {other:?}"),
+                        }
+                    }
                     other => bail!("global in {other:?}"),
                 }
             }
@@ -719,7 +768,7 @@ impl<'m> Lowerer<'m> {
                 Val::P(Ptr::Buf { buf, imm, dynr, shape }) => {
                     Val::V(self.load_buf(buf, imm, dynr, shape)?)
                 }
-                Val::V(_) => bail!("load of a value"),
+                Val::V(_) | Val::Tex(..) | Val::Smp(..) => bail!("load of a value / handle"),
             },
             Expression::Compose { ty, components } => {
                 let mut comps = Vec::new();
@@ -788,6 +837,65 @@ impl<'m> Lowerer<'m> {
                 let v = self.val(ctx, *expr)?;
                 Val::V(self.cast(&v, *kind, *convert)?)
             }
+            Expression::ImageSample {
+                image,
+                sampler,
+                gather: None,
+                coordinate,
+                array_index: None,
+                offset: None,
+                level,
+                depth_ref: None,
+                clamp_to_edge: _,
+            } => {
+                // one mip level on this GPU: every sample level is level 0
+                let _ = level;
+                let Val::Tex(tex, elem) = self.get(ctx, *image)? else { bail!("sample of a non-texture") };
+                if elem != Elem::F {
+                    bail!("sampling an integer texture")
+                }
+                let Val::Smp(smp) = self.get(ctx, *sampler)? else { bail!("sample with a non-sampler") };
+                let Lv::A(c) = self.val(ctx, *coordinate)? else { bail!("sample coordinate") };
+                let (Lv::S(x, _), Lv::S(y, _)) = (&c[0], &c[1]) else { bail!("sample coordinate") };
+                Val::V(self.tex_op(TexKind::Sample, tex, smp, *x, *y, Elem::F, false))
+            }
+            Expression::ImageLoad { image, coordinate, array_index: None, sample: None, level, .. } => {
+                let Val::Tex(tex, elem) = self.get(ctx, *image)? else { bail!("load of a non-texture") };
+                if let Some(l) = level {
+                    // only level 0 exists
+                    let Lv::S(r, _) = self.val(ctx, *l)? else { bail!("load level") };
+                    if self.kconst.get(&r) != Some(&0) {
+                        bail!("textureLoad at a non-zero / dynamic mip level")
+                    }
+                }
+                let Lv::A(c) = self.val(ctx, *coordinate)? else { bail!("load coordinate") };
+                let (Lv::S(x, kx), Lv::S(y, _)) = (&c[0], &c[1]) else { bail!("load coordinate") };
+                Val::V(self.tex_op(TexKind::Load, tex, u32::MAX, *x, *y, elem, *kx == K::I))
+            }
+            Expression::ImageQuery { image, query } => {
+                let Val::Tex(tex, _) = self.get(ctx, *image)? else { bail!("query of a non-texture") };
+                match query {
+                    naga::ImageQuery::Size { .. } => {
+                        let d = self.nregs;
+                        self.nregs += 2;
+                        self.tex_ops.push(TexOp {
+                            kind: TexKind::Size,
+                            tex,
+                            smp: u32::MAX,
+                            x: 0,
+                            y: 0,
+                            d,
+                            elem: Elem::U,
+                            signed: false,
+                        });
+                        self.push(Inst::Tex { op: (self.tex_ops.len() - 1) as u32 });
+                        Val::V(Lv::A(vec![Lv::S(d, K::U), Lv::S(d + 1, K::U)]))
+                    }
+                    naga::ImageQuery::NumLevels | naga::ImageQuery::NumLayers | naga::ImageQuery::NumSamples => {
+                        Val::V(self.konst(1, K::U))
+                    }
+                }
+            }
             Expression::CallResult(_) => {
                 // filled by the Call statement; evaluated by Emit only if naga
                 // lists it there (it does not), so a hit here is a bug
@@ -795,6 +903,21 @@ impl<'m> Lowerer<'m> {
             }
             other => bail!("expression {:?}", std::mem::discriminant(other)),
         })
+    }
+
+    /// emit a texture op producing 4 fresh consecutive registers
+    #[allow(clippy::too_many_arguments)]
+    fn tex_op(&mut self, kind: TexKind, tex: u32, smp: u32, x: R, y: R, elem: Elem, signed: bool) -> Lv {
+        let d = self.nregs;
+        self.nregs += 4;
+        self.tex_ops.push(TexOp { kind, tex, smp, x, y, d, elem, signed });
+        self.push(Inst::Tex { op: (self.tex_ops.len() - 1) as u32 });
+        let k = match elem {
+            Elem::F => K::F,
+            Elem::U => K::U,
+            Elem::I => K::I,
+        };
+        Lv::A((0..4).map(|i| Lv::S(d + i, k)).collect())
     }
 
     fn literal(&mut self, l: Literal) -> Res<Lv> {
@@ -895,6 +1018,7 @@ impl<'m> Lowerer<'m> {
 
     fn access_static(&mut self, base: Val, index: u32) -> Res<Val> {
         match base {
+            Val::Tex(..) | Val::Smp(..) => bail!("index into a texture/sampler handle"),
             Val::V(Lv::A(items)) => items
                 .get(index as usize)
                 .cloned()

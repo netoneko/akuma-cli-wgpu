@@ -77,9 +77,8 @@ pub enum BindRes {
     Buffer(Arc<Mutex<Vec<u8>>>),
     /// recorded into bind groups for completeness; the draw executor rejects
     /// texture bindings (the demo's shaders are buffer-only)
-    #[allow(dead_code)]
     Texture(ViewData),
-    Sampler,
+    Sampler(super::texture::SmpRef),
 }
 
 #[derive(Debug, Clone)]
@@ -455,7 +454,12 @@ impl wgpu::custom::DeviceInterface for Device {
                         .expect("akuma backend: foreign texture view");
                     BindRes::Texture(vd.clone())
                 }
-                wgpu::BindingResource::Sampler(_) => BindRes::Sampler,
+                wgpu::BindingResource::Sampler(smp) => {
+                    let sd = smp
+                        .as_custom::<SamplerData>()
+                        .expect("akuma backend: foreign sampler");
+                    BindRes::Sampler(sd.desc)
+                }
                 other => panic!("akuma backend: bind group resource {other:?} unsupported"),
             };
             entries.push((e.binding, res));
@@ -627,9 +631,17 @@ impl wgpu::custom::DeviceInterface for Device {
 
     fn create_sampler(
         &self,
-        _desc: &wgpu::SamplerDescriptor<'_>,
+        desc: &wgpu::SamplerDescriptor<'_>,
     ) -> wgpu::custom::DispatchSampler {
-        wgpu::custom::DispatchSampler::custom(SamplerData)
+        assert!(desc.compare.is_none(), "akuma backend: comparison samplers unsupported");
+        wgpu::custom::DispatchSampler::custom(SamplerData {
+            desc: super::texture::SmpRef {
+                mag: desc.mag_filter,
+                min: desc.min_filter,
+                addr_u: desc.address_mode_u,
+                addr_v: desc.address_mode_v,
+            },
+        })
     }
 
     fn create_query_set(
@@ -740,7 +752,9 @@ impl wgpu::custom::ComputePipelineInterface for ComputePipelineData {
 }
 
 #[derive(Debug)]
-pub struct SamplerData;
+pub struct SamplerData {
+    pub desc: super::texture::SmpRef,
+}
 impl wgpu::custom::SamplerInterface for SamplerData {}
 
 #[derive(Debug)]
@@ -1247,14 +1261,36 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     // lock every buffer once
     let mut locks = Locks::new();
     let mut bind_idx: Vec<(u32, u32, usize)> = Vec::new();
+    // bound textures: lock each distinct store once, keep the guards for the draw
+    let mut tex_guards: Vec<std::sync::MutexGuard<'_, Vec<u8>>> = Vec::new();
+    let mut tex_seen: Vec<*const TexStore> = Vec::new();
+    let mut tex_binds: Vec<(u32, u32, usize, &TextureData)> = Vec::new();
+    let mut smp_binds: Vec<(u32, u32, super::texture::SmpRef)> = Vec::new();
     for (gi, g) in st.groups.iter().enumerate() {
         let g = g.as_ref().expect("bind group not set");
         for (binding, r) in &g.entries {
             match r {
                 BindRes::Buffer(bytes) => bind_idx.push((gi as u32, *binding, locks.lock(bytes))),
-                BindRes::Texture(_) | BindRes::Sampler => {
-                    panic!("akuma backend: texture/sampler bindings are not wired into draws yet")
+                BindRes::Texture(view) => {
+                    assert!(
+                        !Arc::ptr_eq(&view.tex.store, &st.color.store),
+                        "akuma backend: a texture bound for sampling is also the render target"
+                    );
+                    let p = Arc::as_ptr(&view.tex.store);
+                    let at = match tex_seen.iter().position(|&q| q == p) {
+                        Some(i) => i,
+                        None => {
+                            let TexStore::Color(c) = &*view.tex.store else {
+                                panic!("akuma backend: depth textures cannot be sampled yet")
+                            };
+                            tex_seen.push(p);
+                            tex_guards.push(c.lock().unwrap());
+                            tex_guards.len() - 1
+                        }
+                    };
+                    tex_binds.push((gi as u32, *binding, at, &view.tex));
                 }
+                BindRes::Sampler(d) => smp_binds.push((gi as u32, *binding, *d)),
             }
         }
     }
@@ -1268,6 +1304,22 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     let mut res = Resources::default();
     for &(g, b, at) in &bind_idx {
         res = res.with_buffer(g, b, &locks.guards[at][..]);
+    }
+    for &(g, b, at, t) in &tex_binds {
+        let bytes = &tex_guards[at];
+        res.texs.insert(
+            (g, b),
+            super::texture::TexRef {
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+                w: t.size.width,
+                h: t.size.height,
+                format: t.format,
+            },
+        );
+    }
+    for &(g, b, d) in &smp_binds {
+        res.smps.insert((g, b), d);
     }
     let mut vs_inv = pipe.vs.stage.begin(&res);
     let mut fs_inv = fs_stage.begin(&res);
@@ -1423,8 +1475,8 @@ fn lock_buffers(groups: &[Option<BindGroupData>]) -> Locked<'_> {
                     };
                     idx.push((gi as u32, *binding, at));
                 }
-                BindRes::Texture(_) | BindRes::Sampler => {
-                    panic!("akuma backend: texture/sampler bindings unsupported")
+                BindRes::Texture(_) | BindRes::Sampler(_) => {
+                    panic!("akuma backend: texture/sampler bindings unsupported in the legacy path")
                 }
             }
         }

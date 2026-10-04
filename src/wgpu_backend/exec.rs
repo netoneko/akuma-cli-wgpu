@@ -20,6 +20,7 @@ use std::sync::Arc;
 use super::compile;
 use super::interp::{self, Resources, Shader, Value};
 use super::program::{Dst, Interp, Program, Src};
+use super::texture::{SmpRef, TexRef};
 use super::vm;
 
 /// How many `@location` slots a stage interface may use (rio's shaders use
@@ -117,8 +118,16 @@ impl Stage {
                     }));
                 }
                 Err(e) => {
-                    if strict {
-                        return Err(format!("{name}: cannot compile: {e}"));
+                    let uses_handles = shader
+                        .module
+                        .global_variables
+                        .iter()
+                        .any(|(_, g)| g.space == naga::AddressSpace::Handle);
+                    if strict || uses_handles {
+                        return Err(format!(
+                            "{name}: cannot compile{}: {e}",
+                            if uses_handles { " (and the interpreter cannot sample textures)" } else { "" }
+                        ));
                     }
                     if verbose {
                         eprintln!("[exec] {name}: interpreter ({e})");
@@ -168,15 +177,27 @@ impl Stage {
                     .iter()
                     .map(|k| res.bufs.get(k).copied().unwrap_or(&[]))
                     .collect();
+                let texs: Vec<TexRef> = c
+                    .prog
+                    .texs
+                    .iter()
+                    .map(|k| res.texs.get(k).copied().unwrap_or(TexRef::EMPTY))
+                    .collect();
+                let smps: Vec<SmpRef> = c
+                    .prog
+                    .smps
+                    .iter()
+                    .map(|k| res.smps.get(k).copied().unwrap_or(SmpRef::DEFAULT))
+                    .collect();
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 if let Some(j) = &c.jit {
                     let refs = bufs
                         .iter()
                         .map(|b| super::jit::BufRef { ptr: b.as_ptr(), len: b.len() })
                         .collect();
-                    return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs };
+                    return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs, texs, smps };
                 }
-                Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs }
+                Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs, texs, smps }
             }
         }
     }
@@ -184,9 +205,22 @@ impl Stage {
 
 pub enum Invoker<'a> {
     Interp { s: &'a InterpStage, res: &'a Resources<'a> },
-    Vm { p: &'a Program, regs: Vec<u32>, bufs: Vec<&'a [u8]> },
+    Vm {
+        p: &'a Program,
+        regs: Vec<u32>,
+        bufs: Vec<&'a [u8]>,
+        texs: Vec<TexRef>,
+        smps: Vec<SmpRef>,
+    },
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    Jit { p: &'a Program, j: &'a super::jit::Jit, regs: Vec<u32>, refs: Vec<super::jit::BufRef> },
+    Jit {
+        p: &'a Program,
+        j: &'a super::jit::Jit,
+        regs: Vec<u32>,
+        refs: Vec<super::jit::BufRef>,
+        texs: Vec<TexRef>,
+        smps: Vec<SmpRef>,
+    },
 }
 
 impl Invoker<'_> {
@@ -194,15 +228,15 @@ impl Invoker<'_> {
     pub fn run_vertex(&mut self, vertex_index: u32, instance_index: u32, attrs: &Varyings) -> RawVertex {
         match self {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
-            Invoker::Vm { p, regs, bufs } => {
+            Invoker::Vm { p, regs, bufs, texs, smps } => {
                 vertex_in(p, regs, vertex_index, instance_index, attrs);
-                vm::run(&p.code, regs, bufs);
+                vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops);
                 vertex_out(p, regs)
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            Invoker::Jit { p, j, regs, refs } => {
+            Invoker::Jit { p, j, regs, refs, texs, smps } => {
                 vertex_in(p, regs, vertex_index, instance_index, attrs);
-                j.run(regs, refs);
+                j.run(regs, refs, texs, smps);
                 vertex_out(p, regs)
             }
         }
@@ -211,17 +245,17 @@ impl Invoker<'_> {
     pub fn run_fragment(&mut self, varyings: &Varyings, frag_pos: [f32; 4]) -> Option<[u32; 4]> {
         match self {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),
-            Invoker::Vm { p, regs, bufs } => {
+            Invoker::Vm { p, regs, bufs, texs, smps } => {
                 frag_in(p, regs, varyings, frag_pos);
-                if vm::run(&p.code, regs, bufs) {
+                if vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops) {
                     return None;
                 }
                 Some(frag_out(p, regs))
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            Invoker::Jit { p, j, regs, refs } => {
+            Invoker::Jit { p, j, regs, refs, texs, smps } => {
                 frag_in(p, regs, varyings, frag_pos);
-                if j.run(regs, refs) {
+                if j.run(regs, refs, texs, smps) {
                     return None;
                 }
                 Some(frag_out(p, regs))

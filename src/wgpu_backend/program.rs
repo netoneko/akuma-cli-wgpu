@@ -67,6 +67,8 @@ pub enum Inst {
     Call { d: R, a: R, b: R, f: Fun },
     /// d = u32 at byte (regs[off] + imm) of buffer slot `buf`, 0 if out of range
     LoadBuf { d: R, buf: u32, off: R, imm: u32 },
+    /// texture fetch / sample / size: `Program::tex_ops[op]`
+    Tex { op: u32 },
     Jmp { t: u32 },
     Jz { c: R, t: u32 },
     Jnz { c: R, t: u32 },
@@ -112,6 +114,12 @@ pub struct Program {
     pub outputs: Vec<(Dst, R)>,
     /// (location, interpolation) of each `@location` input (fragment stage)
     pub interp: Vec<(u32, Interp)>,
+    /// (group, binding) per texture slot / sampler slot used by `Tex`
+    pub texs: Vec<(u32, u32)>,
+    pub smps: Vec<(u32, u32)>,
+    /// operands of `Inst::Tex`. Heap-stable: the JIT embeds element addresses,
+    /// so this Vec must never be grown after `jit::compile`.
+    pub tex_ops: Vec<super::texture::TexOp>,
 }
 
 // ---------------------------------------------------------------------------
