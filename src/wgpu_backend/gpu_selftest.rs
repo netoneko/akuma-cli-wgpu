@@ -1270,6 +1270,167 @@ fn t_fuzz_fragment(g: &Gpu) -> TestResult {
     Ok(())
 }
 
+
+/// sugarloaf's rectangle shader (`renderer/renderer.wgsl`: instanced quads
+/// with corner radii, clip rectangles, discard) through its own pipeline
+/// layout: a plain rect, a rounded rect and a clipped rect, checked at the
+/// pixels that tell them apart. Needs `AKUMA_SUGARLOAF`.
+fn t_sugarloaf_quads(g: &Gpu) -> TestResult {
+    let Some(dir) = std::env::var_os("AKUMA_SUGARLOAF") else {
+        return Ok(());
+    };
+    let path = std::path::Path::new(&dir).join("renderer/renderer.wgsl");
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        println!("      ({} not found: skipped)", path.display());
+        return Ok(());
+    };
+    let m = g.module(&src);
+    let (w, h) = (80u32, 50u32);
+    let fmt = wgpu::TextureFormat::Bgra8Unorm;
+    let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry { binding, visibility, ty, count: None };
+    let bgl0 = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            entry(
+                0,
+                wgpu::ShaderStages::VERTEX,
+                wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            ),
+            entry(1, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+        ],
+    });
+    let tex_ty = wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        view_dimension: wgpu::TextureViewDimension::D2,
+        multisampled: false,
+    };
+    let bgl1 = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[entry(0, wgpu::ShaderStages::FRAGMENT, tex_ty), entry(1, wgpu::ShaderStages::FRAGMENT, tex_ty)],
+    });
+    let pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bgl0), Some(&bgl1)],
+        immediate_size: 0,
+    });
+    use wgpu::VertexFormat as F;
+    let attrs = [
+        (F::Float32x3, 0u64),
+        (F::Float32x4, 12),
+        (F::Float32x4, 28),
+        (F::Sint32x2, 44),
+        (F::Float32x2, 52),
+        (F::Float32x4, 60),
+        (F::Sint32, 76),
+        (F::Float32x4, 80),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, &(format, offset))| wgpu::VertexAttribute { format, offset, shader_location: i as u32 })
+    .collect::<Vec<_>>();
+    let vbl = wgpu::VertexBufferLayout { array_stride: 96, step_mode: wgpu::VertexStepMode::Instance, attributes: &attrs };
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let pipe = g.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&pl),
+        vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_instanced"), buffers: &[Some(vbl)], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: &m,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState { format: fmt, blend: Some(wgpu::BlendState { color: c, alpha: c }), write_mask: wgpu::ColorWrites::ALL })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // pixels -> NDC, column-major
+    let mut u = Vec::new();
+    for v in [2.0 / w as f32, 0.0, 0.0, 0.0, 0.0, -2.0 / h as f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0f32] {
+        u.extend_from_slice(&v.to_le_bytes());
+    }
+    let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
+    let smp = g.sampler(wgpu::FilterMode::Nearest, wgpu::AddressMode::ClampToEdge);
+    let bg0 = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl0,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&smp) },
+        ],
+    });
+    let color_tex = g.texture(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    g.upload(&color_tex, 1, 1, 4, &[255, 255, 255, 255]);
+    let mask_tex = g.texture(1, 1, wgpu::TextureFormat::R8Unorm);
+    g.upload(&mask_tex, 1, 1, 1, &[255]);
+    let (cv, mv) = (
+        color_tex.create_view(&wgpu::TextureViewDescriptor::default()),
+        mask_tex.create_view(&wgpu::TextureViewDescriptor::default()),
+    );
+    let bg1 = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl1,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&cv) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mv) },
+        ],
+    });
+    // (x, y, size w, h, radius, clip rect)
+    let rects: [(f32, f32, f32, f32, f32, [f32; 4]); 3] = [
+        (2.0, 2.0, 20.0, 15.0, 0.0, [0.0; 4]),
+        (26.0, 2.0, 40.0, 30.0, 8.0, [0.0; 4]),
+        (2.0, 24.0, 20.0, 20.0, 0.0, [0.0, 0.0, 12.0, 100.0]),
+    ];
+    let mut inst = Vec::new();
+    for (x, y, rw, rh, r, clip) in rects {
+        let f = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let i = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        inst.extend(f(&[x, y, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0]));
+        inst.extend(i(&[0, 0]));
+        inst.extend(f(&[rw, rh, r, r, r, r]));
+        inst.extend(i(&[0]));
+        inst.extend(f(&clip));
+    }
+    let vb = g.buffer(&inst, wgpu::BufferUsages::VERTEX);
+    let target = g.texture(w, h, fmt);
+    g.pass(&target, Some(wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), |rp| {
+        rp.set_pipeline(&pipe);
+        rp.set_bind_group(0, &bg0, &[]);
+        rp.set_bind_group(1, &bg1, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.draw(0..4, 0..3);
+    });
+    let px = g.read(&target, w, h, 4);
+    let at = |x: u32, y: u32| {
+        let o = ((y * w + x) * 4) as usize;
+        [px[o + 2], px[o + 1], px[o], px[o + 3]] // r g b a from BGRA
+    };
+    let (red, blue) = ([255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+    let checks: [(&str, u32, u32, [u8; 4]); 8] = [
+        ("plain rect, inside", 10, 8, red),
+        ("plain rect, just outside", 22, 8, blue),
+        ("rounded rect, centre", 46, 17, red),
+        ("rounded rect, cut-off corner", 26, 2, blue),
+        ("rounded rect, straight left edge", 26, 17, red),
+        ("clipped rect, inside the clip", 5, 30, red),
+        ("clipped rect, outside the clip", 15, 30, blue),
+        ("clipped rect, outside the rect", 25, 30, blue),
+    ];
+    for (what, x, y, want) in checks {
+        let got = at(x, y);
+        expect(got.iter().zip(&want).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 1), || {
+            format!("{what}: pixel ({x},{y}) = {got:?}, expected {want:?}")
+        })?;
+    }
+    Ok(())
+}
+
 /// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
 /// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
 /// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
@@ -1758,6 +1919,7 @@ pub fn run() -> i32 {
         ("position-quantization runs match per-pixel shading", t_runs),
         ("random fragment shaders vs the interpreter", t_fuzz_fragment),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
+        ("sugarloaf renderer.wgsl: plain, rounded and clipped rects", t_sugarloaf_quads),
     ];
     let mut failed = 0;
     for (name, f) in tests {

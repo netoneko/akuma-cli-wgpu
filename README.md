@@ -238,17 +238,21 @@ yes, "just replace it with a new canvas" was the right instinct); transcendental
 its own colour and a glyph (the worst case, 16k cells, 16k glyph instances); "terminal-like" is
 a dark background with runs of three highlight colours and glyphs in 60% of the cells.
 
-| pass | start of session 2 | now |
+| pass | start of session 2 | now (mean, best of 24) |
 |---|---|---|
-| cell backgrounds, 4 threads | 211–223 ms | **5 ms** |
-| cell backgrounds, 1 thread | 784 ms | (not re-measured) |
-| bg + a glyph in every cell | 303–320 ms | **34 ms** |
-| terminal-like, backgrounds | — | **4.4 ms** |
-| terminal-like, backgrounds + 60% glyphs (a full redraw) | — | **23 ms (≈ 43 fps)** |
-| trivial position-dependent shader, whole 4K | 87.6 ms | 19.9 ms |
-| constant-colour fill, whole 4K | 29–34 ms | 3.3–6 ms |
+| cell backgrounds, 4 threads | 211–223 ms | **5 ms (3.5)** |
+| cell backgrounds, 1 thread | 784 ms | 10.6 ms |
+| bg + a glyph in every cell | 303–320 ms | **25 ms (21)** |
+| terminal-like, backgrounds | — | **4–5 ms (2.8)** |
+| terminal-like, backgrounds + 60% glyphs (a full redraw) | — | **19–21 ms (14.5) ≈ 50 fps** |
+| terminal-like full redraw, 1 thread | — | 33 ms |
+| trivial position-dependent shader, whole 4K | 87.6 ms | 19.8 ms |
+| constant-colour fill, whole 4K | 29–34 ms | 3.4–8 ms |
 
-The target was a full redraw under ~50 ms; it is at ~23–25 ms. Where it came from, in the order
+The mean–best gap (~5 ms) is the kernel scheduler: whether the four pool threads actually get four
+CPUs for a given phase varies from frame to frame (see "Things this kernel taught us").
+
+The target was a full redraw under ~50 ms; it is at ~15–20 ms. Where it came from, in the order
 it was built (each step measured on the box; `exec-selftest`, `gpu-selftest` and the demo's
 `selftest --wgpu` checksums stayed green at every step):
 
@@ -306,15 +310,30 @@ it was built (each step measured on the box; `exec-selftest`, `gpu-selftest` and
    microseconds) and only then sleep; `begin_render_pass` calls `pool::warm()` so the first
    parallel phase of a pass finds them spinning.
 
-What is left, honestly: the **glyph pass** is now most of a frame (≈ 18–28 ms): per glyph quad
-~4 µs of CPU for ~50 pixels — two triangles' setup, ~12 four-pixel batches with a texture fetch
-and an alpha blend each, and the serial-ish vertex stage (316 instructions/vertex). Ideas, in
-order: cross-row lane gathering for tiny triangles (6-pixel-wide rows leave half of every
-4-lane batch empty), a cheaper `fetch_attrs`, hoisting `PixelPlan::new` and the libm calls
-(`round`/`ceil`) out of per-triangle setup, 8-lane (two-register-file) JIT code for ILP, and a
-real register allocator for the wide JIT (it is still load-op-store; ~5 cycles per instruction).
-Run detection could also be taught about the glyph shader's atlas lookups (a glyph is an
-affine texture window, not a quantization — different problem).
+7. **If-conversion** (`opt.rs::ifconv`). The wide JIT runs four pixels/vertices per instruction
+   with *uniform* control flow: a branch whose lanes disagree makes the batch bail out to
+   one-lane-at-a-time. WGSL's short-circuit `a || b` is lowered by naga into a branch and a
+   temporary, and sugarloaf's glyph vertex shader has `vid == 1u || vid == 3u`, which the four
+   vertices of a quad *always* disagree on: **every vertex batch bailed** (found with an rdtsc
+   probe: 9648 of 9648 batches diverged). Small `if`/`else` diamonds whose arms are straight-line
+   pure code now execute both arms and `Select` the results (arms ≤ 16 instructions; no texture
+   fetches or result-cached libm calls, so speculation is safe). Vertex stage 8.2 → 4.3 ms
+   (single thread), no divergence left in the grid shaders.
+8. **Gathering narrow triangles** (`raster.rs::flush_gather`): a 6-pixel-wide glyph quad leaves
+   half of every four-lane batch empty if each row is its own batch; the covered pixels of
+   successive rows are now gathered into full batches and scattered to their texels
+   (per-lane planes, per-lane `@builtin(position).y`). Glyph raster ~13 → ~9 ms.
+
+What is left, honestly: the **glyph pass** is still most of a frame. Per glyph quad ~3 µs of CPU for
+~50 pixels — two triangles' setup, ~12 four-pixel batches with a texture fetch and an alpha
+blend each, and a vertex stage that spends ~100 cycles/vertex mostly outside the JIT'd code (input
+marshalling 250 cycles/batch, output extraction). Ideas, in order: merge the two triangles of an
+axis-aligned quad into one rectangle fill; cheaper vertex input/output marshalling (SSE transposes
+instead of per-lane `match`); 8-lane (two-register-file) JIT code for ILP and a real register
+allocator for the wide JIT (it is still load-op-store, ~5 cycles per instruction on the critical
+chain — the hit path of the memoized grid shader costs ~200 cycles/batch before run detection
+removed most of it). Run detection does not help the glyph shader (an atlas lookup at an affine
+coordinate is not a quantization).
 
 #### Things this kernel taught us (for the kernel repo)
 
