@@ -575,9 +575,13 @@ impl Raster<'_> {
             let out = &mut self.color.data[base + done * 4..base + (done + m) * 4];
             match shade {
                 Shade4::Colors(c) => {
-                    let (px, all_opaque) = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra);
-                    let stored = plan.blend.is_none() || (plan.opaque_is_store && all_opaque);
+                    let all_one = c[3].0 == [1.0f32.to_bits(); 4];
+                    let stored = plan.blend.is_none() || (plan.opaque_is_store && all_one);
+                    let mut px = [0u32; 4];
+                    // `px` is the group's result when it is known without the generic path
+                    let mut have_px = true;
                     if stored {
+                        px = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra).0;
                         for (i, p) in px.iter().take(m).enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
@@ -585,13 +589,20 @@ impl Raster<'_> {
                         pure = false;
                         // blend all four against the destination at once
                         let mut d = [0u8; 16];
-                        d[..m * 4].copy_from_slice(out);
-                        let px = format::blend_over4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], &d, bgra, sfc, sfa);
+                        if m == 4 {
+                            d.copy_from_slice(&out[..16]);
+                        } else {
+                            for i in 0..m {
+                                d[i * 4..i * 4 + 4].copy_from_slice(&out[i * 4..i * 4 + 4]);
+                            }
+                        }
+                        px = format::blend_over4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], &d, bgra, sfc, sfa);
                         for (i, p) in px.iter().take(m).enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
                     } else {
                         pure = false;
+                        have_px = false;
                         for i in 0..m {
                             let col = [c[0].0[i], c[1].0[i], c[2].0[i], c[3].0[i]];
                             plan.write(&mut out[i * 4..i * 4 + 4], col, false, &mut None, &mut None);
@@ -601,6 +612,7 @@ impl Raster<'_> {
                     // it while the shader's quantized position values stay the same
                     if runs_x
                         && m == 4
+                        && have_px
                         && (stored || (plan.opaque_is_store && c[3].0[3] == 1.0f32.to_bits()))
                         && n - done > 4
                     {

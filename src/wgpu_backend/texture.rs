@@ -166,19 +166,28 @@ pub unsafe extern "C" fn tex_helper_wide(regs: *mut u32, texs: *const TexRef, sm
         }
         return;
     }
-    let bpt = if t.format == wgpu::TextureFormat::R8Unorm { 1 } else { 4 };
     let mut out = [[0u32; 4]; 4]; // [channel][lane]
+    let one = 1.0f32.to_bits();
     for lane in 0..4 {
         let (rx, ry) = unsafe { (*regs.add(o.x as usize * 4 + lane), *regs.add(o.y as usize * 4 + lane)) };
         let (x, y) = if o.signed { (rx as i32 as i64, ry as i32 as i64) } else { (rx as i64, ry as i64) };
         if x < 0 || y < 0 || x >= t.w as i64 || y >= t.h as i64 {
             continue; // all zero, like the scalar path
         }
-        let at = (y as usize * t.w as usize + x as usize) * bpt;
-        let px = unsafe { std::slice::from_raw_parts(t.data.add(at), bpt) };
-        let c = format::decode(t.format, px);
-        for ch in 0..4 {
-            out[ch][lane] = c[ch].to_bits();
+        let at = y as usize * t.w as usize + x as usize;
+        match t.format {
+            wgpu::TextureFormat::R8Unorm => {
+                out[0][lane] = format::unorm_bits(unsafe { *t.data.add(at) });
+                out[3][lane] = one;
+            }
+            f => {
+                let px = unsafe { std::slice::from_raw_parts(t.data.add(at * 4), 4) };
+                let (c0, c2) = if f == wgpu::TextureFormat::Bgra8Unorm { (2, 0) } else { (0, 2) };
+                out[0][lane] = format::unorm_bits(px[c0]);
+                out[1][lane] = format::unorm_bits(px[1]);
+                out[2][lane] = format::unorm_bits(px[c2]);
+                out[3][lane] = format::unorm_bits(px[3]);
+            }
         }
     }
     for (ch, v) in out.iter().enumerate() {

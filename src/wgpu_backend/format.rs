@@ -70,6 +70,12 @@ fn unorm(b: u8) -> f32 {
     UNORM_LUT[b as usize]
 }
 
+/// `unorm(b)` as bits
+#[inline]
+pub fn unorm_bits(b: u8) -> u32 {
+    UNORM_LUT[b as usize].to_bits()
+}
+
 fn to_unorm(c: f32) -> u8 {
     // WebGPU: clamp, scale, round to nearest (ties away from zero is fine
     // here: x*255 is never exactly .5 for the representable inputs we care about)

@@ -1375,10 +1375,10 @@ pub fn bench() -> i32 {
     bench_quads(&g);
     let (cols, rows, cw, ch) = (240u32, 67u32, 16u32, 32u32);
     for (what, glyphs) in [("bg pass only", 0u32), ("bg + a glyph in every cell", cols * rows)] {
-        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 8) {
+        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 24) {
             Ok((_px, ms)) => println!(
-                "{}x{} grid, {what}: {ms:.1} ms/frame ({:.1} fps)",
-                cols * cw, rows * ch, 1000.0 / ms
+                "{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps)",
+                cols * cw, rows * ch, last_best(), 1000.0 / ms
             ),
             Err(e) => {
                 println!("FAIL {what}: {e}");
@@ -1390,8 +1390,8 @@ pub fn bench() -> i32 {
     // and glyphs in ~60% of the cells
     TERMINAL_SCENE.store(true, std::sync::atomic::Ordering::Relaxed);
     for (what, glyphs) in [("terminal-like, bg pass only", 0u32), ("terminal-like, bg + glyphs in 60% of cells", cols * rows * 6 / 10)] {
-        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 8) {
-            Ok((_px, ms)) => println!("{}x{} grid, {what}: {ms:.1} ms/frame ({:.1} fps)", cols * cw, rows * ch, 1000.0 / ms),
+        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 24) {
+            Ok((_px, ms)) => println!("{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps)", cols * cw, rows * ch, last_best(), 1000.0 / ms),
             Err(e) => {
                 println!("FAIL {what}: {e}");
                 return 1;
@@ -1457,6 +1457,12 @@ struct VO { @builtin(position) p: vec4<f32>, @location(0) @interpolate(flat) c: 
         let ms = (crate::clock::monotonic() - t0) * 1000.0 / 5.0;
         println!("{n} quads, {what}: {ms:.1} ms ({:.0} ns/quad)", ms * 1e6 / n as f64);
     }
+}
+
+/// fastest timed frame of the last `sugarloaf_scene` (f64 bits, ms)
+static LAST_BEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn last_best() -> f64 {
+    f64::from_bits(LAST_BEST_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 static TERMINAL_SCENE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1660,6 +1666,7 @@ fn sugarloaf_scene(
 
     let target = g.texture(w, h, fmt);
     let mut total = 0.0;
+    let mut best = f64::INFINITY;
     // with several frames, the first is a warm-up (specialization, page faults)
     // and not timed
     for i in 0..frames.max(1) + (frames > 1) as u32 {
@@ -1677,10 +1684,13 @@ fn sugarloaf_scene(
             }
         });
         if frames <= 1 || i > 0 {
-            total += crate::clock::monotonic() - t0;
+            let dt = crate::clock::monotonic() - t0;
+            total += dt;
+            best = best.min(dt);
         }
     }
     let px = g.read(&target, w, h, 4);
+    LAST_BEST_MS.store((best * 1000.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
     Ok((px, total / frames.max(1) as f64 * 1000.0))
 }
 

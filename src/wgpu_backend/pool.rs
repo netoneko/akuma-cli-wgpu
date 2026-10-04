@@ -19,8 +19,14 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// kicked), which is longer than a whole vertex stage. A spinning worker
 /// picks a job up in microseconds.
 static KICK: AtomicU64 = AtomicU64::new(0);
-/// how long an idle worker spins before it sleeps
-const SPIN_SECS: f64 = 0.050;
+/// how long an idle worker spins before it sleeps (`AKUMA_SPIN_MS` overrides;
+/// 0 = sleep at once, which puts a scheduler tick on every parallel phase)
+fn spin_secs() -> f64 {
+    static S: OnceLock<f64> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("AKUMA_SPIN_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(50.0) / 1000.0
+    })
+}
 
 /// the job as the workers see it: a lifetime-erased borrow that `run` keeps
 /// alive until every worker is done with it
@@ -72,7 +78,7 @@ fn worker(index: usize) {
         while KICK.load(Ordering::Acquire) == seen_kick {
             std::hint::spin_loop();
             n += 1;
-            if n % 2048 == 0 && crate::clock::monotonic() - t0 > SPIN_SECS {
+            if n % 2048 == 0 && crate::clock::monotonic() - t0 > spin_secs() {
                 break;
             }
         }
