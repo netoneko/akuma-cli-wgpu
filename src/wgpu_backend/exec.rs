@@ -435,6 +435,8 @@ pub struct SpanRegs {
     out: [u32; 4],
     /// the code overwrites an input register: re-set the inputs every batch
     inputs_clobbered: bool,
+    /// the varyings differ between the pixels of a batch
+    per_lane: bool,
 }
 
 /// What `Invoker::shade4` produced for up to 4 consecutive pixels.
@@ -442,8 +444,8 @@ pub struct SpanRegs {
 pub enum Shade4 {
     /// r, g, b, a of the 4 lanes (f32 bits)
     Colors([super::jit::L4; 4]),
-    /// the lanes disagreed at a branch and were run one by one
-    Lanes([Option<[u32; 4]>; 4]),
+    /// the lanes disagreed at a branch: run them one by one (`run_fragment`)
+    Diverged,
     /// every lane was discarded
     Killed,
 }
@@ -523,12 +525,29 @@ impl Invoker<'_> {
         prog.inputs.iter().any(|(_, s)| matches!(s, Src::Position(2) | Src::Position(3)))
     }
 
+    /// Wide stages: the (location, component) of each varying input the code
+    /// reads, in the order `shade4_with` indexes them.
+    pub fn span_locs(&self, out: &mut [(u32, u32); 32]) -> usize {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { span, .. } = self {
+            let mut n = 0;
+            for &(_, l, c) in span.locs.iter().take(32) {
+                out[n] = (l, c);
+                n += 1;
+            }
+            return n;
+        }
+        let _ = out;
+        0
+    }
+
     /// Wide stages only: set the inputs that stay fixed along a run of
     /// pixels on one row of a flat-varying primitive (the varyings and the
     /// row's y). Returns false for any other executor.
-    pub fn span_begin(&mut self, var: &Varyings, py: f32) -> bool {
+    pub fn span_begin(&mut self, var: &Varyings, py: f32, per_lane: bool) -> bool {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if let Invoker::Wide { regs, span, .. } = self {
+            span.per_lane = per_lane;
             for &(r, l, c) in &span.locs {
                 regs[r as usize].0 = [var[l as usize][c as usize]; 4];
             }
@@ -537,16 +556,34 @@ impl Invoker<'_> {
             }
             return true;
         }
-        let _ = (var, py);
+        let _ = (var, py, per_lane);
         false
     }
 
     /// Shade the `n` (1..=4) pixels at x = `x0 + 0.5 ..` of the row `span_begin`
-    /// was given. Lanes past `n` repeat the last pixel so they cannot diverge.
+    /// was given (flat varyings). Lanes past `n` repeat the last pixel so they
+    /// cannot diverge.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[inline]
     pub fn shade4(&mut self, var: &Varyings, x0: f32, py: f32, n: usize) -> Shade4 {
-        let Invoker::Wide { w, regs, refs, texs, smps, scalar, span, .. } = self else {
+        let Invoker::Wide { span, .. } = self else { unreachable!() };
+        // (location, component) per input, in `span_locs` order
+        let idx: [(u32, u32); 32] = {
+            let mut a = [(0, 0); 32];
+            for (i, &(_, l, c)) in span.locs.iter().enumerate().take(32) {
+                a[i] = (l, c);
+            }
+            a
+        };
+        self.shade4_with(x0, py, n, |_, i| var[idx[i].0 as usize][idx[i].1 as usize])
+    }
+
+    /// As `shade4`, with the varying inputs supplied per lane: `f(lane, location,
+    /// component)` gives the f32 bits.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[inline]
+    pub fn shade4_with(&mut self, x0: f32, py: f32, n: usize, mut f: impl FnMut(usize, usize) -> u32) -> Shade4 {
+        let Invoker::Wide { w, regs, refs, texs, smps, span, .. } = self else {
             unreachable!("shade4 on a non-wide invoker")
         };
         let mut xs = [0u32; 4];
@@ -556,12 +593,18 @@ impl Invoker<'_> {
         for &r in &span.pos_x {
             regs[r as usize].0 = xs;
         }
-        if span.inputs_clobbered {
+        // varyings that differ per lane (or inputs the code overwrites) are
+        // written for every batch
+        if span.per_lane || span.inputs_clobbered {
             for &r in &span.pos_y {
                 regs[r as usize].0 = [py.to_bits(); 4];
             }
-            for &(r, l, c) in &span.locs {
-                regs[r as usize].0 = [var[l as usize][c as usize]; 4];
+            for (i, &(r, _, _)) in span.locs.iter().enumerate() {
+                let mut v = [0u32; 4];
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x = f(k.min(n - 1), i);
+                }
+                regs[r as usize].0 = v;
             }
         }
         let status = w.run_wide(regs, refs, texs, smps);
@@ -579,13 +622,7 @@ impl Invoker<'_> {
                 regs[span.out[3] as usize],
             ]),
             1 => Shade4::Killed,
-            _ => {
-                let mut out = [None; 4];
-                for (k, o) in out.iter_mut().enumerate().take(n) {
-                    *o = scalar.run_fragment(var, [x0 + k as f32 + 0.5, py, 0.0, 0.0]);
-                }
-                Shade4::Lanes(out)
-            }
+            _ => Shade4::Diverged,
         }
     }
 
@@ -716,6 +753,7 @@ impl SpanRegs {
             pos_y: vec![],
             locs: vec![],
             out: [0; 4],
+            per_lane: false,
             inputs_clobbered: p.code.iter().any(|i| {
                 i.dst().is_some_and(|d| p.inputs.iter().any(|&(r, _)| r == d))
             }) || p.tex_ops.iter().any(|t| p.inputs.iter().any(|&(r, _)| r >= t.d && r < t.d + 4)),

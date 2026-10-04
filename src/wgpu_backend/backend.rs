@@ -1433,10 +1433,19 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         scratch_give(&CHUNK_POOL, part);
     } else {
         let per = ids.len().div_ceil(vthreads).div_ceil(4) * 4;
-        let parts: Vec<Vec<super::exec::RawVertex>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = ids.chunks(per).map(|c| sc.spawn(|| run_chunk(c))).collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        let nchunks = ids.len().div_ceil(per);
+        let slots: Vec<Mutex<Vec<super::exec::RawVertex>>> = (0..nchunks).map(|_| Mutex::new(Vec::new())).collect();
+        let tj0 = crate::clock::monotonic();
+        super::pool::run(nchunks, &|i| {
+            let lo = i * per;
+            let part = run_chunk(&ids[lo..(lo + per).min(ids.len())]);
+            *slots[i].lock().unwrap() = part;
         });
+        if super::prof::enabled() {
+            eprintln!("[vs] pool {:.2} ms", (crate::clock::monotonic() - tj0) * 1e3);
+        }
+        let parts: Vec<Vec<super::exec::RawVertex>> =
+            slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
         verts.reserve(ids.len());
         for part in parts {
             verts.extend_from_slice(&part);
@@ -1580,18 +1589,14 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         let queue = Mutex::new(bands);
         let res_ref = &res;
         let fplan_ref = &fplan;
-        std::thread::scope(|sc| {
-            for _ in 0..threads {
-                sc.spawn(|| {
-                    let mut fs = fs_stage.begin_with(res_ref, fplan_ref);
-                    loop {
-                        let next = queue.lock().unwrap().pop();
-                        match next {
-                            Some(b) => run_band(b, &mut fs),
-                            None => break,
-                        }
-                    }
-                });
+        super::pool::run(threads, &|_| {
+            let mut fs = fs_stage.begin_with(res_ref, fplan_ref);
+            loop {
+                let next = queue.lock().unwrap().pop();
+                match next {
+                    Some(b) => run_band(b, &mut fs),
+                    None => break,
+                }
             }
         });
     }

@@ -43,6 +43,7 @@ pub mod interp;
 pub mod jit;
 pub mod memo;
 pub mod opt;
+pub mod pool;
 pub mod program;
 pub mod raster;
 pub mod vertex;

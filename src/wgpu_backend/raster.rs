@@ -242,12 +242,12 @@ impl Raster<'_> {
         let width = max_x - min_x;
         // the straight-line case: flat varyings, nothing reading depth or
         // barycentrics, a 4-lane stage, a plain unorm8 target
-        let span_fast = flat_all
-            && !need_geom
-            && !constant_fs
+        let span_fast = !constant_fs
             && self.depth.is_none()
             && lanes == 4
-            && plan.unorm8.is_some();
+            && plan.unorm8.is_some()
+            && !fs.uses_position_zw();
+        let geo = SpanGeo { s: &s, dwdx, inv_sum };
 
         for py in min_y..max_y {
             // the covered pixels of this row are one interval [lo, hi) of
@@ -269,7 +269,8 @@ impl Raster<'_> {
                 }
             }
             if lo < hi && span_fast {
-                self.fast_span(fs, &plan, &var, py, min_x + lo, (hi - lo) as usize);
+                let w0 = [w_row[0] + dwdx[0] * lo, w_row[1] + dwdx[1] * lo, w_row[2] + dwdx[2] * lo];
+                self.fast_span(fs, &plan, &geo, provoking, flat_all, py, min_x + lo, w0, (hi - lo) as usize);
             } else {
                 for k in lo..hi {
                     let px = min_x + k;
@@ -344,35 +345,87 @@ impl Raster<'_> {
 
     /// One run of `n` covered pixels starting at (`px0`, `py`), shaded four at
     /// a time with the wide stage and written straight to the target: no
-    /// per-pixel gather, marshalling or format dispatch.
+    /// per-pixel gather, marshalling or format dispatch. `w0` = the edge
+    /// functions at the first pixel; varyings are interpolated only for the
+    /// inputs the shader reads.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn fast_span(&mut self, fs: &mut Invoker<'_>, plan: &PixelPlan, var: &Varyings, py: i64, px0: i64, n: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn fast_span(
+        &mut self,
+        fs: &mut Invoker<'_>,
+        plan: &PixelPlan,
+        geo: &SpanGeo<'_>,
+        provoking: &Varyings,
+        flat_all: bool,
+        py: i64,
+        px0: i64,
+        w0: [i64; 3],
+        n: usize,
+    ) {
         use super::exec::Shade4;
         let bgra = plan.unorm8.unwrap();
         let ypos = py as f32 + 0.5;
-        if !fs.span_begin(var, ypos) {
+        if !fs.span_begin(provoking, ypos, !flat_all) {
             return;
         }
         let cw = self.color.width as i64;
         let base = ((py - self.row0) * cw + px0) as usize * 4;
-        let dst = &mut self.color.data[base..base + n * 4];
+        // each varying component the shader reads is a plane over the span:
+        // value(k) = a + b*k for the k-th pixel (perspective: a ratio of two)
+        let mut locs = [(0u32, 0u32); 32];
+        let nl = fs.span_locs(&mut locs);
+        let mut planes = [Plane::Const(0); 32];
+        let ortho = geo.s[0].invw == geo.s[1].invw && geo.s[1].invw == geo.s[2].invw;
+        for i in 0..nl {
+            let (loc, comp) = (locs[i].0 as usize, locs[i].1 as usize);
+            let mode = self.interp.iter().find(|(x, _)| *x as usize == loc).map_or(Interp::Flat, |(_, m)| *m);
+            planes[i] = match mode {
+                Interp::Flat => Plane::Const(provoking[loc][comp]),
+                _ => {
+                    let v = [
+                        f32::from_bits(geo.s[0].var[loc][comp]) as f64,
+                        f32::from_bits(geo.s[1].var[loc][comp]) as f64,
+                        f32::from_bits(geo.s[2].var[loc][comp]) as f64,
+                    ];
+                    // plane of per-vertex values g: inv_sum * sum(w_i(k) * g_i)
+                    let plane = |g: [f64; 3]| {
+                        (
+                            geo.inv_sum * (w0[0] as f64 * g[0] + w0[1] as f64 * g[1] + w0[2] as f64 * g[2]),
+                            geo.inv_sum
+                                * (geo.dwdx[0] as f64 * g[0] + geo.dwdx[1] as f64 * g[1] + geo.dwdx[2] as f64 * g[2]),
+                        )
+                    };
+                    if mode == Interp::Linear || ortho {
+                        let (a, b) = plane(v);
+                        Plane::Lin { a, b }
+                    } else {
+                        let iw = [geo.s[0].invw, geo.s[1].invw, geo.s[2].invw];
+                        let (a, b) = plane([v[0] * iw[0], v[1] * iw[1], v[2] * iw[2]]);
+                        let (da, db) = plane(iw);
+                        Plane::Persp { a, b, da, db }
+                    }
+                }
+            };
+        }
         let mut done = 0usize;
         while done < n {
             let m = (n - done).min(4);
             let x0 = (px0 + done as i64) as f32;
-            let out = &mut dst[done * 4..(done + m) * 4];
-            match fs.shade4(var, x0, ypos, m) {
+            let shade = fs.shade4_with(x0, ypos, m, |lane, i| {
+                let k = (done + lane) as f64;
+                match planes[i] {
+                    Plane::Const(bits) => bits,
+                    Plane::Lin { a, b } => ((a + b * k) as f32).to_bits(),
+                    Plane::Persp { a, b, da, db } => (((a + b * k) / (da + db * k)) as f32).to_bits(),
+                }
+            });
+            let out = &mut self.color.data[base + done * 4..base + (done + m) * 4];
+            match shade {
                 Shade4::Colors(c) => {
                     let (px, all_opaque) = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra);
                     if plan.blend.is_none() || (plan.opaque_is_store && all_opaque) {
-                        if m == 4 {
-                            for (i, p) in px.iter().enumerate() {
-                                out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
-                            }
-                        } else {
-                            for i in 0..m {
-                                out[i * 4..i * 4 + 4].copy_from_slice(&px[i].to_le_bytes());
-                            }
+                        for (i, p) in px.iter().take(m).enumerate() {
+                            out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
                     } else {
                         for i in 0..m {
@@ -381,10 +434,24 @@ impl Raster<'_> {
                         }
                     }
                 }
-                Shade4::Lanes(l) => {
+                Shade4::Diverged => {
+                    // the lanes branched differently: one scalar run each
                     for i in 0..m {
-                        if let Some(col) = l[i] {
-                            plan.write(&mut out[i * 4..i * 4 + 4], col, false, &mut None, &mut None);
+                        let mut var = *provoking;
+                        if !flat_all {
+                            let kk = (done + i) as i64;
+                            let w = [w0[0] + geo.dwdx[0] * kk, w0[1] + geo.dwdx[1] * kk, w0[2] + geo.dwdx[2] * kk];
+                            let l = [
+                                w[0] as f64 * geo.inv_sum,
+                                w[1] as f64 * geo.inv_sum,
+                                w[2] as f64 * geo.inv_sum,
+                            ];
+                            let invw = l[0] * geo.s[0].invw + l[1] * geo.s[1].invw + l[2] * geo.s[2].invw;
+                            self.interpolate(&mut var, provoking, geo.s, &l, invw);
+                        }
+                        if let Some(col) = fs.run_fragment(&var, [x0 + i as f32 + 0.5, ypos, 0.0, 0.0]) {
+                            let out = &mut self.color.data[base + (done + i) * 4..base + (done + i) * 4 + 4];
+                            plan.write(out, col, false, &mut None, &mut None);
                         }
                     }
                 }
@@ -395,7 +462,19 @@ impl Raster<'_> {
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    fn fast_span(&mut self, _fs: &mut Invoker<'_>, _plan: &PixelPlan, _var: &Varyings, _py: i64, _px0: i64, _n: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn fast_span(
+        &mut self,
+        _fs: &mut Invoker<'_>,
+        _plan: &PixelPlan,
+        _geo: &SpanGeo<'_>,
+        _provoking: &Varyings,
+        _flat_all: bool,
+        _py: i64,
+        _px0: i64,
+        _w0: [i64; 3],
+        _n: usize,
+    ) {
         unreachable!("span_fast needs a wide stage")
     }
 
@@ -592,6 +671,20 @@ fn clip(tri: &[CV; 3], interp: &[(u32, Interp)]) -> Vec<CV> {
 // ---------------------------------------------------------------------------
 // per-triangle pixel write plan
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Plane {
+    Const(u32),
+    Lin { a: f64, b: f64 },
+    Persp { a: f64, b: f64, da: f64, db: f64 },
+}
+
+/// per-triangle constants of the fast span path
+struct SpanGeo<'a> {
+    s: &'a [SV; 3],
+    dwdx: [i64; 3],
+    inv_sum: f64,
+}
 
 #[derive(Clone, Copy)]
 struct Pending {

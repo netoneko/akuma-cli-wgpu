@@ -212,8 +212,14 @@ pub unsafe extern "C" fn memo_get(regs: *mut u32, m: *const MemoInfo, stride: u3
         let o = e + 1 + m.ins.len() as u32;
         for (j, &r) in m.outs.iter().enumerate() {
             let v = *at(o + j as u32, 0);
-            for lane in 0..st {
-                *at(r, lane) = v;
+            if st == 4 {
+                // one 16-byte store: the caller reloads the register as a
+                // vector, and four 4-byte stores would defeat store forwarding
+                (at(r, 0) as *mut [u32; 4]).write_unaligned([v; 4]);
+            } else {
+                for lane in 0..st {
+                    *at(r, lane) = v;
+                }
             }
         }
         1

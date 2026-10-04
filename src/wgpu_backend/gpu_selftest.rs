@@ -884,9 +884,10 @@ pub fn bench() -> i32 {
             println!("{w}x{h}, {what}: {ms:.1} ms/frame ({:.0} ns/fragment)", ms * 1e6 / (w * h) as f64);
         }
     }
+    bench_quads(&g);
     let (cols, rows, cw, ch) = (240u32, 67u32, 16u32, 32u32);
     for (what, glyphs) in [("bg pass only", 0u32), ("bg + a glyph in every cell", cols * rows)] {
-        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 3) {
+        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 8) {
             Ok((_px, ms)) => println!(
                 "{}x{} grid, {what}: {ms:.1} ms/frame ({:.1} fps)",
                 cols * cw, rows * ch, 1000.0 / ms
@@ -901,6 +902,60 @@ pub fn bench() -> i32 {
         super::prof::report();
     }
     0
+}
+
+/// 16k small instanced quads (6x8 px, a terminal's glyphs) with fragment
+/// shaders of increasing weight: separates per-triangle, per-span and
+/// per-fragment costs of the glyph pass.
+fn bench_quads(g: &Gpu) {
+    let (w, h) = (3840u32, 2144u32);
+    const HEAD: &str = "
+struct VO { @builtin(position) p: vec4<f32>, @location(0) @interpolate(flat) c: vec4<f32>, @location(1) t: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+    let col = ii % 240u; let row = (ii / 240u) % 67u;
+    let corner = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    let px = vec2<f32>(f32(col) * 16.0 + 3.0, f32(row) * 32.0 + 12.0) + corner * vec2<f32>(SX, SY);
+    var o: VO;
+    o.p = vec4<f32>(px.x / 1920.0 - 1.0, 1.0 - px.y / 1072.0, 0.0, 1.0);
+    o.c = vec4<f32>(1.0, 0.5, 0.25, 1.0);
+    o.t = corner * 6.0;
+    return o;
+}
+";
+    let fmt = wgpu::TextureFormat::Bgra8Unorm;
+    let c = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let premul = Some(wgpu::BlendState { color: c, alpha: c });
+    let n = 240 * 67;
+    let flat = "@fragment fn fs(i: VO) -> @location(0) vec4<f32> { return i.c; }";
+    let lin = "@fragment fn fs(i: VO) -> @location(0) vec4<f32> { return vec4<f32>(i.t.x * 0.1, i.t.y * 0.1, 0.5, 1.0); }";
+    let alpha = "@fragment fn fs(i: VO) -> @location(0) vec4<f32> { let a = i.t.x * 0.1 + 0.2; return vec4<f32>(a, a, a, a); }";
+    for (what, size, fs) in [
+        ("6x8 flat colour, opaque", ("6.0", "8.0"), flat),
+        ("6x8 linear varying", ("6.0", "8.0"), lin),
+        ("6x8 linear varying, alpha < 1 (blend reads dst)", ("6.0", "8.0"), alpha),
+        ("1x1 flat colour (per-triangle overhead)", ("1.0", "1.0"), flat),
+    ] {
+        let m = g.module(&format!("{}{fs}", HEAD.replace("SX", size.0).replace("SY", size.1)));
+        let tex = g.texture(w, h, fmt);
+        let p = g.pipeline(&m, &g.empty_layout(), fmt, premul, wgpu::PrimitiveTopology::TriangleStrip, None, &[]);
+        let run = || {
+            g.pass(&tex, None, |rp| {
+                rp.set_pipeline(&p);
+                rp.draw(0..4, 0..n);
+            })
+        };
+        run();
+        let t0 = crate::clock::monotonic();
+        for _ in 0..5 {
+            run();
+        }
+        let ms = (crate::clock::monotonic() - t0) * 1000.0 / 5.0;
+        println!("{n} quads, {what}: {ms:.1} ms ({:.0} ns/quad)", ms * 1e6 / n as f64);
+    }
 }
 
 /// Run sugarloaf's `grid.wgsl` bg pass and, if `glyphs > 0`, a glyph pass with
@@ -1091,7 +1146,9 @@ fn sugarloaf_scene(
 
     let target = g.texture(w, h, fmt);
     let mut total = 0.0;
-    for _ in 0..frames.max(1) {
+    // with several frames, the first is a warm-up (specialization, page faults)
+    // and not timed
+    for i in 0..frames.max(1) + (frames > 1) as u32 {
         let t0 = crate::clock::monotonic();
         g.pass(&target, Some(BLACK), |rp| {
             rp.set_pipeline(&bg_pipe);
@@ -1105,7 +1162,9 @@ fn sugarloaf_scene(
                 rp.draw(0..4, 0..glyphs);
             }
         });
-        total += crate::clock::monotonic() - t0;
+        if frames <= 1 || i > 0 {
+            total += crate::clock::monotonic() - t0;
+        }
     }
     let px = g.read(&target, w, h, 4);
     Ok((px, total / frames.max(1) as f64 * 1000.0))

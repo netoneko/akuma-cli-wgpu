@@ -691,9 +691,38 @@ fn emit_wide(
             emit_scalar(a, p, &Inst::LoadBuf { d, buf, off: 0, imm }, fixups)?;
             // emit_scalar stored the loaded word into lane 0 of d; broadcast it
             a.stride = saved;
-            a.vload(0, d);
+            a.vm(&[0x66], &[0x6E], 0, d); // movd xmm0,[d]
             a.bytes(&[0x66, 0x0F, 0x70, 0xC0, 0x00]); // pshufd xmm0,xmm0,0
             a.vstore(0, d);
+        }
+        // a load whose four offsets agree (every pixel of a cell reads the same
+        // word): one scalar load, broadcast; otherwise one load per lane
+        Inst::LoadBuf { d, buf, off, imm } if std::env::var_os("AKUMA_NOLB").is_none() => {
+            a.vload(0, off);
+            a.bytes(&[0x66, 0x0F, 0x70, 0xC8, 0x00]); // pshufd xmm1,xmm0,0
+            a.vr(&[0x66], &[0x76], 1, 0); // pcmpeqd xmm1,xmm0
+            a.vr(&[], &[0x50], 0, 1); // movmskps eax,xmm1
+            a.bytes(&[0x83, 0xF8, 0x0F, 0x0F, 0x85]); // cmp eax,15; jne slow
+            let to_slow = a.b.len();
+            a.u32(0);
+            a.lane = 0;
+            emit_scalar(a, p, &Inst::LoadBuf { d, buf, off, imm }, fixups)?;
+            // movd (4 bytes: forwards from the scalar store, a 16-byte load would stall)
+            a.vm(&[0x66], &[0x6E], 0, d);
+            a.bytes(&[0x66, 0x0F, 0x70, 0xC0, 0x00]); // pshufd xmm0,xmm0,0
+            a.vstore(0, d);
+            a.u8(0xE9); // jmp done
+            let to_done = a.b.len();
+            a.u32(0);
+            let rel = (a.b.len() - (to_slow + 4)) as i32;
+            a.b[to_slow..to_slow + 4].copy_from_slice(&rel.to_le_bytes());
+            for lane in 0..4 {
+                a.lane = lane;
+                emit_scalar(a, p, &Inst::LoadBuf { d, buf, off, imm }, fixups)?;
+            }
+            a.lane = 0;
+            let rel = (a.b.len() - (to_done + 4)) as i32;
+            a.b[to_done..to_done + 4].copy_from_slice(&rel.to_le_bytes());
         }
         // rounding: one vector op (SSE4.1 roundps)
         Inst::Call { d, a: x, f: f @ (Fun::Floor | Fun::Ceil | Fun::Trunc), .. } => {
