@@ -972,6 +972,18 @@ fn emit_wide(
             let rel = (a.b.len() - (to_skip + 4)) as i32;
             a.b[to_skip..to_skip + 4].copy_from_slice(&rel.to_le_bytes());
         }
+        // texture fetch: one call for all four lanes
+        Inst::Tex { op } => {
+            let opref = p.tex_ops.get(op as usize).ok_or("tex op out of range")?;
+            a.bytes(&[0x48, 0x89, 0xDF]); // mov rdi,rbx
+            a.bytes(&[0x4C, 0x89, 0xEE]); // mov rsi,r13
+            a.bytes(&[0x4C, 0x89, 0xF2]); // mov rdx,r14
+            a.bytes(&[0x48, 0xB9]); // mov rcx, imm64
+            a.bytes(&(opref as *const _ as usize as u64).to_le_bytes());
+            a.bytes(&[0x48, 0xB8]); // mov rax, imm64
+            a.bytes(&(super::texture::tex_helper_wide as usize as u64).to_le_bytes());
+            a.bytes(&[0xFF, 0xD0]); // call rax
+        }
         // memo helpers take the whole 4-lane register file
         Inst::MemoGet { .. } | Inst::MemoPut { .. } => emit_scalar(a, p, inst, fixups)?,
         // everything else: the scalar template, once per lane

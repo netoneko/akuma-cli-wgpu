@@ -143,6 +143,50 @@ pub unsafe extern "C" fn tex_helper(
     }
 }
 
+/// `tex_helper` for a wide batch: `regs` is the register file with 4 lanes per
+/// register. The common fetch (`textureLoad` of an 8-bit unorm texture as
+/// floats) is done for all four lanes in one go; everything else goes lane by
+/// lane through `tex_helper`.
+///
+/// # Safety
+/// As for `tex_helper`.
+pub unsafe extern "C" fn tex_helper_wide(regs: *mut u32, texs: *const TexRef, smps: *const SmpRef, op: *const TexOp) {
+    let o = unsafe { &*op };
+    let t = unsafe { *texs.add(o.tex as usize) };
+    let fast = o.kind == TexKind::Load
+        && o.elem == Elem::F
+        && !t.data.is_null()
+        && matches!(
+            t.format,
+            wgpu::TextureFormat::R8Unorm | wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+        );
+    if !fast {
+        for lane in 0..4 {
+            unsafe { tex_helper(regs.add(lane), texs, smps, op, 4) };
+        }
+        return;
+    }
+    let bpt = if t.format == wgpu::TextureFormat::R8Unorm { 1 } else { 4 };
+    let mut out = [[0u32; 4]; 4]; // [channel][lane]
+    for lane in 0..4 {
+        let (rx, ry) = unsafe { (*regs.add(o.x as usize * 4 + lane), *regs.add(o.y as usize * 4 + lane)) };
+        let (x, y) = if o.signed { (rx as i32 as i64, ry as i32 as i64) } else { (rx as i64, ry as i64) };
+        if x < 0 || y < 0 || x >= t.w as i64 || y >= t.h as i64 {
+            continue; // all zero, like the scalar path
+        }
+        let at = (y as usize * t.w as usize + x as usize) * bpt;
+        let px = unsafe { std::slice::from_raw_parts(t.data.add(at), bpt) };
+        let c = format::decode(t.format, px);
+        for ch in 0..4 {
+            out[ch][lane] = c[ch].to_bits();
+        }
+    }
+    for (ch, v) in out.iter().enumerate() {
+        // one 16-byte store per result register (the caller reloads it as a vector)
+        unsafe { (regs.add((o.d as usize + ch) * 4) as *mut [u32; 4]).write_unaligned(*v) };
+    }
+}
+
 #[inline]
 fn texel(t: &TexRef, x: u32, y: u32) -> &[u8] {
     let bpt = format::bytes_per_texel(t.format).unwrap() as usize;
