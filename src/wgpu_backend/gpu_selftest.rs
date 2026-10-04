@@ -782,6 +782,235 @@ fn t_texture_copy(g: &Gpu) -> TestResult {
     expect(got[0] == 0 && got[1] == 0 && got[8] == 0, || "copy touched outside the block".into())
 }
 
+/// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
+/// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
+/// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
+/// instanced glyph pass (7 vertex attributes in 4 formats, a mat4 projection,
+/// triangle strips, `textureLoad` from an R8 atlas). Needs
+/// `AKUMA_SUGARLOAF=<path to rio>/sugarloaf/src`; skipped without it.
+fn t_sugarloaf_grid(g: &Gpu) -> TestResult {
+    let Some(dir) = std::env::var_os("AKUMA_SUGARLOAF") else {
+        println!("      (sugarloaf grid.wgsl: set AKUMA_SUGARLOAF=<rio>/sugarloaf/src to run)");
+        return Ok(());
+    };
+    let path = std::path::Path::new(&dir).join("grid/shaders/grid.wgsl");
+    let src = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let m = g.module(&src);
+
+    let (cols, rows, cw, ch) = (6u32, 3u32, 12u32, 16u32);
+    let (w, h) = (cols * cw, rows * ch);
+    let fmt = wgpu::TextureFormat::Bgra8Unorm;
+
+    // ---- uniforms (160 bytes; see the struct in grid.wgsl) ----
+    let mut u = vec![0u8; 160];
+    let f32s = |u: &mut [u8], at: usize, v: &[f32]| {
+        for (i, x) in v.iter().enumerate() {
+            u[at + i * 4..at + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let u32s = |u: &mut [u8], at: usize, v: &[u32]| {
+        for (i, x) in v.iter().enumerate() {
+            u[at + i * 4..at + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    // column-major ortho: pixels (y down) -> NDC
+    f32s(&mut u, 0, &[2.0 / w as f32, 0.0, 0.0, 0.0, 0.0, -2.0 / h as f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0]);
+    f32s(&mut u, 112, &[cw as f32, ch as f32]); // cell_size
+    u32s(&mut u, 120, &[cols, rows]); // grid_size
+    u32s(&mut u, 156, &[1]); // input_colorspace: plain sRGB (no gamut remap)
+    let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
+
+    // ---- cells: one u32 each, rgba little-endian ----
+    let cell_rgb = |c: u32, r: u32| [40 * c + 20, 80 * r + 30, 200 - 20 * c];
+    let mut cells = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let [cr, cg, cb] = cell_rgb(c, r);
+            cells.extend_from_slice(&(cr | cg << 8 | cb << 16 | 255 << 24).to_le_bytes());
+        }
+    }
+    let cbuf = g.buffer(&cells, wgpu::BufferUsages::STORAGE);
+
+    let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let bg_bgl = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    });
+    let bg0 = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bg_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cbuf.as_entire_binding() },
+        ],
+    });
+    let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let atlas_bgl = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[tex_entry(0), tex_entry(1)],
+    });
+
+    // grayscale atlas 16x16: texel (x,y) = 255 when (x+y) is even
+    let atlas = g.texture(16, 16, wgpu::TextureFormat::R8Unorm);
+    let atlas_px: Vec<u8> = (0..16 * 16).map(|i| if (i % 16 + i / 16) % 2 == 0 { 255 } else { 0 }).collect();
+    g.upload(&atlas, 16, 16, 1, &atlas_px);
+    let color_atlas = g.texture(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    g.upload(&color_atlas, 1, 1, 4, &[255, 0, 255, 255]);
+    let (av, cv) = (
+        atlas.create_view(&wgpu::TextureViewDescriptor::default()),
+        color_atlas.create_view(&wgpu::TextureViewDescriptor::default()),
+    );
+    let bg1 = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &atlas_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&av) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&cv) },
+        ],
+    });
+
+    let premul = {
+        let c = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        wgpu::BlendState { color: c, alpha: c }
+    };
+    let target_state = [Some(wgpu::ColorTargetState { format: fmt, blend: Some(premul), write_mask: wgpu::ColorWrites::ALL })];
+
+    // ---- background pipeline ----
+    let bg_pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bg_bgl)],
+        immediate_size: 0,
+    });
+    let bg_pipe = g.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&bg_pl),
+        vertex: wgpu::VertexState { module: &m, entry_point: Some("grid_bg_vertex"), buffers: &[], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &m, entry_point: Some("grid_bg_fragment"), targets: &target_state, compilation_options: Default::default() }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // ---- text pipeline (attribute layout copied from grid/webgpu.rs) ----
+    let text_pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bg_bgl), Some(&atlas_bgl)],
+        immediate_size: 0,
+    });
+    let attrs = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x2, offset: 0, shader_location: 0 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x2, offset: 8, shader_location: 1 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Sint16x2, offset: 16, shader_location: 2 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint16x2, offset: 20, shader_location: 3 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4, offset: 24, shader_location: 4 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8, offset: 28, shader_location: 5 },
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8, offset: 29, shader_location: 6 },
+    ];
+    let vbl = wgpu::VertexBufferLayout { array_stride: 32, step_mode: wgpu::VertexStepMode::Instance, attributes: &attrs };
+    let text_pipe = g.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&text_pl),
+        vertex: wgpu::VertexState { module: &m, entry_point: Some("grid_text_vertex"), buffers: &[Some(vbl)], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &m, entry_point: Some("grid_text_fragment"), targets: &target_state, compilation_options: Default::default() }),
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // one glyph at grid (2,1): atlas pos (1,1), size 6x8, bearings (3,12), white
+    let mut inst = Vec::new();
+    inst.extend_from_slice(&1u32.to_le_bytes());
+    inst.extend_from_slice(&1u32.to_le_bytes());
+    inst.extend_from_slice(&6u32.to_le_bytes());
+    inst.extend_from_slice(&8u32.to_le_bytes());
+    inst.extend_from_slice(&3i16.to_le_bytes());
+    inst.extend_from_slice(&12i16.to_le_bytes());
+    inst.extend_from_slice(&2u16.to_le_bytes());
+    inst.extend_from_slice(&1u16.to_le_bytes());
+    inst.extend_from_slice(&[255, 255, 255, 255]);
+    inst.extend_from_slice(&[0, 0, 0, 0]); // atlas = grayscale, bools = 0, pad
+    let vb = g.buffer(&inst, wgpu::BufferUsages::VERTEX);
+
+    let target = g.texture(w, h, fmt);
+    g.pass(&target, Some(BLACK), |rp| {
+        rp.set_pipeline(&bg_pipe);
+        rp.set_bind_group(0, &bg0, &[]);
+        rp.draw(0..3, 0..1);
+        rp.set_pipeline(&text_pipe);
+        rp.set_bind_group(0, &bg0, &[]);
+        rp.set_bind_group(1, &bg1, &[]);
+        rp.set_vertex_buffer(0, vb.slice(..));
+        rp.draw(0..4, 0..1);
+    });
+    let px = g.read(&target, w, h, 4);
+    // Bgra8Unorm bytes: b, g, r, a
+    let at = |x: u32, y: u32| {
+        let o = ((y * w + x) * 4) as usize;
+        [px[o + 2] as i32, px[o + 1] as i32, px[o] as i32, px[o + 3] as i32]
+    };
+    let near = |got: [i32; 4], want: [i32; 4]| got.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1);
+    // every cell centre carries its colour (corners avoid the glyph's cell (2,1))
+    for r in 0..rows {
+        for c in 0..cols {
+            if (c, r) == (2, 1) {
+                continue;
+            }
+            let [cr, cg, cb] = cell_rgb(c, r);
+            let got = at(c * cw + 1, r * ch + 1);
+            expect(near(got, [cr as i32, cg as i32, cb as i32, 255]), || {
+                format!("cell ({c},{r}) = {got:?}, expected {:?}", [cr, cg, cb, 255])
+            })?;
+        }
+    }
+    // the glyph: pixel (px,py) in 27..33 x 20..28 shows atlas[(1+px-27, 1+py-20)]
+    let bg = {
+        let [cr, cg, cb] = cell_rgb(2, 1);
+        [cr as i32, cg as i32, cb as i32, 255]
+    };
+    for gy in 0..8u32 {
+        for gx in 0..6u32 {
+            let (ax, ay) = (1 + gx, 1 + gy);
+            let on = (ax + ay) % 2 == 0;
+            let got = at(27 + gx, 20 + gy);
+            let want = if on { [255, 255, 255, 255] } else { bg };
+            expect(near(got, want), || {
+                format!("glyph texel ({gx},{gy}) atlas({ax},{ay}) on={on}: {got:?}, expected {want:?}")
+            })?;
+        }
+    }
+    // outside the glyph box, inside the same cell: untouched background
+    expect(near(at(24 + 1, 16 + 1), bg), || format!("cell bg near the glyph = {:?}", at(25, 17)))
+}
+
 pub fn run() -> i32 {
     let g = Gpu::new();
     let tests: &[(&str, fn(&Gpu) -> TestResult)] = &[
@@ -800,6 +1029,7 @@ pub fn run() -> i32 {
         ("textureSample repeat + textureDimensions", t_texture_repeat_and_dims),
         ("sRGB texture decode on sample", t_texture_srgb),
         ("texture-to-texture copy with origins", t_texture_copy),
+        ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
     ];
     let mut failed = 0;
     for (name, f) in tests {
