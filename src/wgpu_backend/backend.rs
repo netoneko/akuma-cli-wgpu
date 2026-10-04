@@ -1027,6 +1027,8 @@ fn raster_tri(
 
     // provoking vertex = first corner: the flat varying source
     let provoking: &Varyings = &v[0].varyings;
+    // per-fragment timers cost a syscall each on this kernel: only when asked
+    let profiling = super::prof::level() >= 2;
 
     // scanline raster with per-pixel z interpolated along the edges
     let (wi, hi) = (w as i64, h as i64);
@@ -1068,10 +1070,12 @@ fn raster_tri(
                 *zi = z;
                 // fragment stage for this pixel; it returns the four raw
                 // target-component values
-                let tf = crate::clock::monotonic();
+                let tf = if profiling { crate::clock::monotonic() } else { 0.0 };
                 let frag = fs.run_fragment(provoking, [x as f32 + 0.5, yy, z, 1.0]);
-                super::prof::add_ns(6, crate::clock::monotonic() - tf);
-                super::prof::inc(9, 1);
+                if profiling {
+                    super::prof::add_ns(6, crate::clock::monotonic() - tf);
+                    super::prof::inc(9, 1);
+                }
                 if let Some(px) = frag {
                     let o = (row + x as usize) * 4;
                     color[o..o + 4].copy_from_slice(&[
@@ -1570,11 +1574,22 @@ impl wgpu::custom::QueueWriteBufferInterface for QueueWriteBuffer {
 
 #[derive(Debug)]
 pub struct BufferMapped {
-    /// snapshot of the mapped bytes (map only happens on quiesced state)
-    pub bytes: Arc<Vec<u8>>,
+    /// keeps the buffer storage alive while the range is exposed
+    _keep: Arc<Mutex<Vec<u8>>>,
+    /// start of the buffer's bytes. Stable: buffers are allocated once at
+    /// their full size and never resized, and this backend is
+    /// single-threaded with a synchronous "GPU" — nothing writes a buffer
+    /// while it is mapped (wgpu's own contract forbids it). Avoids copying
+    /// the whole buffer on every map (33 MB per frame at 4K).
+    ptr: *const u8,
+    len: usize,
     pub offset: BufferAddress,
     pub size: usize,
 }
+
+// the pointee is owned by `_keep` and is only ever read through this handle
+unsafe impl Send for BufferMapped {}
+unsafe impl Sync for BufferMapped {}
 
 impl wgpu::custom::BufferMappedRangeInterface for BufferMapped {
     fn len(&self) -> usize {
@@ -1582,7 +1597,8 @@ impl wgpu::custom::BufferMappedRangeInterface for BufferMapped {
     }
 
     unsafe fn read_slice(&self) -> &[u8] {
-        &self.bytes[self.offset as usize..self.offset as usize + self.size]
+        let all = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
+        &all[self.offset as usize..self.offset as usize + self.size]
     }
 
     unsafe fn write_slice(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
@@ -1606,12 +1622,16 @@ impl wgpu::custom::BufferInterface for BufferData {
         &self,
         sub_range: std::ops::Range<BufferAddress>,
     ) -> Result<wgpu::custom::DispatchBufferMappedRange, wgpu::MapRangeError> {
-        // snapshot the quiesced bytes; read_slice hands back the snapshot
-        let bytes = self.bytes.lock().unwrap().clone();
+        let (ptr, len) = {
+            let g = self.bytes.lock().unwrap();
+            (g.as_ptr(), g.len())
+        };
         let size = (sub_range.end.min(self.size) - sub_range.start) as usize;
         Ok(wgpu::custom::DispatchBufferMappedRange::custom(
             BufferMapped {
-                bytes: Arc::new(bytes),
+                _keep: Arc::clone(&self.bytes),
+                ptr,
+                len,
                 offset: sub_range.start,
                 size,
             },

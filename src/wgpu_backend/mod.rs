@@ -46,7 +46,7 @@ pub mod shaders;
 /// One-line status of the wgpu path (main.rs prints it when the wgpu path
 /// starts).
 pub const STATUS: &str = "wgpu path: akuma custom backend — WGSL via naga 30 \
-interpreter (no JIT), fixed-function raster per softrender contract";
+interpreter (JIT on x86-64 / register VM / interpreter fallback), fixed-function raster per softrender contract";
 
 use crate::fb::Frame;
 use crate::softrender::{self, Scene};
@@ -355,10 +355,13 @@ impl WgpuRenderer {
             // 3. the current frame (BG + rain so far) becomes the load
             // contents of the color target
             let t0 = crate::clock::monotonic();
-            let mut pixels = Vec::with_capacity(frame.buf.len() * 4);
-            for &px in &frame.buf {
-                pixels.extend_from_slice(&px.to_le_bytes());
-            }
+            // the frame is little-endian u32 words; the texture wants those
+            // exact bytes, so hand wgpu the buffer itself (no per-pixel
+            // conversion, no 33 MB temporary at 4K)
+            const _: () = assert!(cfg!(target_endian = "little"));
+            let pixels: &[u8] = unsafe {
+                std::slice::from_raw_parts(frame.buf.as_ptr() as *const u8, frame.buf.len() * 4)
+            };
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.color,
@@ -366,7 +369,7 @@ impl WgpuRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &pixels,
+                pixels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some((self.w * 4) as u32),
@@ -449,18 +452,18 @@ impl WgpuRenderer {
                 .readback
                 .get_mapped_range(..)
                 .expect("wgpu: get_mapped_range failed");
-            let bytes: Vec<u8> = mapped.to_vec();
-            drop(mapped);
-            self.readback.unmap();
-
+            // rows are 256-aligned in the readback buffer; alpha is dropped
+            // (the framebuffer word is 0x00RRGGBB). A masked u32 copy per
+            // row vectorizes; no intermediate Vec.
             for y in 0..self.h {
-                let row = &bytes[y * self.readback_pitch..y * self.readback_pitch + self.w * 4];
-                for x in 0..self.w {
-                    let o = x * 4;
-                    frame.buf[y * self.w + x] =
-                        u32::from_le_bytes([row[o], row[o + 1], row[o + 2], 0]);
+                let row = &mapped[y * self.readback_pitch..y * self.readback_pitch + self.w * 4];
+                let dst = &mut frame.buf[y * self.w..(y + 1) * self.w];
+                for (d, px) in dst.iter_mut().zip(row.chunks_exact(4)) {
+                    *d = u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00ff_ffff;
                 }
             }
+            drop(mapped);
+            self.readback.unmap();
             prof::add_ns(7, crate::clock::monotonic() - t0);
         }
     }
@@ -501,10 +504,19 @@ pub mod prof {
     pub fn inc(i: usize, n: u64) {
         C[i].fetch_add(n, Relaxed);
     }
-    pub fn enabled() -> bool {
+    /// 0 = off, 1 = per-phase (cheap), 2 = also per-fragment timers (each is
+    /// a syscall on Akuma, so it distorts everything it sits inside)
+    pub fn level() -> u8 {
         use std::sync::OnceLock;
-        static E: OnceLock<bool> = OnceLock::new();
-        *E.get_or_init(|| std::env::var_os("AKUMA_PROF").is_some())
+        static E: OnceLock<u8> = OnceLock::new();
+        *E.get_or_init(|| match std::env::var("AKUMA_PROF").as_deref() {
+            Ok("2") => 2,
+            Ok(_) => 1,
+            Err(_) => 0,
+        })
+    }
+    pub fn enabled() -> bool {
+        level() > 0
     }
     pub fn report() {
         let frames = C[10].load(Relaxed).max(1);
