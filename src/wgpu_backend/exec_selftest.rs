@@ -24,6 +24,10 @@ struct VsOut {
 };
 fn helper(x: f32, y: f32) -> f32 { return x * 2.0 - y; }
 fn helper_vec(v: vec3<f32>) -> vec3<f32> { return v + vec3<f32>(1.0, 2.0, 3.0); }
+var<private> pg: vec4<f32> = vec4<f32>(1.0, 2.0, 3.0, 4.0);
+var<private> pc: u32;
+var<private> pa: array<f32, 4>;
+fn bump(x: f32) { pg.x = pg.x + x; pc = pc + 1u; }
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     let p = d[vi % 64u];
@@ -45,6 +49,13 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
+    Case { name: "var<private> globals (init, helper writes, branches, dyn index)", interp: true, body: r#"
+        bump(p.x);
+        if (q.x > 0.0) { bump(q.y); pa[vi % 4u] = q.z; } else { pg.w = -1.0; }
+        bump(1.0);
+        let pos = pg + vec4<f32>(pa[0], pa[1], pa[2], pa[3]);
+        let a = vec4<u32>(pc, pc * 3u, vi, 0u);
+        let b = vec4<f32>(pa[(vi + 1u) % 4u], pg.y, pg.z, pg.w);"# },
     Case { name: "float arithmetic", interp: true, body: r#"
         let pos = p * q + p / q - q;
         let a = vec4<u32>(vi, vi * 3u, 7u, 9u);

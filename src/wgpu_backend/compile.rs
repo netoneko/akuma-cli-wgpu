@@ -111,6 +111,8 @@ struct Lowerer<'m> {
     tex_ops: Vec<TexOp>,
     labels: Vec<Option<u32>>,
     gmemo: Vec<Option<Lv>>,
+    /// `var<private>` globals: per-invocation registers, by global index
+    privates: Vec<Option<Lv>>,
 }
 
 pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
@@ -136,6 +138,7 @@ pub fn compile_with_template(sh: &Shader, entry: usize) -> Res<(Program, Program
         tex_ops: Vec::new(),
         labels: Vec::new(),
         gmemo: vec![None; m.global_expressions.len()],
+        privates: vec![None; m.global_variables.len()],
     };
     lw.cmap.insert(0, 0);
     lw.kconst.insert(0, 0);
@@ -146,6 +149,29 @@ pub fn compile_with_template(sh: &Shader, entry: usize) -> Res<(Program, Program
     let mut args = Vec::new();
     for a in &f.arguments {
         args.push(Val::V(lw.make_input(a.ty, &a.binding)?));
+    }
+    // `var<private>` globals are per-invocation state shared by every
+    // (inlined) function: allocate and initialize them once, here, before
+    // any control flow (librashader's translated shaders use them).
+    for (h, gv) in m.global_variables.iter() {
+        if gv.space != AddressSpace::Private {
+            continue;
+        }
+        let l = lw.alloc(gv.ty)?;
+        match gv.init {
+            Some(init) => {
+                let v = lw.gexpr(init)?;
+                lw.store_lv(&l, &v)?;
+            }
+            None => {
+                let mut ls = Vec::new();
+                leaves(&l, &mut ls);
+                for (r, _) in ls {
+                    lw.push(Inst::Const { d: r, v: 0 });
+                }
+            }
+        }
+        lw.privates[h.index()] = Some(l);
     }
     let ret = lw.lower_function(f, args, 0)?;
 
@@ -784,6 +810,9 @@ impl<'m> Lowerer<'m> {
                             other => bail!("handle global of type {other:?}"),
                         }
                     }
+                    AddressSpace::Private => Val::P(Ptr::Local(
+                        self.privates[g.index()].clone().ok_or("private global not allocated")?,
+                    )),
                     other => bail!("global in {other:?}"),
                 }
             }

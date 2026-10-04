@@ -124,7 +124,13 @@ pub enum PtrBase {
     Local(Handle<naga::LocalVariable>),
     /// (group, binding) of a buffer global
     Buffer { group: u32, binding: u32 },
+    /// a `var<private>` global (indexes the invocation's `Privates`)
+    Private(Handle<naga::GlobalVariable>),
 }
+
+/// The invocation's `var<private>` globals, by global index; shared by every
+/// frame of one entry-point run (`None` for globals in other spaces).
+type Privates = std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PtrStep {
@@ -453,6 +459,7 @@ struct Frame<'a> {
     memo: Vec<Option<Value>>,
     return_slot: Option<Value>,
     depth: u32,
+    privates: Privates,
 }
 
 impl<'a> Frame<'a> {
@@ -462,6 +469,7 @@ impl<'a> Frame<'a> {
         res: &'a Resources<'a>,
         args: Vec<Value>,
         depth: u32,
+        privates: Privates,
     ) -> Frame<'a> {
         Frame {
             sh,
@@ -478,6 +486,7 @@ impl<'a> Frame<'a> {
             memo: vec![None; fun.expressions.len()],
             return_slot: None,
             depth,
+            privates,
         }
     }
 
@@ -558,6 +567,10 @@ impl<'a> Frame<'a> {
                             steps: Vec::new(),
                         })
                     }
+                    AddressSpace::Private => Value::Ptr(Ptr {
+                        base: PtrBase::Private(*h),
+                        steps: Vec::new(),
+                    }),
                     other => panic!("interp: global address space {other:?} unsupported"),
                 }
             }
@@ -714,7 +727,9 @@ impl<'a> Frame<'a> {
     fn buffer_ptr_offset_shape(&self, p: &Ptr) -> (u32, PtrShape) {
         let (group, binding) = match p.base {
             PtrBase::Buffer { group, binding } => (group, binding),
-            PtrBase::Local(_) => unreachable!("local pointer in buffer_ptr_offset_shape"),
+            PtrBase::Local(_) | PtrBase::Private(_) => {
+                unreachable!("variable pointer in buffer_ptr_offset_shape")
+            }
         };
         let gv = self
             .sh
@@ -794,6 +809,15 @@ impl<'a> Frame<'a> {
                 }
                 v
             }
+            PtrBase::Private(g) => {
+                let mut v = self.privates.borrow()[g.index()]
+                    .clone()
+                    .expect("interp: private global not initialized");
+                for s in &ptr.steps {
+                    v = step_value(v, *s);
+                }
+                v
+            }
             PtrBase::Buffer { group, binding } => {
                 let bytes = *self
                     .res
@@ -835,6 +859,16 @@ impl<'a> Frame<'a> {
                 }
                 let cur = self.slots[slot.index()].as_mut().unwrap();
                 let mut cur: &mut Value = cur;
+                for s in &ptr.steps {
+                    cur = descend_mut(cur, *s);
+                }
+                *cur = v;
+            }
+            PtrBase::Private(g) => {
+                let mut privs = self.privates.borrow_mut();
+                let mut cur: &mut Value = privs[g.index()]
+                    .as_mut()
+                    .expect("interp: private global not initialized");
                 for s in &ptr.steps {
                     cur = descend_mut(cur, *s);
                 }
@@ -948,7 +982,14 @@ impl<'a> Frame<'a> {
                 result,
             } => {
                 let args: Vec<Value> = arguments.iter().map(|&a| self.eval(a)).collect();
-                let ret = call_function(self.sh, self.res, *function, args, self.depth + 1);
+                let ret = call_function(
+                    self.sh,
+                    self.res,
+                    *function,
+                    args,
+                    self.depth + 1,
+                    self.privates.clone(),
+                );
                 if let (Some(slot), Some(v)) = (result, ret) {
                     self.memo[slot.index()] = Some(v);
                 }
@@ -980,7 +1021,22 @@ impl<'a> Frame<'a> {
 /// Evaluate a stage entry point (by index) with the given arguments.
 fn run_entry(sh: &Shader, entry: usize, res: &Resources, args: Vec<Value>) -> Option<Value> {
     let f = &sh.module.entry_points[entry].function;
-    let mut fr = Frame::new(sh, f, res, args, 0);
+    let privates: Privates = Default::default();
+    let mut fr = Frame::new(sh, f, res, args, 0, privates.clone());
+    // `var<private>` globals: fresh per invocation, from their const init
+    // (or zero), before the body runs
+    let inits: Vec<Option<Value>> = sh
+        .module
+        .global_variables
+        .iter()
+        .map(|(_, gv)| {
+            (gv.space == AddressSpace::Private).then(|| match gv.init {
+                Some(init) => fr.eval_const(init),
+                None => zero_value_for(sh, gv.ty),
+            })
+        })
+        .collect();
+    *privates.borrow_mut() = inits;
     fr.init_locals();
     let flow = fr.exec_block(&f.body);
     match flow {
@@ -1114,12 +1170,13 @@ fn call_function(
     h: Handle<Function>,
     args: Vec<Value>,
     depth: u32,
+    privates: Privates,
 ) -> Option<Value> {
     if depth > MAX_CALL_DEPTH {
         panic!("interp: call depth limit exceeded");
     }
     let f = &sh.module.functions[h];
-    let mut fr = Frame::new(sh, f, res, args, depth);
+    let mut fr = Frame::new(sh, f, res, args, depth, privates);
     fr.init_locals();
     let flow = fr.exec_block(&f.body);
     match flow {
