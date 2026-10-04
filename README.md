@@ -636,8 +636,8 @@ a glyph) 320 → 25 ms. The demo's four 4K checksums and 720p checksums are unch
   position), random fragment shaders vs the interpreter (default, runs off, forced
   specialization, two uniform values), sugarloaf's `renderer.wgsl` rects. Fuzzing: 800 random
   vertex shaders and 150 random fragment shaders × variants, all executors bit-identical.
-- **Could not verify:** rio itself; anything about how the output looks to a human (all
-  pixel checks are numeric); the wide JIT's numbers on a CPU other than this one; behaviour
+- **Could not verify:** rio itself; how the rio-scale passes look to a human (all their pixel
+  checks are numeric; the demo was watched on the panel and looked right); the wide JIT's numbers on a CPU other than this one; behaviour
   of the worker pool's 50 ms spin on a busy desktop (it burns up to three cores for 50 ms
   after each frame — `AKUMA_SPIN_MS` tunes it); `sched_setaffinity` (returns -1 here, so workers cannot be pinned).
 
@@ -650,8 +650,9 @@ in ~20 ms. In order:
 1. **Glyph pass** (now most of a frame): merge the two triangles of an axis-aligned quad into
    one rectangle fill; cheaper vertex marshalling; a register allocator / 8-lane code for the
    wide JIT. Re-run `gpu-bench` after every change (it reports mean and best).
-2. **Verify on `/dev/fb0`** that the demo still looks right with everything above (only
-   headless `selftest` and `screensaver --timeout` runs were done, no human looked at the panel).
+2. ~~Verify on `/dev/fb0`~~ done 2026-10-04: a person watched `screensaver --wgpu --timeout 25` on the
+   panel after all of Task 11 (876 frames, 34.9 fps) and reported it smooth and looking right. Rio-scale
+   output (grid/rect passes) has still only been checked numerically.
 3. **rio itself**, which is outside this repo: a framebuffer platform in `rio-window`
    (screen = `/dev/fb0`, input = the console tty), a `Surface` whose texture is presented
    into the mapping with whole-row copies, and building rio against this wgpu backend. Known
