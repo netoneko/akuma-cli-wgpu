@@ -357,34 +357,28 @@ impl WgpuRenderer {
             self.queue.write_buffer(tris_buf, 0, &mesh);
             prof::add_ns(1, crate::clock::monotonic() - t0);
 
-            // 3. the current frame (BG + rain so far) becomes the load
-            // contents of the color target
-            let t0 = crate::clock::monotonic();
-            // the frame is little-endian u32 words; the texture wants those
-            // exact bytes, so hand wgpu the buffer itself (no per-pixel
-            // conversion, no 33 MB temporary at 4K)
+            // 3. Render in place. The frame (BG + rain so far) already holds
+            // exactly the texture's bytes (a little-endian 0x00RRGGBB word is
+            // the bytes b, g, r, 0 that the fragment stage writes), so rather
+            // than uploading 33 MB at 4K, drawing, copying it to a readback
+            // buffer and blitting it back, the colour texture's storage is
+            // pointed at the frame's own memory for the duration of the pass.
             const _: () = assert!(cfg!(target_endian = "little"));
-            let pixels: &[u8] = unsafe {
-                std::slice::from_raw_parts(frame.buf.as_ptr() as *const u8, frame.buf.len() * 4)
-            };
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.color,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some((self.w * 4) as u32),
-                    rows_per_image: None,
-                },
-                extent(self.w, self.h),
-            );
-            prof::add_ns(2, crate::clock::monotonic() - t0);
+            let tex = self
+                .color
+                .as_custom::<backend::TextureData>()
+                .expect("wgpu: colour target is not an akuma texture");
+            let backend::TexStore::Color(store) = &*tex.store else { unreachable!() };
+            let nbytes = frame.buf.len() * 4;
+            assert_eq!(nbytes, self.w * self.h * 4);
+            // SAFETY: a Vec<u8> view of the frame's u32 allocation. It is only
+            // ever indexed (the pass reads and writes pixels in place), never
+            // grown or dropped: it is swapped out again and `forget`-ten below,
+            // so the allocation is freed once, by `frame`, with its own layout.
+            let alias = unsafe { Vec::from_raw_parts(frame.buf.as_mut_ptr() as *mut u8, nbytes, nbytes) };
+            let original = std::mem::replace(&mut *store.lock().unwrap(), alias);
 
-            // 4. render pass: draw the logo over the loaded backdrop
+            // 4. render pass: draw the logo over the backdrop already in place
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("akuma") });
@@ -419,57 +413,16 @@ impl WgpuRenderer {
                 rpass.set_bind_group(0, &self.bind_group, &[]);
                 rpass.draw(0..(n as u32 * 3), 0..1);
             }
-
-            // 5. read back and blit into the frame
-            enc.copy_texture_to_buffer(
-                self.color.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &self.readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(self.readback_pitch as u32),
-                        rows_per_image: None,
-                    },
-                },
-                extent(self.w, self.h),
-            );
             let t0 = crate::clock::monotonic();
             let done = self.queue.submit([enc.finish()]);
-
-            self.device.poll(wgpu::PollType::Wait {
-                submission_index: Some(done),
-                timeout: None,
-            })
-            .expect("wgpu: poll failed");
+            self.device
+                .poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: None })
+                .expect("wgpu: poll failed");
             prof::add_ns(3, crate::clock::monotonic() - t0);
-            let t0 = crate::clock::monotonic();
 
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |r| {
-                    let _ = tx.send(r);
-                });
-            if let Ok(Err(e)) = rx.recv() {
-                panic!("wgpu: map_async failed: {e:?}");
-            }
-            let mapped = self
-                .readback
-                .get_mapped_range(..)
-                .expect("wgpu: get_mapped_range failed");
-            // rows are 256-aligned in the readback buffer; alpha is dropped
-            // (the framebuffer word is 0x00RRGGBB). A masked u32 copy per
-            // row vectorizes; no intermediate Vec.
-            for y in 0..self.h {
-                let row = &mapped[y * self.readback_pitch..y * self.readback_pitch + self.w * 4];
-                let dst = &mut frame.buf[y * self.w..(y + 1) * self.w];
-                for (d, px) in dst.iter_mut().zip(row.chunks_exact(4)) {
-                    *d = u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00ff_ffff;
-                }
-            }
-            drop(mapped);
-            self.readback.unmap();
-            prof::add_ns(7, crate::clock::monotonic() - t0);
+            // put the texture's own storage back; the alias is never dropped
+            let alias = std::mem::replace(&mut *store.lock().unwrap(), original);
+            std::mem::forget(alias);
         }
     }
 }
