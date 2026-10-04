@@ -45,6 +45,8 @@ pub enum Stage {
 #[derive(Debug)]
 pub struct CompiledStage {
     pub prog: Program,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub jit: Option<super::jit::Jit>,
 }
 
 #[derive(Debug)]
@@ -74,7 +76,30 @@ impl Stage {
                             prog.nregs
                         );
                     }
-                    return Stage::Compiled(CompiledStage { prog });
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    let jit = if force == "vm" {
+                        None
+                    } else {
+                        match super::jit::compile(&prog) {
+                            Ok(j) => {
+                                if verbose {
+                                    eprintln!("[exec] {name}: jit, {} bytes of x86-64", j.code_len());
+                                }
+                                Some(j)
+                            }
+                            Err(e) => {
+                                if verbose {
+                                    eprintln!("[exec] {name}: jit declined ({e}), using vm");
+                                }
+                                None
+                            }
+                        }
+                    };
+                    return Stage::Compiled(CompiledStage {
+                        prog,
+                        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                        jit,
+                    });
                 }
                 Err(e) => {
                     if verbose {
@@ -89,6 +114,8 @@ impl Stage {
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Interp(_) => "interp",
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Stage::Compiled(c) if c.jit.is_some() => "jit",
             Stage::Compiled(_) => "vm",
         }
     }
@@ -98,12 +125,20 @@ impl Stage {
         match self {
             Stage::Interp(s) => Invoker::Interp { s, res },
             Stage::Compiled(c) => {
-                let bufs = c
+                let bufs: Vec<&[u8]> = c
                     .prog
                     .bufs
                     .iter()
                     .map(|k| res.bufs.get(k).copied().unwrap_or(&[]))
                     .collect();
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                if let Some(j) = &c.jit {
+                    let refs = bufs
+                        .iter()
+                        .map(|b| super::jit::BufRef { ptr: b.as_ptr(), len: b.len() })
+                        .collect();
+                    return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs };
+                }
                 Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs }
             }
         }
@@ -113,6 +148,8 @@ impl Stage {
 pub enum Invoker<'a> {
     Interp { s: &'a InterpStage, res: &'a Resources<'a> },
     Vm { p: &'a Program, regs: Vec<u32>, bufs: Vec<&'a [u8]> },
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    Jit { p: &'a Program, j: &'a super::jit::Jit, regs: Vec<u32>, refs: Vec<super::jit::BufRef> },
 }
 
 impl Invoker<'_> {
@@ -120,24 +157,15 @@ impl Invoker<'_> {
         match self {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
             Invoker::Vm { p, regs, bufs } => {
-                for &(r, src) in &p.inputs {
-                    regs[r as usize] = match src {
-                        Src::VertexIndex => vertex_index,
-                        Src::InstanceIndex => instance_index,
-                        // vertex attributes: no vertex buffers yet
-                        _ => 0,
-                    };
-                }
+                vertex_in(p, regs, vertex_index, instance_index);
                 vm::run(&p.code, regs, bufs);
-                let mut out = RawVertex::default();
-                for &(d, r) in &p.outputs {
-                    let bits = regs[r as usize];
-                    match d {
-                        Dst::Position(i) => out.position[i as usize] = f32::from_bits(bits),
-                        Dst::Location(l, c) => out.varyings[l as usize][c as usize] = bits,
-                    }
-                }
-                out
+                vertex_out(p, regs)
+            }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Jit { p, j, regs, refs } => {
+                vertex_in(p, regs, vertex_index, instance_index);
+                j.run(regs, refs);
+                vertex_out(p, regs)
             }
         }
     }
@@ -146,23 +174,19 @@ impl Invoker<'_> {
         match self {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),
             Invoker::Vm { p, regs, bufs } => {
-                for &(r, src) in &p.inputs {
-                    regs[r as usize] = match src {
-                        Src::Position(c) => frag_pos[c as usize].to_bits(),
-                        Src::Location(l, c) => varyings[l as usize][c as usize],
-                        _ => 0,
-                    };
-                }
+                frag_in(p, regs, varyings, frag_pos);
                 if vm::run(&p.code, regs, bufs) {
                     return None;
                 }
-                let mut color = [0u32; 4];
-                for &(d, r) in &p.outputs {
-                    if let Dst::Location(0, c) = d {
-                        color[c as usize] = regs[r as usize];
-                    }
+                Some(frag_out(p, regs))
+            }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Jit { p, j, regs, refs } => {
+                frag_in(p, regs, varyings, frag_pos);
+                if j.run(regs, refs) {
+                    return None;
                 }
-                Some(color)
+                Some(frag_out(p, regs))
             }
         }
     }
@@ -257,4 +281,55 @@ fn bits_value(sh: &Shader, ty: naga::Handle<naga::Type>, bits: &[u32; 4]) -> Val
         }
         other => panic!("exec: varying type {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// compiled-stage input/output marshalling (shared by VM and JIT)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn vertex_in(p: &Program, regs: &mut [u32], vertex_index: u32, instance_index: u32) {
+    for &(r, src) in &p.inputs {
+        regs[r as usize] = match src {
+            Src::VertexIndex => vertex_index,
+            Src::InstanceIndex => instance_index,
+            // vertex attributes: no vertex buffers yet
+            _ => 0,
+        };
+    }
+}
+
+#[inline]
+fn vertex_out(p: &Program, regs: &[u32]) -> RawVertex {
+    let mut out = RawVertex::default();
+    for &(d, r) in &p.outputs {
+        let bits = regs[r as usize];
+        match d {
+            Dst::Position(i) => out.position[i as usize] = f32::from_bits(bits),
+            Dst::Location(l, c) => out.varyings[l as usize][c as usize] = bits,
+        }
+    }
+    out
+}
+
+#[inline]
+fn frag_in(p: &Program, regs: &mut [u32], varyings: &Varyings, frag_pos: [f32; 4]) {
+    for &(r, src) in &p.inputs {
+        regs[r as usize] = match src {
+            Src::Position(c) => frag_pos[c as usize].to_bits(),
+            Src::Location(l, c) => varyings[l as usize][c as usize],
+            _ => 0,
+        };
+    }
+}
+
+#[inline]
+fn frag_out(p: &Program, regs: &[u32]) -> [u32; 4] {
+    let mut color = [0u32; 4];
+    for &(d, r) in &p.outputs {
+        if let Dst::Location(0, c) = d {
+            color[c as usize] = regs[r as usize];
+        }
+    }
+    color
 }

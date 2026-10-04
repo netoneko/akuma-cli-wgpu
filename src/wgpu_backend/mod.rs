@@ -36,6 +36,8 @@ pub mod backend;
 pub mod compile;
 pub mod exec;
 pub mod interp;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub mod jit;
 pub mod program;
 pub mod vm;
 pub mod shaders;
