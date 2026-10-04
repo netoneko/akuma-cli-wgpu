@@ -477,15 +477,29 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// `var x = <const expr>` arrives as a `LocalVariable::init`; apply it
+    /// before the body runs (slots are otherwise zero-initialized).
+    fn init_locals(&mut self) {
+        for (h, lv) in self.fun.local_variables.iter() {
+            if let Some(init) = lv.init {
+                let v = self.eval(init);
+                self.slots[h.index()] = Some(v);
+            }
+        }
+    }
+
     // -- expression evaluation -------------------------------------------
 
+    /// An expression's value: the one captured at its `Emit` (or `Call`)
+    /// point if it has one. Anything not emitted — literals, constants,
+    /// argument/variable references and the pointer chains built on them — is
+    /// pure, so it is simply recomputed on every use, never memoized: a
+    /// pointer like `arr[i]` must see the current `i` on every loop iteration.
     fn eval(&mut self, e: Handle<Expression>) -> Value {
         if let Some(v) = &self.memo[e.index()] {
             return v.clone();
         }
-        let v = self.eval_inner(e);
-        self.memo[e.index()] = Some(v.clone());
-        v
+        self.eval_inner(e)
     }
 
     fn eval_inner(&mut self, e: Handle<Expression>) -> Value {
@@ -845,8 +859,14 @@ impl<'a> Frame<'a> {
 
     fn exec_stmt(&mut self, stmt: &naga::Statement) -> Flow {
         match stmt {
-            naga::Statement::Emit(_) => {
-                // pure expressions: evaluated lazily on first reference
+            naga::Statement::Emit(range) => {
+                // naga semantics: the value is whatever the expression
+                // computes *here* (a `let` of a load must not see later
+                // stores, and a loop re-emits it every iteration)
+                for h in range.clone() {
+                    let v = self.eval_inner(h);
+                    self.memo[h.index()] = Some(v);
+                }
                 Flow::Next
             }
             naga::Statement::Block(b) => self.exec_block(b),
@@ -957,6 +977,7 @@ impl<'a> Frame<'a> {
 fn run_entry(sh: &Shader, entry: usize, res: &Resources, args: Vec<Value>) -> Option<Value> {
     let f = &sh.module.entry_points[entry].function;
     let mut fr = Frame::new(sh, f, res, args, 0);
+    fr.init_locals();
     let flow = fr.exec_block(&f.body);
     match flow {
         Flow::Return | Flow::Next => fr.return_slot,
@@ -1085,6 +1106,7 @@ fn call_function(
     }
     let f = &sh.module.functions[h];
     let mut fr = Frame::new(sh, f, res, args, depth);
+    fr.init_locals();
     let flow = fr.exec_block(&f.body);
     match flow {
         Flow::Return | Flow::Next => fr.return_slot,
@@ -1153,7 +1175,17 @@ fn zero_value_for(sh: &Shader, ty: Handle<naga::Type>) -> Value {
 
 fn compose_value(sh: &Shader, ty: Handle<naga::Type>, comps: Vec<Value>) -> Value {
     match &sh.module.types[ty].inner {
-        TypeInner::Vector { .. } => Value::Vec(comps),
+        TypeInner::Vector { .. } => {
+            // vec4(vec2, vec2) / vec4(vec3, f32): flatten vector components
+            let mut flat = Vec::with_capacity(comps.len());
+            for c in comps {
+                match c {
+                    Value::Vec(vs) => flat.extend(vs),
+                    scalar => flat.push(scalar),
+                }
+            }
+            Value::Vec(flat)
+        }
         TypeInner::Array { .. } => Value::Arr(comps),
         TypeInner::Struct { .. } => Value::Struct(comps),
         TypeInner::Matrix { columns, rows, .. } => {
@@ -1265,6 +1297,7 @@ fn step_value(v: Value, s: PtrStep) -> Value {
         (Value::Arr(vs), PtrStep::Idx(i)) => nth(vs, i, "array"),
         (Value::Vec(vs), PtrStep::Idx(i)) => nth(vs, i, "vector"),
         (Value::Vec(vs), PtrStep::Member(i)) => nth(vs, i, "vector"),
+        (Value::Arr(vs), PtrStep::Member(i)) => nth(vs, i, "array"),
         (Value::Struct(vs), PtrStep::Member(i)) => nth(vs, i, "struct"),
         (Value::Mat { cols, rows }, PtrStep::Member(i)) => Value::Vec(
             (0..rows)
@@ -1279,6 +1312,9 @@ fn descend_mut<'v>(v: &'v mut Value, s: PtrStep) -> &'v mut Value {
     match (v, s) {
         (Value::Arr(vs), PtrStep::Idx(i)) => &mut vs[i as usize],
         (Value::Vec(vs), PtrStep::Idx(i)) => &mut vs[i as usize],
+        // `v.x = ..` is an AccessIndex (Member) step into a vector pointer
+        (Value::Vec(vs), PtrStep::Member(i)) => &mut vs[i as usize],
+        (Value::Arr(vs), PtrStep::Member(i)) => &mut vs[i as usize],
         (Value::Struct(vs), PtrStep::Member(i)) => &mut vs[i as usize],
         (other, s) => panic!("interp: descend {s:?} on {other:?}"),
     }
@@ -1368,6 +1404,13 @@ fn binary(op: BinaryOperator, l: Value, r: Value) -> Value {
                     .collect(),
             )
         }
+        // scalar broadcast (vec * scalar, scalar + vec, ...)
+        (Value::Vec(ls), _) => {
+            Value::Vec(ls.iter().cloned().map(|a| s(op, a, r.clone())).collect())
+        }
+        (_, Value::Vec(rs)) => {
+            Value::Vec(rs.iter().cloned().map(|b| s(op, l.clone(), b)).collect())
+        }
         _ => s(op, l, r),
     }
 }
@@ -1438,6 +1481,11 @@ fn cast(v: Value, kind: ScalarKind, convert: Option<naga::Bytes>) -> Value {
                 (Value::F32(x), ScalarKind::Uint) => Value::U32(x.to_bits()),
                 (Value::I32(x), ScalarKind::Float) => Value::F32(f32::from_bits(x as u32)),
                 (Value::U32(x), ScalarKind::Float) => Value::F32(f32::from_bits(x)),
+                (Value::I32(x), ScalarKind::Uint) => Value::U32(x as u32),
+                (Value::U32(x), ScalarKind::Sint) => Value::I32(x as i32),
+                (Value::F32(x), ScalarKind::Float) => Value::F32(x),
+                (Value::I32(x), ScalarKind::Sint) => Value::I32(x),
+                (Value::U32(x), ScalarKind::Uint) => Value::U32(x),
                 (a, k) => panic!("interp: bitcast to {k:?} from {a:?}"),
             },
             Some(_) => match (v, kind) {

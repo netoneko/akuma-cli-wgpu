@@ -99,6 +99,7 @@ enum Mode {
     Screensaver,
     Matrix,
     Selftest,
+    ExecSelftest,
 }
 
 const USAGE: &str = "\
@@ -111,6 +112,7 @@ COMMANDS:
     screensaver    3D cat logo over the Matrix backdrop
     matrix         Matrix backdrop only
     selftest       render headlessly into RAM, print stats, exit
+    exec-selftest  diff the shader executors (interp/vm/jit) bit for bit
 
 OPTIONS:
     --latin        Latin characters in the backdrop (default: katakana)
@@ -149,6 +151,7 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
             "screensaver" => mode = Mode::Screensaver,
             "matrix" => mode = Mode::Matrix,
             "selftest" => mode = Mode::Selftest,
+            "exec-selftest" => mode = Mode::ExecSelftest,
             "-h" | "--help" | "help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown command `{other}` (try --help)")),
         }
@@ -208,6 +211,7 @@ fn main() {
 
     let code = match opts.mode {
         Mode::Selftest => run_selftest(&opts),
+        Mode::ExecSelftest => wgpu_backend::exec_selftest::run(),
         Mode::Matrix => run_show(&opts, /*asset overlay*/ false),
         Mode::Screensaver => run_show(&opts, true),
     };

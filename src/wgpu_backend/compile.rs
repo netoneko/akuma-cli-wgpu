@@ -391,14 +391,34 @@ impl<'m> Lowerer<'m> {
         if let Some(res) = &f.result {
             ctx.ret = Some(self.alloc(res.ty)?);
         }
-        // pre-emit expressions, once, before any control flow
+        // Expressions naga never `Emit`s: literals/constants, argument and
+        // variable references, and anything built purely from constants
+        // (`vec4(0.0)`, `array(1.0, 2.0)`, `2.0 * 3.0`, ...). All are pure, so
+        // evaluate them once here, before any control flow.
+        let mut is_const = vec![false; f.expressions.len()];
         for (h, e) in f.expressions.iter() {
-            if matches!(
+            let c = |x: &Handle<Expression>| is_const[x.index()];
+            let k = match e {
+                Expression::Literal(_) | Expression::Constant(_) | Expression::ZeroValue(_) => true,
+                Expression::Compose { components, .. } => components.iter().all(c),
+                Expression::Splat { value, .. } => c(value),
+                Expression::Swizzle { vector, .. } => c(vector),
+                Expression::Access { base, index } => c(base) && c(index),
+                Expression::AccessIndex { base, .. } => c(base),
+                Expression::Unary { expr, .. } | Expression::As { expr, .. } => c(expr),
+                Expression::Binary { left, right, .. } => c(left) && c(right),
+                Expression::Select { condition, accept, reject } => {
+                    c(condition) && c(accept) && c(reject)
+                }
+                Expression::Math { arg, arg1, arg2, arg3, .. } => {
+                    c(arg) && [arg1, arg2, arg3].into_iter().flatten().all(c)
+                }
+                _ => false,
+            };
+            is_const[h.index()] = k;
+            if k || matches!(
                 e,
-                Expression::Literal(_)
-                    | Expression::Constant(_)
-                    | Expression::ZeroValue(_)
-                    | Expression::FunctionArgument(_)
+                Expression::FunctionArgument(_)
                     | Expression::GlobalVariable(_)
                     | Expression::LocalVariable(_)
             ) {
@@ -408,7 +428,7 @@ impl<'m> Lowerer<'m> {
         }
         for (h, lv) in f.local_variables.iter() {
             if let Some(init) = lv.init {
-                let v = self.val(&ctx, init)?;
+                let v = self.val(&mut ctx, init)?;
                 let dst = ctx.locals[h.index()].clone();
                 self.store_lv(&dst, &v)?;
             }
@@ -418,17 +438,30 @@ impl<'m> Lowerer<'m> {
         Ok(ctx.ret)
     }
 
-    fn val(&self, ctx: &Ctx<'m>, h: Handle<Expression>) -> Res<Lv> {
+    fn val(&mut self, ctx: &mut Ctx<'m>, h: Handle<Expression>) -> Res<Lv> {
         match self.get(ctx, h)? {
             Val::V(l) => Ok(l),
             Val::P(_) => bail!("pointer where a value was expected"),
         }
     }
 
-    fn get(&self, ctx: &Ctx<'m>, h: Handle<Expression>) -> Res<Val> {
-        ctx.memo[h.index()]
-            .clone()
-            .ok_or_else(|| format!("expression {} used before its Emit", h.index()))
+    /// The value captured at the expression's Emit/Call. naga does not Emit
+    /// pointer chains (`a.x = ..`, `arr[i]`), so those are rebuilt at each use
+    /// and deliberately not memoized — a dynamic index must be re-read, and
+    /// whatever code it emits belongs to the path that uses it. Anything else
+    /// that was never emitted is a lowering bug / unsupported shape.
+    fn get(&mut self, ctx: &mut Ctx<'m>, h: Handle<Expression>) -> Res<Val> {
+        if let Some(v) = &ctx.memo[h.index()] {
+            return Ok(v.clone());
+        }
+        match &ctx.fun.expressions[h] {
+            Expression::Access { .. } | Expression::AccessIndex { .. } => self.expr(ctx, h),
+            other => Err(format!(
+                "expression {} ({:?}) used before its Emit",
+                h.index(),
+                std::mem::discriminant(other)
+            )),
+        }
     }
 
     // -- statements -------------------------------------------------------------
@@ -441,7 +474,7 @@ impl<'m> Lowerer<'m> {
         Ok(())
     }
 
-    fn cond_reg(&self, lv: &Lv) -> Res<R> {
+    fn cond_reg(lv: &Lv) -> Res<R> {
         match lv {
             Lv::S(r, K::B) => Ok(*r),
             other => bail!("condition {other:?}"),
@@ -459,7 +492,7 @@ impl<'m> Lowerer<'m> {
             }
             S::Block(b) => self.block(ctx, b)?,
             S::If { condition, accept, reject } => {
-                let c = self.cond_reg(&self.val(ctx, *condition)?)?;
+                let c = Self::cond_reg(&self.val(ctx, *condition)?)?;
                 let l_else = self.new_label();
                 let l_end = self.new_label();
                 self.push(Inst::Jz { c, t: l_else });
@@ -484,7 +517,7 @@ impl<'m> Lowerer<'m> {
                 self.place(cont);
                 self.block(ctx, continuing)?;
                 if let Some(bi) = break_if {
-                    let c = self.cond_reg(&self.val(ctx, *bi)?)?;
+                    let c = Self::cond_reg(&self.val(ctx, *bi)?)?;
                     self.push(Inst::Jnz { c, t: end });
                 }
                 self.push(Inst::Jmp { t: top });

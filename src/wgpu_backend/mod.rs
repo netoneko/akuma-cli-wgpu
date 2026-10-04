@@ -35,6 +35,7 @@
 pub mod backend;
 pub mod compile;
 pub mod exec;
+pub mod exec_selftest;
 pub mod interp;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod jit;

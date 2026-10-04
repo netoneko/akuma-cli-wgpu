@@ -64,6 +64,13 @@ impl Stage {
     /// interpreter; `AKUMA_EXEC_VERBOSE=1` reports each decision.
     pub fn new(shader: Arc<Shader>, entry: usize) -> Stage {
         let force = std::env::var("AKUMA_EXEC").unwrap_or_default();
+        Stage::build(shader, entry, &force).unwrap_or_else(|e| panic!("exec: {e}"))
+    }
+
+    /// `force`: "" (best available), "interp", "vm" or "jit" (an error if
+    /// the shader cannot be compiled / jitted).
+    pub fn build(shader: Arc<Shader>, entry: usize, force: &str) -> Result<Stage, String> {
+        let strict = force == "vm" || force == "jit";
         let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
         let name = shader.module.entry_points[entry].name.clone();
         if force != "interp" {
@@ -95,20 +102,31 @@ impl Stage {
                             }
                         }
                     };
-                    return Stage::Compiled(CompiledStage {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    if force == "jit" && jit.is_none() {
+                        return Err("jit unavailable for this shader".into());
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+                    if force == "jit" {
+                        return Err("jit unavailable on this target".into());
+                    }
+                    return Ok(Stage::Compiled(CompiledStage {
                         prog,
                         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                         jit,
-                    });
+                    }));
                 }
                 Err(e) => {
+                    if strict {
+                        return Err(format!("{name}: cannot compile: {e}"));
+                    }
                     if verbose {
                         eprintln!("[exec] {name}: interpreter ({e})");
                     }
                 }
             }
         }
-        Stage::Interp(InterpStage::new(shader, entry))
+        Ok(Stage::Interp(InterpStage::new(shader, entry)))
     }
 
     pub fn name(&self) -> &'static str {
