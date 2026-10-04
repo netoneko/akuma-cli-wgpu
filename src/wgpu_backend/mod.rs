@@ -34,6 +34,7 @@
 
 pub mod backend;
 pub mod compile;
+pub mod crt;
 pub mod exec;
 pub mod exec_selftest;
 pub mod format;

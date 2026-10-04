@@ -295,7 +295,27 @@ impl SurfaceOutputDetail {
             SinkRef::Fb(fb) => {
                 // smaller than the panel = top-left corner (see present_raw)
                 assert!(w <= fb.width && h <= fb.height, "surface larger than fb");
-                fb.present_raw(&bytes, row_bytes);
+                let tubes = super::crt::tubes() as usize;
+                if tubes > 0 && bpt == 4 {
+                    // the CRT look (crt.rs): curvature, scanlines, vignette
+                    let mut cache = super::crt::CACHE.lock().unwrap();
+                    if !cache.as_ref().is_some_and(|c| c.fits(w, h, tubes)) {
+                        *cache = Some(super::crt::Crt::new(w, h, tubes));
+                    }
+                    let t0 = crate::clock::monotonic();
+                    let out = cache.as_mut().unwrap().apply(&bytes);
+                    let t1 = crate::clock::monotonic();
+                    fb.present_raw(out, row_bytes);
+                    if std::env::var_os("AKUMA_EXEC_VERBOSE").is_some() {
+                        eprintln!(
+                            "[crt] {w}x{h}, {tubes} tube(s): effect {:.1} ms, copy {:.1} ms",
+                            (t1 - t0) * 1e3,
+                            (crate::clock::monotonic() - t1) * 1e3
+                        );
+                    }
+                } else {
+                    fb.present_raw(&bytes, row_bytes);
+                }
             }
             SinkRef::Ram => {
                 // the selftest reads the texture bytes directly; presenting
