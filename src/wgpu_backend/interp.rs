@@ -173,7 +173,7 @@ pub struct VertexOut {
 // the uniform address-space restrictions never bite)
 // ---------------------------------------------------------------------------
 
-fn vsize(n: VectorSize) -> u32 {
+pub(super) fn vsize(n: VectorSize) -> u32 {
     match n {
         VectorSize::Bi => 2,
         VectorSize::Tri => 3,
@@ -181,7 +181,7 @@ fn vsize(n: VectorSize) -> u32 {
     }
 }
 
-fn w(s: naga::Scalar) -> u32 {
+pub(super) fn w(s: naga::Scalar) -> u32 {
     s.width as u32
 }
 
@@ -194,11 +194,11 @@ pub fn round_up(align: u32, val: u32) -> u32 {
 /// up to element alignment — the WGSL rule. Idx stepping and member offsets
 /// must come from one set of rules (naga's stored stride agrees with these,
 /// but deriving the stride here is what keeps the two from drifting apart).
-fn array_stride(module: &naga::Module, base: Handle<naga::Type>) -> u32 {
+pub(super) fn array_stride(module: &naga::Module, base: Handle<naga::Type>) -> u32 {
     round_up(align_of(module, base), size_of(module, base))
 }
 
-fn align_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
+pub(super) fn align_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
     match &module.types[ty].inner {
         TypeInner::Scalar(s) | TypeInner::Atomic(s) => w(*s),
         TypeInner::Vector { size, scalar } => match *size {
@@ -220,7 +220,7 @@ fn align_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
     }
 }
 
-fn size_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
+pub(super) fn size_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
     match &module.types[ty].inner {
         TypeInner::Scalar(s) | TypeInner::Atomic(s) => w(*s),
         TypeInner::Vector { size, scalar } => vsize(*size) * w(*scalar),
@@ -247,14 +247,14 @@ fn size_of(module: &naga::Module, ty: Handle<naga::Type>) -> u32 {
 }
 
 /// stride for a vector standing in for a matrix column
-fn vec_stride(n: u32, s: naga::Scalar) -> u32 {
+pub(super) fn vec_stride(n: u32, s: naga::Scalar) -> u32 {
     round_up(w(s), n * w(s))
 }
 
 /// array stride = element size rounded up to element alignment
 
 /// struct member offsets (storage layout)
-fn member_offsets(module: &naga::Module, members: &[naga::StructMember]) -> Vec<u32> {
+pub(super) fn member_offsets(module: &naga::Module, members: &[naga::StructMember]) -> Vec<u32> {
     let mut offs = Vec::with_capacity(members.len());
     let mut off = 0;
     for m in members {

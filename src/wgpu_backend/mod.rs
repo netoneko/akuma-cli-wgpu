@@ -33,8 +33,11 @@
 //! equal the software-path baselines in the README.
 
 pub mod backend;
+pub mod compile;
 pub mod exec;
 pub mod interp;
+pub mod program;
+pub mod vm;
 pub mod shaders;
 
 /// One-line status of the wgpu path (main.rs prints it when the wgpu path

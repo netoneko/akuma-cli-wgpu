@@ -17,7 +17,10 @@
 
 use std::sync::Arc;
 
+use super::compile;
 use super::interp::{self, Resources, Shader, Value};
+use super::program::{Dst, Program, Src};
+use super::vm;
 
 /// How many `@location` slots a stage interface may use (rio's shaders use
 /// at most 3; flat 4-component slots, raw 32-bit words).
@@ -36,6 +39,12 @@ pub type Varyings = [[u32; 4]; MAX_LOC];
 #[derive(Debug)]
 pub enum Stage {
     Interp(InterpStage),
+    Compiled(CompiledStage),
+}
+
+#[derive(Debug)]
+pub struct CompiledStage {
+    pub prog: Program,
 }
 
 #[derive(Debug)]
@@ -48,13 +57,39 @@ pub struct InterpStage {
 }
 
 impl Stage {
+    /// Pick the best executor for a stage: compiled if the lowering accepts
+    /// the shader, the interpreter otherwise. `AKUMA_EXEC=interp` forces the
+    /// interpreter; `AKUMA_EXEC_VERBOSE=1` reports each decision.
     pub fn new(shader: Arc<Shader>, entry: usize) -> Stage {
+        let force = std::env::var("AKUMA_EXEC").unwrap_or_default();
+        let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
+        let name = shader.module.entry_points[entry].name.clone();
+        if force != "interp" {
+            match compile::compile(&shader, entry) {
+                Ok(prog) => {
+                    if verbose {
+                        eprintln!(
+                            "[exec] {name}: compiled, {} insts, {} regs",
+                            prog.code.len(),
+                            prog.nregs
+                        );
+                    }
+                    return Stage::Compiled(CompiledStage { prog });
+                }
+                Err(e) => {
+                    if verbose {
+                        eprintln!("[exec] {name}: interpreter ({e})");
+                    }
+                }
+            }
+        }
         Stage::Interp(InterpStage::new(shader, entry))
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Interp(_) => "interp",
+            Stage::Compiled(_) => "vm",
         }
     }
 
@@ -62,24 +97,73 @@ impl Stage {
     pub fn begin<'a>(&'a self, res: &'a Resources<'a>) -> Invoker<'a> {
         match self {
             Stage::Interp(s) => Invoker::Interp { s, res },
+            Stage::Compiled(c) => {
+                let bufs = c
+                    .prog
+                    .bufs
+                    .iter()
+                    .map(|k| res.bufs.get(k).copied().unwrap_or(&[]))
+                    .collect();
+                Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs }
+            }
         }
     }
 }
 
 pub enum Invoker<'a> {
     Interp { s: &'a InterpStage, res: &'a Resources<'a> },
+    Vm { p: &'a Program, regs: Vec<u32>, bufs: Vec<&'a [u8]> },
 }
 
 impl Invoker<'_> {
     pub fn run_vertex(&mut self, vertex_index: u32, instance_index: u32) -> RawVertex {
         match self {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
+            Invoker::Vm { p, regs, bufs } => {
+                for &(r, src) in &p.inputs {
+                    regs[r as usize] = match src {
+                        Src::VertexIndex => vertex_index,
+                        Src::InstanceIndex => instance_index,
+                        // vertex attributes: no vertex buffers yet
+                        _ => 0,
+                    };
+                }
+                vm::run(&p.code, regs, bufs);
+                let mut out = RawVertex::default();
+                for &(d, r) in &p.outputs {
+                    let bits = regs[r as usize];
+                    match d {
+                        Dst::Position(i) => out.position[i as usize] = f32::from_bits(bits),
+                        Dst::Location(l, c) => out.varyings[l as usize][c as usize] = bits,
+                    }
+                }
+                out
+            }
         }
     }
 
     pub fn run_fragment(&mut self, varyings: &Varyings, frag_pos: [f32; 4]) -> Option<[u32; 4]> {
         match self {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),
+            Invoker::Vm { p, regs, bufs } => {
+                for &(r, src) in &p.inputs {
+                    regs[r as usize] = match src {
+                        Src::Position(c) => frag_pos[c as usize].to_bits(),
+                        Src::Location(l, c) => varyings[l as usize][c as usize],
+                        _ => 0,
+                    };
+                }
+                if vm::run(&p.code, regs, bufs) {
+                    return None;
+                }
+                let mut color = [0u32; 4];
+                for &(d, r) in &p.outputs {
+                    if let Dst::Location(0, c) = d {
+                        color[c as usize] = regs[r as usize];
+                    }
+                }
+                Some(color)
+            }
         }
     }
 }
