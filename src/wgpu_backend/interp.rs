@@ -1090,7 +1090,11 @@ pub fn run_fragment(
     };
     let mut out = [0u32; 4];
     for (i, c) in comps.iter().take(4).enumerate() {
-        out[i] = scalar_u32(c);
+        // integer targets return their value, float targets the f32 bits
+        out[i] = match c {
+            Value::F32(x) => x.to_bits(),
+            other => scalar_u32(other),
+        };
     }
     Some(out)
 }

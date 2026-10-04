@@ -243,6 +243,181 @@ fn run_stage_with(st: &Stage, res: &Resources<'_>, spec: bool) -> Vec<RawVertex>
     out
 }
 
+/// Run one snippet through every executor (and specialized): (ok, report line, declined count).
+fn run_case(name: &str, body: &str, interp: bool, res: &Resources<'_>, have_jit: bool) -> (bool, String, u32) {
+    let src = format!("{HEAD}{body}{TAIL}");
+    let mut declined = 0;
+    let sh = match Shader::parse(&src) {
+        Ok(s) => Arc::new(s),
+        Err(e) => return (false, format!("{name:<52} snippet does not parse: {e}"), 0),
+    };
+    // the oracle: interpreter if it supports the snippet, else the VM
+    let oracle_name = if interp { "interp" } else { "vm" };
+    let oracle = match Stage::build(sh.clone(), 0, oracle_name) {
+        Ok(s) => s,
+        Err(e) => return (true, format!("DECL  {name:<52} {e}"), 1),
+    };
+    let want = run_stage(&oracle, res);
+    let mut line = format!("{name:<52}");
+    let mut ok = true;
+    for mode in ["vm", "jit", "jitw"] {
+        if mode == oracle_name {
+            continue;
+        }
+        match Stage::build(sh.clone(), 0, mode) {
+            Err(e) => {
+                if mode.starts_with("jit") && !have_jit {
+                    line.push_str(&format!("  {mode}: n/a"));
+                } else {
+                    line.push_str(&format!("  {mode}: declined ({e})"));
+                    declined += 1;
+                }
+            }
+            Ok(st) => {
+                for spec in [false, true] {
+                    let got = run_stage_with(&st, res, spec);
+                    let tag = if spec { format!("{mode}+spec") } else { mode.to_string() };
+                    match got.iter().zip(&want).enumerate().find_map(|(i, (g, w))| diff(g, w).map(|d| (i, d))) {
+                        None => line.push_str(&format!("  {tag}: ok")),
+                        Some((i, d)) => {
+                            ok = false;
+                            line.push_str(&format!("  {tag}: MISMATCH at vertex {i}: {d}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !interp {
+        line.push_str("  (vs interp: n/a)");
+    }
+    (ok, line, declined)
+}
+
+/// Random snippet generator (deterministic xorshift): float expressions over
+/// the inputs `p`, `q`, `u` and `vi`, `var`s, if/else on comparisons, short
+/// `for` loops.
+pub struct Gen {
+    pub x: u64,
+}
+
+impl Gen {
+    fn next(&mut self) -> u64 {
+        self.x ^= self.x << 13;
+        self.x ^= self.x >> 7;
+        self.x ^= self.x << 17;
+        self.x
+    }
+    fn pick(&mut self, n: usize) -> usize {
+        (self.next() >> 20) as usize % n
+    }
+    fn leaf(&mut self, nv: usize, in_loop: bool) -> String {
+        match self.pick(if in_loop { 8 } else { 7 }) {
+            0 => ["p.x", "p.y", "p.z", "p.w"][self.pick(4)].into(),
+            1 => ["q.x", "q.y", "q.z", "q.w"][self.pick(4)].into(),
+            2 | 3 => ["u.x", "u.y", "u.z", "u.w"][self.pick(4)].into(),
+            4 => "f32(vi)".into(),
+            5 => format!("{:.2}", (self.pick(400) as f32 - 200.0) / 8.0),
+            6 if nv > 0 => format!("v{}", self.pick(nv)),
+            6 => "1.5".into(),
+            _ => "f32(i)".into(),
+        }
+    }
+    fn fexpr(&mut self, d: u32, nv: usize, in_loop: bool) -> String {
+        if d == 0 || self.pick(5) == 0 {
+            return self.leaf(nv, in_loop);
+        }
+        let a = self.fexpr(d - 1, nv, in_loop);
+        let b = self.fexpr(d - 1, nv, in_loop);
+        match self.pick(14) {
+            0 => format!("({a} + {b})"),
+            1 => format!("({a} - {b})"),
+            2 => format!("({a} * {b})"),
+            3 => format!("({a} / (abs({b}) + 1.0))"),
+            4 => format!("min({a}, {b})"),
+            5 => format!("max({a}, {b})"),
+            6 => format!("abs({a})"),
+            7 => format!("floor({a})"),
+            8 => {
+                let c = self.cond(d - 1, nv, in_loop);
+                format!("select({a}, {b}, {c})")
+            }
+            9 => format!("sqrt(abs({a}))"),
+            10 => format!("pow(abs({a}) + 0.25, 1.5)"),
+            11 => format!("(0.0 - {a})"),
+            12 => format!("trunc({a})"),
+            _ => format!("clamp({a}, -10.0, 10.0)"),
+        }
+    }
+    fn cond(&mut self, d: u32, nv: usize, in_loop: bool) -> String {
+        let a = self.fexpr(d.saturating_sub(1), nv, in_loop);
+        let b = self.fexpr(d.saturating_sub(1), nv, in_loop);
+        match self.pick(if d == 0 { 4 } else { 7 }) {
+            0 => format!("{a} < {b}"),
+            1 => format!("{a} > {b}"),
+            2 => format!("{a} >= {b}"),
+            3 => format!("u.x > {:.2}", self.pick(30) as f32 / 10.0),
+            4 => format!("({} && {})", self.cond(d - 1, nv, in_loop), self.cond(d - 1, nv, in_loop)),
+            5 => format!("({} || {})", self.cond(d - 1, nv, in_loop), self.cond(d - 1, nv, in_loop)),
+            _ => format!("!({})", self.cond(d - 1, nv, in_loop)),
+        }
+    }
+    fn stmts(&mut self, out: &mut String, nv: usize, depth: u32, in_loop: bool) {
+        for _ in 0..1 + self.pick(3) {
+            let k = self.pick(nv);
+            match self.pick(if depth == 0 { 3 } else { 6 }) {
+                0 | 1 => {
+                    let e = self.fexpr(3, nv, in_loop);
+                    out.push_str(&format!("        v{k} = {e};\n"));
+                }
+                2 => {
+                    let e = self.fexpr(2, nv, in_loop);
+                    out.push_str(&format!("        v{k} = v{k} + {e};\n"));
+                }
+                3 | 4 => {
+                    let c = self.cond(2, nv, in_loop);
+                    out.push_str(&format!("        if ({c}) {{\n"));
+                    self.stmts(out, nv, depth - 1, in_loop);
+                    if self.pick(2) == 0 {
+                        out.push_str("        } else {\n");
+                        self.stmts(out, nv, depth - 1, in_loop);
+                    }
+                    out.push_str("        }\n");
+                }
+                _ if !in_loop => {
+                    let n = 1 + self.pick(4);
+                    out.push_str(&format!("        for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{\n"));
+                    self.stmts(out, nv, depth - 1, true);
+                    out.push_str("        }\n");
+                }
+                _ => {}
+            }
+        }
+    }
+    /// `var v0..v5: f32` with random initializers and statements over them
+    /// (reading `p`, `q`, `u`, `vi` as in the vertex snippets)
+    pub fn vars(&mut self) -> String {
+        let mut s = String::new();
+        const NV: usize = 6;
+        for k in 0..NV {
+            let e = self.fexpr(2, k, false);
+            s.push_str(&format!("        var v{k}: f32 = {e};\n"));
+        }
+        self.stmts(&mut s, NV, 3, false);
+        s
+    }
+
+    fn body(&mut self) -> String {
+        let mut s = self.vars();
+        s.push_str(
+            "        let pos = vec4<f32>(v0, v1, v2, v3);
+        let a = vec4<u32>(u32(abs(v4)), u32(abs(v5)), vi, 0u);
+        let b = vec4<f32>(v4, v5, v0 + v1, 1.0);",
+        );
+        s
+    }
+}
+
 pub fn run() -> i32 {
     let data = data_bytes();
     let uni: Vec<u8> = [1.0f32, 2.0, 3.0, 0.5].iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -254,64 +429,31 @@ pub fn run() -> i32 {
     let mut failures = 0;
     let mut declined = 0;
     for c in CASES {
-        let src = format!("{HEAD}{}{TAIL}", c.body);
-        let sh = match Shader::parse(&src) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                println!("FAIL  {:<52} snippet does not parse: {e}", c.name);
-                failures += 1;
-                continue;
-            }
-        };
-        // the oracle: interpreter if it supports the snippet, else the VM
-        let oracle_name = if c.interp { "interp" } else { "vm" };
-        let oracle = match Stage::build(sh.clone(), 0, oracle_name) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("DECL  {:<52} {e}", c.name);
-                declined += 1;
-                continue;
-            }
-        };
-        let want = run_stage(&oracle, &res);
-        let mut line = format!("{:<52}", c.name);
-        let mut ok = true;
-        for mode in ["vm", "jit", "jitw"] {
-            if mode == oracle_name {
-                continue;
-            }
-            match Stage::build(sh.clone(), 0, mode) {
-                Err(e) => {
-                    if mode.starts_with("jit") && !have_jit {
-                        line.push_str(&format!("  {mode}: n/a"));
-                    } else {
-                        line.push_str(&format!("  {mode}: declined ({e})"));
-                        declined += 1;
-                    }
-                }
-                Ok(st) => {
-                    for spec in [false, true] {
-                        let got = run_stage_with(&st, &res, spec);
-                        let tag = if spec { format!("{mode}+spec") } else { mode.to_string() };
-                        match got.iter().zip(&want).enumerate().find_map(|(i, (g, w))| diff(g, w).map(|d| (i, d))) {
-                            None => line.push_str(&format!("  {tag}: ok")),
-                            Some((i, d)) => {
-                                ok = false;
-                                line.push_str(&format!("  {tag}: MISMATCH at vertex {i}: {d}"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !c.interp {
-            line.push_str("  (vs interp: n/a)");
-        }
+        let (ok, line, d) = run_case(c.name, c.body, c.interp, &res, have_jit);
+        declined += d;
         println!("{} {line}", if ok { "ok  " } else { "FAIL" });
         if !ok {
             failures += 1;
         }
     }
+    // random shaders: control flow on uniform- and input-dependent conditions,
+    // loops, mixed ops — through the optimizer, specialization, both JITs
+    let nfuzz: u32 = std::env::var("AKUMA_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let seed: u64 = std::env::var("AKUMA_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5EED);
+    let mut fuzz_bad = 0;
+    for k in 0..nfuzz {
+        let mut g = Gen { x: seed.wrapping_add(k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 };
+        let body = g.body();
+        let name = format!("fuzz #{k} (seed {:#x})", seed.wrapping_add(k as u64));
+        let (ok, line, d) = run_case(&name, &body, true, &res, have_jit);
+        declined += d;
+        if !ok {
+            fuzz_bad += 1;
+            failures += 1;
+            println!("FAIL {line}\n{body}");
+        }
+    }
+    println!("fuzz: {nfuzz} random shaders, {fuzz_bad} mismatching");
     if failures == 0 {
         println!("EXEC-SELFTEST OK ({declined} declined)");
         0

@@ -1142,6 +1142,134 @@ struct U { pad: vec4<f32>, dims: vec4<u32> };
     Ok(())
 }
 
+
+/// Random fragment shaders — a cell lookup, position-quantized coordinates,
+/// random float maths with branches and short loops on top — rendered by the
+/// default executors (JIT, memoization, run replication) and with forced
+/// specialization, against the interpreter. Some shaders leak the raw pixel
+/// position into the colour (run replication must back off), some depend only
+/// on the quantized position.
+fn t_fuzz_fragment(g: &Gpu) -> TestResult {
+    use crate::wgpu_backend::exec_selftest::Gen;
+    use std::sync::atomic::Ordering::Relaxed;
+    let n: u32 = std::env::var("AKUMA_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let (w, h) = (101u32, 67u32);
+    let fmt = wgpu::TextureFormat::Bgra8Unorm;
+    let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let bgl = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    });
+    let pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let mut cells = Vec::new();
+    let mut x = 0xBADC_0FFEu32;
+    for _ in 0..40 * 40 {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        cells.extend_from_slice(&x.to_le_bytes());
+    }
+    let cbuf = g.buffer(&cells, wgpu::BufferUsages::STORAGE);
+    for k in 0..n {
+        let mut rng = Gen { x: (0xF00D_u64 + k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1 };
+        let vars = rng.vars();
+        for leaky in [false, true] {
+            let cw = [3.0f32, 5.5, 8.0, 13.0][(k % 4) as usize];
+            let ch = [4.0f32, 2.5, 9.0, 16.0][((k / 4) % 4) as usize];
+            let src = format!(
+                "{FULL_TRI}
+@group(0) @binding(0) var<uniform> u: vec4<f32>;
+@group(0) @binding(1) var<storage, read> cells: array<u32>;
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{
+    let gp = vec2<i32>(floor((pos.xy - vec2<f32>(1.5, 0.25)) / vec2<f32>({cw:?}, {ch:?})));
+    let cx = u32(max(0, min(gp.x, 39)));
+    let cy = u32(max(0, min(gp.y, 39)));
+    let wd = cells[cy * 40u + cx];
+    let p = vec4<f32>(f32(wd & 255u) / 255.0, f32((wd >> 8u) & 255u) / 255.0, f32((wd >> 16u) & 255u) / 255.0, f32(gp.x));
+    let q = vec4<f32>(f32(gp.y), f32(wd >> 24u), {leak}, 1.0);
+    let vi = wd & 1023u;
+{vars}
+    return vec4<f32>(clamp(v0 * 0.1, 0.0, 1.0), clamp(v1 * 0.1, 0.0, 1.0), clamp(v2 * 0.1, 0.0, 1.0), 1.0);
+}}",
+                leak = if leaky { "pos.x * 0.07" } else { "q_const()" },
+            )
+            .replace("q_const()", "0.5");
+            if std::env::var_os("AKUMA_FUZZ_VERBOSE").is_some() {
+                eprintln!("--- fuzz #{k} leaky={leaky}\n{src}");
+            }
+            let make = || {
+                let m = g.module(&src);
+                g.pipeline(&m, &pl, fmt, None, wgpu::PrimitiveTopology::TriangleList, None, &[])
+            };
+            let draw = |p: &wgpu::RenderPipeline, uval: [f32; 4]| -> Vec<u8> {
+                let mut u = Vec::new();
+                for v in uval {
+                    u.extend_from_slice(&v.to_le_bytes());
+                }
+                let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
+                let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: cbuf.as_entire_binding() },
+                    ],
+                });
+                let target = g.texture(w, h, fmt);
+                g.pass(&target, Some(BLACK), |rp| {
+                    rp.set_pipeline(p);
+                    rp.set_bind_group(0, &bg, &[]);
+                    rp.draw(0..3, 0..1);
+                });
+                g.read(&target, w, h, 4)
+            };
+            // the reference: the interpreter
+            // SAFETY: tests run on one thread; nothing else reads the environment meanwhile
+            unsafe { std::env::set_var("AKUMA_EXEC", "interp") };
+            let pi = make();
+            unsafe { std::env::remove_var("AKUMA_EXEC") };
+            let pd = make();
+            for uval in [[1.0f32, 2.0, 3.0, 0.5], [0.25, -1.0, 7.5, 2.0]] {
+                let want = draw(&pi, uval);
+                for (what, spec, runs) in [("default", false, true), ("no runs", false, false), ("forced spec", true, true)] {
+                    crate::wgpu_backend::exec::FORCE_SPEC.store(spec, Relaxed);
+                    crate::wgpu_backend::runs::ENABLED.store(runs, Relaxed);
+                    let got = draw(&pd, uval);
+                    crate::wgpu_backend::exec::FORCE_SPEC.store(false, Relaxed);
+                    crate::wgpu_backend::runs::ENABLED.store(true, Relaxed);
+                    if got != want {
+                        let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap() / 4;
+                        return Err(format!(
+                            "fuzz #{k} leaky={leaky} u={uval:?} ({what}): pixel ({}, {}) = {:?}, interpreter {:?}\n{vars}",
+                            i as u32 % w,
+                            i as u32 / w,
+                            &got[i * 4..i * 4 + 4],
+                            &want[i * 4..i * 4 + 4]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
 /// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
 /// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
@@ -1618,6 +1746,7 @@ pub fn run() -> i32 {
         ("memoized + specialized fragment shader vs CPU", t_memo_spec),
         ("over-blending onto random texels vs scalar definition", t_over_blend_vector),
         ("position-quantization runs match per-pixel shading", t_runs),
+        ("random fragment shaders vs the interpreter", t_fuzz_fragment),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
     ];
     let mut failed = 0;
