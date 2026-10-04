@@ -74,6 +74,9 @@ pub struct Spec {
     folded: Vec<super::opt::Folded>,
 }
 
+/// Tests set this to specialize even tiny draws.
+pub static FORCE_SPEC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What `Stage::plan` decided for a draw: run the generic program (`None`)
 /// or a specialized one.
 pub type Plan = Option<Arc<Spec>>;
@@ -243,8 +246,9 @@ impl Stage {
     /// invocations of this stage; small draws are not worth a compile.
     pub fn plan(&self, res: &Resources<'_>, work: u64) -> Plan {
         let Stage::Compiled(c) = self else { return None };
+        let forced = FORCE_SPEC.load(std::sync::atomic::Ordering::Relaxed);
         if std::env::var("AKUMA_SPEC").as_deref() == Ok("0")
-            || work.saturating_mul(c.prog.code.len() as u64) < 20_000_000
+            || (!forced && work.saturating_mul(c.prog.code.len() as u64) < 20_000_000)
         {
             return None;
         }

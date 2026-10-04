@@ -1379,23 +1379,6 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
 
     // ---- vertex stage (batched) + primitive assembly ----
     let t_draw0 = crate::clock::monotonic();
-    let mut ids: Vec<(u32, u32)> = Vec::with_capacity(instances.len() * vertex_ids.len());
-    for inst in instances.clone() {
-        for &vid in &vertex_ids {
-            ids.push((vid as u32, inst));
-        }
-    }
-    // vertex memory is recycled between draws: fresh pages cost a page fault
-    // each (several microseconds on Akuma), which at 100k vertices rivals the
-    // shader work itself
-    let mut verts: Vec<super::exec::RawVertex> = scratch_take(&VERT_POOL);
-    verts.clear();
-    let t_vs0 = crate::clock::monotonic();
-    let vplan = pipe.vs.stage.plan(&res, ids.len() as u64);
-    let t_vs1 = crate::clock::monotonic();
-    // vertices are independent: big draws fetch attributes and run the
-    // vertex stage in chunks on all workers, results joined in order
-    let vthreads = if ids.len() >= 4096 { raster_threads(&[[0; 4]; 64], 1, 1).min(ids.len() / 1024) } else { 1 };
     // `Locks` holds raw pointers only for identity checks while locking;
     // fetching just reads the guarded bytes
     struct SyncLocks<'l, 'm>(&'l Locks<'m>);
@@ -1407,53 +1390,56 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         }
     }
     let sync_locks = SyncLocks(&locks);
-    let run_chunk = |chunk: &[(u32, u32)]| -> Vec<super::exec::RawVertex> {
+    let nv = vertex_ids.len().max(1);
+    let nverts = instances.len() * vertex_ids.len();
+    let inst0 = instances.start;
+    let t_vs0 = crate::clock::monotonic();
+    let vplan = pipe.vs.stage.plan(&res, nverts as u64);
+    let t_vs1 = crate::clock::monotonic();
+    // Vertices are independent: workers take fixed-size chunks, fetch the
+    // chunk's attributes a few hundred at a time (no big temporary arrays:
+    // fresh pages cost a page fault each on Akuma) and run the vertex stage.
+    // Chunk memory is recycled between draws for the same reason.
+    let nchunks = nverts.div_ceil(VCHUNK);
+    let slots: Vec<Mutex<Vec<super::exec::RawVertex>>> = (0..nchunks).map(|_| Mutex::new(Vec::new())).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let vwork = |_t: usize| {
         let locks = sync_locks.get();
-        let tc0 = crate::clock::monotonic();
-        let attrs: Vec<super::exec::Varyings> = chunk
-            .iter()
-            .map(|&(vid, inst)| fetch_attrs(pipe, st.vbufs, &vb_idx, locks, vid as i64, inst))
-            .collect();
-        let tc1 = crate::clock::monotonic();
         let mut inv = pipe.vs.stage.begin_with(&res, &vplan);
-        let mut out = scratch_take(&CHUNK_POOL);
-        out.clear();
-        out.reserve(chunk.len());
-        let tc2 = crate::clock::monotonic();
-        inv.run_vertex_batch(chunk, &attrs, &mut out);
-        if super::prof::enabled() {
-            let tc3 = crate::clock::monotonic();
-            let post = f64::from_bits(POST_T.load(std::sync::atomic::Ordering::Relaxed));
-            eprintln!("[vchunk] {} verts: starts +{:.2} ms, fetch {:.2} ms, begin {:.2} ms, run {:.2} ms, ends +{:.2}", chunk.len(), (tc0 - post) * 1e3, (tc1 - tc0) * 1e3, (tc2 - tc1) * 1e3, (tc3 - tc2) * 1e3, (tc3 - post) * 1e3);
+        let mut ids = [(0u32, 0u32); 256];
+        let mut attrs: Vec<super::exec::Varyings> = Vec::with_capacity(256);
+        loop {
+            let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c >= nchunks {
+                break;
+            }
+            let (lo, hi) = (c * VCHUNK, ((c + 1) * VCHUNK).min(nverts));
+            let mut out = scratch_take(&CHUNK_POOL);
+            out.clear();
+            out.reserve(hi - lo);
+            let mut k = lo;
+            while k < hi {
+                let m = (hi - k).min(256);
+                attrs.clear();
+                for j in 0..m {
+                    let vid = vertex_ids[(k + j) % nv];
+                    let inst = inst0 + ((k + j) / nv) as u32;
+                    ids[j] = (vid as u32, inst);
+                    attrs.push(fetch_attrs(pipe, st.vbufs, &vb_idx, locks, vid, inst));
+                }
+                inv.run_vertex_batch(&ids[..m], &attrs, &mut out);
+                k += m;
+            }
+            *slots[c].lock().unwrap() = out;
         }
-        out
     };
-    if vthreads <= 1 {
-        let part = run_chunk(&ids);
-        verts.extend_from_slice(&part);
-        scratch_give(&CHUNK_POOL, part);
-    } else {
-        let per = ids.len().div_ceil(vthreads).div_ceil(4) * 4;
-        let nchunks = ids.len().div_ceil(per);
-        let slots: Vec<Mutex<Vec<super::exec::RawVertex>>> = (0..nchunks).map(|_| Mutex::new(Vec::new())).collect();
-        let tj0 = crate::clock::monotonic();
-        POST_T.store(tj0.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        super::pool::run(nchunks, &|i| {
-            let lo = i * per;
-            let part = run_chunk(&ids[lo..(lo + per).min(ids.len())]);
-            *slots[i].lock().unwrap() = part;
-        });
-        if super::prof::enabled() {
-            eprintln!("[vs] pool {:.2} ms", (crate::clock::monotonic() - tj0) * 1e3);
-        }
-        let parts: Vec<Vec<super::exec::RawVertex>> =
-            slots.into_iter().map(|m| m.into_inner().unwrap()).collect();
-        verts.reserve(ids.len());
-        for part in parts {
-            verts.extend_from_slice(&part);
-            scratch_give(&CHUNK_POOL, part);
-        }
+    let vthreads = if nverts >= 4096 { raster_threads(&[[0; 4]; 64], 1, 1).min(nchunks) } else { 1 };
+    let tj0 = crate::clock::monotonic();
+    super::pool::run(vthreads.max(1), &vwork);
+    if super::prof::enabled() {
+        eprintln!("[vs] {vthreads} workers, {nchunks} chunks: {:.2} ms", (crate::clock::monotonic() - tj0) * 1e3);
     }
+    let verts = VertStore { parts: slots.into_iter().map(|m| m.into_inner().unwrap()).collect() };
     let t_vs2 = crate::clock::monotonic();
     // (a, b, c, provoking) as indices into `verts`
     let mut prims: Vec<[u32; 4]> = Vec::new();
@@ -1567,8 +1553,8 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         let mut each = |p: &[u32; 4]| {
             raster.triangle(
                 fs,
-                [&verts[p[0] as usize], &verts[p[1] as usize], &verts[p[2] as usize]],
-                &verts[p[3] as usize].varyings,
+                [verts.get(p[0] as usize), verts.get(p[1] as usize), verts.get(p[2] as usize)],
+                &verts.get(p[3] as usize).varyings,
             );
         };
         match &prim_rows {
@@ -1602,12 +1588,14 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
             }
         });
     }
-    scratch_give(&VERT_POOL, verts);
+    for part in verts.parts {
+        scratch_give(&CHUNK_POOL, part);
+    }
     if super::prof::enabled() {
         let t_end = crate::clock::monotonic();
         eprintln!(
             "[draw] {} verts, {} prims, est {} frags, {} threads: fetch {:.2} ms, vs plan {:.2} ms, vs run {:.2} ms, assembly+plan {:.2} ms, raster {:.2} ms",
-            ids.len(),
+            nverts,
             prims.len(),
             est_frags,
             threads,
@@ -1620,8 +1608,24 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     }
 }
 
-static POST_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static VERT_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
+const VSHIFT: usize = 13;
+/// vertices per chunk of the vertex stage's output
+const VCHUNK: usize = 1 << VSHIFT;
+
+/// The vertex stage's results, in `VCHUNK`-sized pieces so that workers fill
+/// them independently and nothing is concatenated.
+struct VertStore {
+    parts: Vec<Vec<super::exec::RawVertex>>,
+}
+
+impl VertStore {
+    #[inline]
+    fn get(&self, i: usize) -> &super::exec::RawVertex {
+        &self.parts[i >> VSHIFT][i & (VCHUNK - 1)]
+    }
+}
+
+
 static CHUNK_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
 
 fn scratch_take(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>) -> Vec<super::exec::RawVertex> {
@@ -1641,7 +1645,7 @@ fn scratch_give(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>, mut v: Vec<super
 /// vertices a long way).
 fn prim_row_ranges(
     prims: &[[u32; 4]],
-    verts: &[super::exec::RawVertex],
+    verts: &VertStore,
     vp: &super::raster::Viewport,
     ch: u32,
 ) -> Vec<(i64, i64)> {
@@ -1651,7 +1655,7 @@ fn prim_row_ranges(
             let mut lo = f32::INFINITY;
             let mut hi = f32::NEG_INFINITY;
             for &i in &p[..3] {
-                let [x, y, z, w] = verts[i as usize].position;
+                let [x, y, z, w] = verts.get(i as usize).position;
                 // inside the clip volume with room to spare: plain projection
                 if !(w > 1e-6 && z >= 0.0 && z <= w && x.abs() <= 4.0 * w && y.abs() <= 4.0 * w) {
                     return (0, ch as i64);
@@ -1670,7 +1674,7 @@ fn prim_row_ranges(
 /// worth specializing; precision does not matter.
 fn estimate_fragments(
     prims: &[[u32; 4]],
-    verts: &[super::exec::RawVertex],
+    verts: &VertStore,
     vp: &super::raster::Viewport,
     cw: u32,
     ch: u32,
@@ -1684,7 +1688,7 @@ fn estimate_fragments(
         let mut y1 = f32::NEG_INFINITY;
         let mut behind = false;
         for &i in &p[..3] {
-            let [x, y, _, w] = verts[i as usize].position;
+            let [x, y, _, w] = verts.get(i as usize).position;
             if !(w > 1e-9) {
                 behind = true;
                 break;

@@ -782,6 +782,140 @@ fn t_texture_copy(g: &Gpu) -> TestResult {
     expect(got[0] == 0 && got[1] == 0 && got[8] == 0, || "copy touched outside the block".into())
 }
 
+
+/// A fragment shader built to exercise memoization and specialization: its
+/// colour is a pure function of a loaded cell word (pow-heavy, with a branch
+/// on the word and one on a uniform), evaluated over cells of widths that
+/// make 4-pixel batches uniform (16), straddle cell edges (3, 5) and never
+/// repeat (1). Results must equal a CPU evaluation of the same f32 maths,
+/// with and without forced specialization, and again after the uniform that
+/// the specialization folded changes.
+fn t_memo_spec(g: &Gpu) -> TestResult {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (w, h) = (64u32, 16u32);
+    let fmt = wgpu::TextureFormat::Rgba8Unorm;
+    let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let bgl = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    });
+    let pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    for cw in [1u32, 3, 5, 16] {
+        let src = format!(
+            "{FULL_TRI}
+struct U {{ mode: u32, cols: u32, a: u32, b: u32 }};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> cells: array<u32>;
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    let cx = min(u32(p.x) / {cw}u, u.cols - 1u);
+    let cy = u32(p.y) / 4u;
+    let w = cells[cy * u.cols + cx];
+    var r = f32(w & 255u) / 255.0;
+    var g = f32((w >> 8u) & 255u) / 255.0;
+    var b = f32((w >> 16u) & 255u) / 255.0;
+    if (u.mode == 0u) {{
+        r = pow(r, 2.2); g = pow(g, 0.45); b = pow(b + 0.1, 1.7);
+    }} else {{
+        r = pow(r, 0.5) * 0.9; g = pow(g + 0.2, 3.0); b = pow(b, 1.25);
+    }}
+    if ((w & 1u) != 0u) {{ r = r * 0.5; }}
+    return vec4<f32>(r, g, b, 1.0);
+}}"
+        );
+        let m = g.module(&src);
+        let p = g.pipeline(&m, &pl, fmt, None, wgpu::PrimitiveTopology::TriangleList, None, &[]);
+        let cols = w.div_ceil(cw);
+        // runs of equal words, so batches hit, plus enough variety to miss
+        let mut cells = Vec::new();
+        let mut x = 0x2545_F491u32;
+        for r in 0..4u32 {
+            for c in 0..cols {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = if (c + r) % 4 == 0 { x } else { 0x00_80_40_21 };
+                cells.extend_from_slice(&(v & 0x00ff_ffff).to_le_bytes());
+            }
+        }
+        let cbuf = g.buffer(&cells, wgpu::BufferUsages::STORAGE);
+        for spec in [false, true] {
+            crate::wgpu_backend::exec::FORCE_SPEC.store(spec, Relaxed);
+            for mode in [0u32, 1, 0] {
+                let mut u = Vec::new();
+                for v in [mode, cols, 0, 0] {
+                    u.extend_from_slice(&v.to_le_bytes());
+                }
+                let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
+                let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: cbuf.as_entire_binding() },
+                    ],
+                });
+                let target = g.texture(w, h, fmt);
+                g.pass(&target, Some(BLACK), |rp| {
+                    rp.set_pipeline(&p);
+                    rp.set_bind_group(0, &bg, &[]);
+                    rp.draw(0..3, 0..1);
+                });
+                let px = g.read(&target, w, h, 4);
+                for y in 0..h {
+                    for xx in 0..w {
+                        let cx = (xx / cw).min(cols - 1);
+                        let o = ((y / 4) * cols + cx) as usize * 4;
+                        let word = u32::from_le_bytes([cells[o], cells[o + 1], cells[o + 2], cells[o + 3]]);
+                        let mut r = (word & 255) as f32 / 255.0;
+                        let mut gg = ((word >> 8) & 255) as f32 / 255.0;
+                        let mut b = ((word >> 16) & 255) as f32 / 255.0;
+                        if mode == 0 {
+                            r = r.powf(2.2);
+                            gg = gg.powf(0.45);
+                            b = (b + 0.1).powf(1.7);
+                        } else {
+                            r = r.powf(0.5) * 0.9;
+                            gg = (gg + 0.2).powf(3.0);
+                            b = b.powf(1.25);
+                        }
+                        if word & 1 != 0 {
+                            r *= 0.5;
+                        }
+                        let want = [to_u8(r), to_u8(gg), to_u8(b), 255];
+                        let at = ((y * w + xx) * 4) as usize;
+                        let got = [px[at], px[at + 1], px[at + 2], px[at + 3]];
+                        if got != want {
+                            crate::wgpu_backend::exec::FORCE_SPEC.store(false, Relaxed);
+                            return Err(format!(
+                                "cell width {cw}, spec {spec}, mode {mode}: pixel ({xx},{y}) = {got:?}, expected {want:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    crate::wgpu_backend::exec::FORCE_SPEC.store(false, Relaxed);
+    Ok(())
+}
+
 /// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
 /// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
 /// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
@@ -1229,6 +1363,7 @@ pub fn run() -> i32 {
         ("textureSample repeat + textureDimensions", t_texture_repeat_and_dims),
         ("sRGB texture decode on sample", t_texture_srgb),
         ("texture-to-texture copy with origins", t_texture_copy),
+        ("memoized + specialized fragment shader vs CPU", t_memo_spec),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
     ];
     let mut failed = 0;
