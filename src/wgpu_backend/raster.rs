@@ -427,6 +427,14 @@ impl Raster<'_> {
                         for (i, p) in px.iter().take(m).enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
+                    } else if let Some((sfc, sfa)) = plan.over {
+                        // blend all four against the destination at once
+                        let mut d = [0u8; 16];
+                        d[..m * 4].copy_from_slice(out);
+                        let px = format::blend_over4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], &d, bgra, sfc, sfa);
+                        for (i, p) in px.iter().take(m).enumerate() {
+                            out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+                        }
                     } else {
                         for i in 0..m {
                             let col = [c[0].0[i], c[1].0[i], c[2].0[i], c[3].0[i]];
@@ -709,6 +717,9 @@ struct PixelPlan {
     /// 8-bit RGBA/BGRA unorm target (Some(true) = BGRA) whose texels the
     /// vector encoder can write: 4 bytes, no sRGB conversion, all channels
     unorm8: Option<bool>,
+    /// premultiplied / straight "over" on an `unorm8` target:
+    /// (colour src factor is src alpha, alpha src factor is src alpha)
+    over: Option<(bool, bool)>,
 }
 
 impl PixelPlan {
@@ -731,6 +742,15 @@ impl PixelPlan {
                 wgpu::TextureFormat::Rgba8Unorm if wm == wgpu::ColorWrites::ALL => Some(false),
                 _ => None,
             },
+            over: c.blend.and_then(|b| {
+                let ok = |c: &wgpu::BlendComponent| {
+                    c.operation == BlendOperation::Add
+                        && matches!(c.src_factor, BlendFactor::One | BlendFactor::SrcAlpha)
+                        && c.dst_factor == BlendFactor::OneMinusSrcAlpha
+                };
+                (ok(&b.color) && ok(&b.alpha) && matches!(c.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm) && wm == wgpu::ColorWrites::ALL)
+                    .then_some((b.color.src_factor == BlendFactor::SrcAlpha, b.alpha.src_factor == BlendFactor::SrcAlpha))
+            }),
             opaque_is_store: c.blend.is_some_and(|b| {
                 let over = |c: &wgpu::BlendComponent| {
                     c.operation == BlendOperation::Add

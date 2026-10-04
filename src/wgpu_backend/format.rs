@@ -181,3 +181,62 @@ pub fn encode4_unorm8(lanes: [&[u32; 4]; 4], bgra: bool) -> ([u32; 4], bool) {
         (out, all_one)
     }
 }
+
+/// 4 pixels of "source over destination" into an 8-bit unorm RGBA/BGRA target
+/// (SSE2): `out = src * sf + dst * (1 - src.a)` per channel, where `sf` is 1
+/// or the source alpha (`sf_color_alpha` for the colour channels,
+/// `sf_alpha_alpha` for the alpha channel). `dst` holds the 4 destination
+/// texels in memory order. Bit-identical to `blend` + `decode` + `encode` for
+/// that blend state: the same f32 operations in the same order.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn blend_over4_unorm8(
+    lanes: [&[u32; 4]; 4],
+    dst: &[u8; 16],
+    bgra: bool,
+    sf_color_alpha: bool,
+    sf_alpha_alpha: bool,
+) -> [u32; 4] {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 is part of the x86_64 baseline
+    unsafe {
+        let zero = _mm_setzero_ps();
+        let one = _mm_set1_ps(1.0);
+        let k255 = _mm_set1_ps(255.0);
+        let half = _mm_set1_ps(0.5);
+        let ld = |p: &[u32; 4]| _mm_loadu_ps(p.as_ptr() as *const f32);
+        let a = ld(lanes[3]);
+        let df = _mm_sub_ps(one, a);
+        let d = _mm_loadu_si128(dst.as_ptr() as *const __m128i);
+        let mask = _mm_set1_epi32(0xff);
+        // destination channel j (memory order) as unorm f32
+        let dec = |j: u32| -> __m128 {
+            let b = match j {
+                0 => _mm_and_si128(d, mask),
+                1 => _mm_and_si128(_mm_srli_epi32(d, 8), mask),
+                2 => _mm_and_si128(_mm_srli_epi32(d, 16), mask),
+                _ => _mm_srli_epi32(d, 24),
+            };
+            _mm_div_ps(_mm_cvtepi32_ps(b), k255)
+        };
+        let q = |v: __m128| {
+            let c = _mm_min_ps(_mm_max_ps(v, zero), one);
+            _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(c, k255), half))
+        };
+        // shader channels in memory order
+        let (c0, c2) = if bgra { (lanes[2], lanes[0]) } else { (lanes[0], lanes[2]) };
+        let mem = [ld(c0), ld(lanes[1]), ld(c2), a];
+        let mut px = _mm_setzero_si128();
+        for j in 0..4u32 {
+            let s = mem[j as usize];
+            let is_alpha = j == 3;
+            let sf_alpha = if is_alpha { sf_alpha_alpha } else { sf_color_alpha };
+            let sterm = if sf_alpha { _mm_mul_ps(s, a) } else { s };
+            let out = _mm_add_ps(sterm, _mm_mul_ps(dec(j), df));
+            px = _mm_or_si128(px, _mm_sll_epi32(q(out), _mm_cvtsi32_si128(8 * j as i32)));
+        }
+        let mut out = [0u32; 4];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, px);
+        out
+    }
+}

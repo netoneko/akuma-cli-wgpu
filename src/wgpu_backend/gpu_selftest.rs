@@ -916,6 +916,76 @@ struct U {{ mode: u32, cols: u32, a: u32, b: u32 }};
     Ok(())
 }
 
+
+/// "over" blending of a position-dependent source (alpha 0..1 in steps) onto
+/// random destination texels, for both channel orders and both source factors,
+/// against the scalar definition (decode, f32 blend, encode).
+fn t_over_blend_vector(g: &Gpu) -> TestResult {
+    use crate::wgpu_backend::format;
+    let (w, h) = (67u32, 13u32);
+    let mut x = 0x1234_5678u32;
+    let mut dst = vec![0u8; (w * h * 4) as usize];
+    for b in dst.iter_mut() {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (x >> 24) as u8;
+    }
+    for fmt in [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm] {
+        for straight in [false, true] {
+            let mul = if straight { "1.0" } else { "a" };
+            let src = format!(
+                "{FULL_TRI}
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    let ix = u32(p.x); let iy = u32(p.y);
+    let a = f32((ix * 7u + iy * 13u) % 31u) / 30.0;
+    let r = f32((ix * 5u) % 17u) / 16.0;
+    let g = f32((iy * 3u + ix) % 19u) / 18.0;
+    let b = f32((ix + iy * 11u) % 23u) / 22.0;
+    return vec4<f32>(r * {mul}, g * {mul}, b * {mul}, a);
+}}"
+            );
+            let c = wgpu::BlendComponent {
+                src_factor: if straight { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::One },
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            };
+            let m = g.module(&src);
+            let p = g.pipeline(&m, &g.empty_layout(), fmt, Some(wgpu::BlendState { color: c, alpha: c }), wgpu::PrimitiveTopology::TriangleList, None, &[]);
+            let tex = g.texture(w, h, fmt);
+            g.upload(&tex, w, h, 4, &dst);
+            g.pass(&tex, None, |rp| {
+                rp.set_pipeline(&p);
+                rp.draw(0..3, 0..1);
+            });
+            let got = g.read(&tex, w, h, 4);
+            for iy in 0..h {
+                for ix in 0..w {
+                    let a = ((ix * 7 + iy * 13) % 31) as f32 / 30.0;
+                    let r = ((ix * 5) % 17) as f32 / 16.0;
+                    let gg = ((iy * 3 + ix) % 19) as f32 / 18.0;
+                    let b = ((ix + iy * 11) % 23) as f32 / 22.0;
+                    let m = if straight { 1.0 } else { a };
+                    let s = [r * m, gg * m, b * m, a];
+                    let at = ((iy * w + ix) * 4) as usize;
+                    let d = format::decode(fmt, &dst[at..at + 4]);
+                    let df = 1.0 - a;
+                    let sf = if straight { a } else { 1.0 };
+                    let o = [s[0] * sf + d[0] * df, s[1] * sf + d[1] * df, s[2] * sf + d[2] * df, s[3] * sf + d[3] * df];
+                    let mut want = [0u8; 4];
+                    format::encode(fmt, o, &mut want);
+                    if got[at..at + 4] != want {
+                        return Err(format!(
+                            "{fmt:?} straight={straight}: pixel ({ix},{iy}) = {:?}, expected {want:?}",
+                            &got[at..at + 4]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
 /// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
 /// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
@@ -1364,6 +1434,7 @@ pub fn run() -> i32 {
         ("sRGB texture decode on sample", t_texture_srgb),
         ("texture-to-texture copy with origins", t_texture_copy),
         ("memoized + specialized fragment shader vs CPU", t_memo_spec),
+        ("over-blending onto random texels vs scalar definition", t_over_blend_vector),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
     ];
     let mut failed = 0;
