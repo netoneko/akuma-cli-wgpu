@@ -273,23 +273,27 @@ so `forkpty`/`openpty` failed, and rio silently substituted a *dead context*
 **The panel setup** (config: `misc/akuma/config.toml` in the rio fork, installed as
 `/root/.config/rio/config.toml`; the previous one is `config.toml.bak`). Font Source Code Pro
 27 (a ~34 px line, 15% under the kernel console's 20×40 cell). Two side-by-side sessions for a
-panel whose right half is dead; every key is on Alt because the console tty cannot send Super
-or Ctrl+Shift (a tty byte stream has no encoding for them; the fb platform only sees bytes).
-**On the console today, use Esc then x**: the kernel's USB keyboard driver drops Alt
-entirely (Alt+D arrives as `d`; see kernel findings). Over ssh, real Alt works.
+panel whose right half is dead. The console tty cannot send Super or Ctrl+Shift (a tty byte
+stream has no encoding for them; the fb platform only sees bytes), and the kernel's keyboard
+drivers drop Alt (Alt+D arrives as `d`; see kernel findings). So every binding is
+**Esc, then a letter**: press and release Esc, then press the letter. (The bindings are
+declared as Alt+letter, which a terminal sends as ESC followed by the letter, so over ssh
+from a terminal with Alt/Option-as-Meta, real Alt works too.)
 
-| key | action |
+| keys (Esc, then…) | action |
 |---|---|
-| Alt+D | split: new session on the right |
-| Alt+S | swap (`SwapSplit`, added in the fork): the other session moves to the left pane, focused |
-| Alt+N | focus the other pane |
-| Alt+W | close the focused pane |
-| Alt+Q | quit (no confirmation: `confirm-before-quit = false`) |
+| Esc, D | split: new session on the right |
+| Esc, S | swap (`SwapSplit`, added in the fork): the other session moves to the left pane, focused |
+| Esc, N | focus the other pane |
+| Esc, W | close the focused pane |
+| Esc, Q | quit (no confirmation: `confirm-before-quit = false`) |
+| `exit` or Ctrl+D | end the shell; closes its pane, and rio with the last one |
 
 **CRT look** = `[renderer] filters = ["akuma-crt-2"]` (curved glass, scanlines, vignette, beam
 spread — `src/wgpu_backend/crt.rs`, applied while presenting; two tubes = one per pane;
 `"akuma-crt"` = one tube) plus the green-phosphor `[colors]` table. Cost ~35 ms effect + 11 ms
-copy per 4K frame. **To turn it off**, delete the block between `# --- CRT look` and
+copy per 4K frame. **Currently the warp is commented out** in the panel config (colours and
+cursor kept); uncomment the two `[renderer]`/`filters` lines to bring it back. **To turn it off**, delete the block between `# --- CRT look` and
 `# end CRT look` and restart rio; to keep the colours but get a flat picture, delete just
 the `[renderer]` table. rio's own librashader CRT (`filters = ["newpixiecrt"]`) now *runs*
 (`var<private>` globals were added to the compiler and interpreter) but takes 10-20 s per 4K
