@@ -266,7 +266,6 @@ impl Stage {
             cache.push(s.clone());
             return Some(s);
         }
-        let name = "specialized";
         let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
         let t0 = crate::clock::monotonic();
         let mut prog = c.template.clone();
@@ -281,7 +280,7 @@ impl Stage {
             prog.runs = super::runs::analyze(&prog);
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        let (jit, wide) = match backends(&prog, &c.force, name, false) {
+        let (jit, wide) = match backends(&prog, &c.force, "specialized", false) {
             Ok(x) => x,
             Err(_) => return None,
         };

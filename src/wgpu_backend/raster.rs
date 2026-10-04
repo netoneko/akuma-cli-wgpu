@@ -381,7 +381,7 @@ impl Raster<'_> {
                 prev_row = None;
                 y_budget = 0;
             } else if lo < hi && span_fast {
-                let mut row = |this: &mut Self, fs: &mut Invoker<'_>, a: i64, b: i64| -> bool {
+                let row = |this: &mut Self, fs: &mut Invoker<'_>, a: i64, b: i64| -> bool {
                     let w0 = [w_row[0] + dwdx[0] * a, w_row[1] + dwdx[1] * a, w_row[2] + dwdx[2] * a];
                     this.fast_span(
                         fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, py, min_x + a, w0, (b - a) as usize,

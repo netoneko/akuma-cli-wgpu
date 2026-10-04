@@ -402,9 +402,10 @@ fn compile_impl(p: &Program, wide: bool) -> Result<Jit, String> {
             _ => {}
         }
     }
+    let no_fwd = std::env::var_os("AKUMA_NOFWD").is_some();
     for (k, inst) in p.code.iter().enumerate() {
         starts.push(a.b.len());
-        a.held_in = if is_target[k] || std::env::var_os("AKUMA_NOFWD").is_some() { None } else { a.held };
+        a.held_in = if is_target[k] || no_fwd { None } else { a.held };
         a.held = None;
         if wide {
             emit_wide(&mut a, p, inst, &mut fixups, &mut bail_jumps)?;
@@ -735,7 +736,7 @@ fn emit_wide(
         }
         // a load whose four offsets agree (every pixel of a cell reads the same
         // word): one scalar load, broadcast; otherwise one load per lane
-        Inst::LoadBuf { d, buf, off, imm } if std::env::var_os("AKUMA_NOLB").is_none() => {
+        Inst::LoadBuf { d, buf, off, imm } => {
             a.vload(0, off);
             a.bytes(&[0x66, 0x0F, 0x70, 0xC8, 0x00]); // pshufd xmm1,xmm0,0
             a.vr(&[0x66], &[0x76], 1, 0); // pcmpeqd xmm1,xmm0

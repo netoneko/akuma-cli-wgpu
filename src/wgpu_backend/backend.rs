@@ -1448,7 +1448,6 @@ fn draw_standard(
                 break;
             }
             let (lo, hi) = (c * VCHUNK, ((c + 1) * VCHUNK).min(nverts));
-            let tq0 = crate::clock::monotonic();
             let mut out = scratch_take(&CHUNK_POOL);
             out.clear();
             out.reserve(hi - lo);
