@@ -270,6 +270,32 @@ so `forkpty`/`openpty` failed, and rio silently substituted a *dead context*
   appended to `/tmp/akuma-fb.log` alongside the fb input trace, one `write`
   per line so threads do not splice.
 
+**The panel setup** (config: `misc/akuma/config.toml` in the rio fork, installed as
+`/root/.config/rio/config.toml`; the previous one is `config.toml.bak`). Font Source Code Pro
+27 (a ~34 px line, 15% under the kernel console's 20×40 cell). Two side-by-side sessions for a
+panel whose right half is dead; every key is on Alt because the console tty cannot send Super
+or Ctrl+Shift (a tty byte stream has no encoding for them; the fb platform only sees bytes).
+**Alt+x also works as Esc, then x.**
+
+| key | action |
+|---|---|
+| Alt+D | split: new session on the right |
+| Alt+S | swap (`SwapSplit`, added in the fork): the other session moves to the left pane, focused |
+| Alt+N | focus the other pane |
+| Alt+W | close the focused pane |
+| Alt+Q | quit (no confirmation: `confirm-before-quit = false`) |
+
+**CRT look** = the `[colors]` table, a green-phosphor palette. To turn it off, delete
+the block between `# --- CRT look` and `# end CRT look` (or the whole `[colors]` table) and
+restart rio. rio's real CRT shader (`[renderer] filters = ["newpixiecrt"]`) **does not run
+yet**: librashader's translated WGSL uses `var<private>` globals, which our shader compiler
+rejects (`exec: main: cannot compile …: global in Private`, rio panics). Only tried under a
+throwaway `HOME=/tmp/crt-home`; do not put it in the real config until the backend handles
+private globals.
+
+Open: `ssh` from inside rio misbehaves (expected: under the pipe fallback ssh has no tty, so no
+raw mode and no remote pty; kernel ptys fix it). Cursor blink.
+
 Note: `/tmp/rio.log` on the box is only the expect harness's stderr
 redirect (the fb trace mirror), not rio's `--enable-log-file` log; the
 latter goes to `~/.config/rio/log/rio.log` and has never appeared on the box.
@@ -413,6 +439,12 @@ coordinate is not a quantization).
   Every terminal emulator's `openpty` fails. rio works around it in userspace (above); the real
   fix is a kernel pty device — spec in the kernel repo's
   `docs/archive/AKUMA_AMD64_RIO_FBDEV_BUILD.md`.
+* **One terminal state per console session.** Interactive children share the console shell's
+  termios (`spawn.rs`, `spawn_inherits_terminal`), so a raw-mode program killed with SIGKILL
+  leaves the console raw (no NL→CRLF) for everyone after it; `stty sane` repairs it. rio's fb
+  platform now heals a raw state it finds at startup.
+* **A shell can hang in its own exit** (seen once in four runs): `sh -i` on pipes, stdin at EOF,
+  printed its exit newline, last completed syscall `close(0)`, then state R forever, never a zombie.
 * **Orphans are never reaped.** A child whose parent is killed stays a zombie forever
   (`State: Z`, `PPid` = the dead parent); nothing reparents it to init. Killed rio instances
   pile up in `ps` this way.
