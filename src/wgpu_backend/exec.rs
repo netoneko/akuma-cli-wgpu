@@ -52,6 +52,83 @@ pub struct CompiledStage {
     /// handles batches whose lanes diverge)
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     pub wide: Option<super::jit::Jit>,
+    /// the optimized program before memoization: what per-draw
+    /// specialization starts from
+    template: Program,
+    /// which executor was asked for (`AKUMA_EXEC`), to build specializations alike
+    force: String,
+    /// recent specializations, newest last
+    spec_cache: std::sync::Mutex<Vec<Arc<Spec>>>,
+}
+
+/// A program specialized to the constant words of one draw's buffers, with
+/// its machine code. Valid for any draw whose buffers still hold the words it
+/// folded (`folded`).
+#[derive(Debug)]
+pub struct Spec {
+    pub prog: Program,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub jit: Option<super::jit::Jit>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub wide: Option<super::jit::Jit>,
+    folded: Vec<super::opt::Folded>,
+}
+
+/// What `Stage::plan` decided for a draw: run the generic program (`None`)
+/// or a specialized one.
+pub type Plan = Option<Arc<Spec>>;
+
+/// machine code for `prog`, per the executor policy `force`
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn backends(
+    prog: &Program,
+    force: &str,
+    name: &str,
+    verbose: bool,
+) -> Result<(Option<super::jit::Jit>, Option<super::jit::Jit>), String> {
+    let jit = if force == "vm" {
+        None
+    } else {
+        match super::jit::compile(prog) {
+            Ok(j) => {
+                if verbose {
+                    eprintln!("[exec] {name}: jit, {} bytes of x86-64", j.code_len());
+                }
+                Some(j)
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("[exec] {name}: jit declined ({e}), using vm");
+                }
+                None
+            }
+        }
+    };
+    if force == "jit" && jit.is_none() {
+        return Err("jit unavailable for this shader".into());
+    }
+    let wide = if jit.is_some() && force != "jit" && std::env::var("AKUMA_WIDE").as_deref() != Ok("0") {
+        match super::jit::compile_wide(prog) {
+            Ok(w) => {
+                if verbose {
+                    eprintln!("[exec] {name}: wide jit, {} bytes", w.code_len());
+                }
+                Some(w)
+            }
+            Err(e) => {
+                if force == "jitw" {
+                    return Err(format!("{name}: wide jit declined: {e}"));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if force == "jitw" && wide.is_none() {
+        return Err("wide jit unavailable".into());
+    }
+    Ok((jit, wide))
 }
 
 #[derive(Debug)]
@@ -79,8 +156,8 @@ impl Stage {
         let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
         let name = shader.module.entry_points[entry].name.clone();
         if force != "interp" {
-            match compile::compile(&shader, entry) {
-                Ok(prog) => {
+            match compile::compile_with_template(&shader, entry) {
+                Ok((prog, template)) => {
                     if verbose {
                         eprintln!(
                             "[exec] {name}: compiled, {} insts, {} regs",
@@ -89,57 +166,10 @@ impl Stage {
                         );
                     }
                     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                    let jit = if force == "vm" {
-                        None
-                    } else {
-                        match super::jit::compile(&prog) {
-                            Ok(j) => {
-                                if verbose {
-                                    eprintln!("[exec] {name}: jit, {} bytes of x86-64", j.code_len());
-                                }
-                                Some(j)
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("[exec] {name}: jit declined ({e}), using vm");
-                                }
-                                None
-                            }
-                        }
-                    };
-                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                    if force == "jit" && jit.is_none() {
-                        return Err("jit unavailable for this shader".into());
-                    }
+                    let (jit, wide) = backends(&prog, force, &name, verbose)?;
                     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
                     if force == "jit" {
                         return Err("jit unavailable on this target".into());
-                    }
-                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                    let wide = if jit.is_some()
-                        && force != "jit"
-                        && std::env::var("AKUMA_WIDE").as_deref() != Ok("0")
-                    {
-                        match super::jit::compile_wide(&prog) {
-                            Ok(w) => {
-                                if verbose {
-                                    eprintln!("[exec] {name}: wide jit, {} bytes", w.code_len());
-                                }
-                                Some(w)
-                            }
-                            Err(e) => {
-                                if force == "jitw" {
-                                    return Err(format!("{name}: wide jit declined: {e}"));
-                                }
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                    if force == "jitw" && wide.is_none() {
-                        return Err("wide jit unavailable".into());
                     }
                     return Ok(Stage::Compiled(CompiledStage {
                         prog,
@@ -147,6 +177,9 @@ impl Stage {
                         jit,
                         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                         wide,
+                        template,
+                        force: force.to_string(),
+                        spec_cache: std::sync::Mutex::new(Vec::new()),
                     }));
                 }
                 Err(e) => {
@@ -202,56 +235,147 @@ impl Stage {
 
     /// Bind the draw's buffers; the returned invoker runs invocations.
     pub fn begin<'a>(&'a self, res: &'a Resources<'a>) -> Invoker<'a> {
+        self.begin_with(res, &None)
+    }
+
+    /// Decide, once per draw, whether to run a program specialized to this
+    /// draw's constant buffer words. `work` is the draw's estimated number of
+    /// invocations of this stage; small draws are not worth a compile.
+    pub fn plan(&self, res: &Resources<'_>, work: u64) -> Plan {
+        let Stage::Compiled(c) = self else { return None };
+        if std::env::var("AKUMA_SPEC").as_deref() == Ok("0")
+            || work.saturating_mul(c.prog.code.len() as u64) < 20_000_000
+        {
+            return None;
+        }
+        let bufs: Vec<&[u8]> = c.prog.bufs.iter().map(|k| res.bufs.get(k).copied().unwrap_or(&[])).collect();
+        let valid = |s: &Spec| {
+            s.folded.iter().all(|&(b, addr, v)| {
+                let a = addr as usize;
+                let w = bufs[b as usize].get(a..a.wrapping_add(4)).map_or(0, |x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+                w == v
+            })
+        };
+        let mut cache = c.spec_cache.lock().unwrap();
+        if let Some(i) = cache.iter().position(|s| valid(s)) {
+            let s = cache.remove(i);
+            cache.push(s.clone());
+            return Some(s);
+        }
+        let name = "specialized";
+        let verbose = std::env::var_os("AKUMA_EXEC_VERBOSE").is_some();
+        let t0 = crate::clock::monotonic();
+        let mut prog = c.template.clone();
+        let folded = super::opt::optimize(&mut prog, Some(&bufs));
+        if prog.code.len() >= c.template.code.len() && folded.is_empty() {
+            return None;
+        }
+        let was = prog.code.len();
+        if self.is_fragment_program(&prog) {
+            super::memo::apply(&mut prog);
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let (jit, wide) = match backends(&prog, &c.force, name, false) {
+            Ok(x) => x,
+            Err(_) => return None,
+        };
+        if verbose {
+            eprintln!(
+                "[exec] specialized: {} -> {} insts ({} folded loads) in {:.2} ms",
+                c.template.code.len(),
+                was,
+                folded.len(),
+                (crate::clock::monotonic() - t0) * 1000.0
+            );
+        }
+        let s = Arc::new(Spec {
+            prog,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            jit,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            wide,
+            folded,
+        });
+        cache.push(s.clone());
+        if cache.len() > 6 {
+            cache.remove(0);
+        }
+        Some(s)
+    }
+
+    /// fragment programs write colour target 0 (vertex programs write position)
+    fn is_fragment_program(&self, p: &Program) -> bool {
+        p.outputs.iter().any(|(d, _)| matches!(d, Dst::Location(0, _)))
+            && !p.outputs.iter().any(|(d, _)| matches!(d, Dst::Position(_)))
+    }
+
+    pub fn begin_with<'a>(&'a self, res: &'a Resources<'a>, plan: &Plan) -> Invoker<'a> {
         match self {
             Stage::Interp(s) => Invoker::Interp { s, res },
             Stage::Compiled(c) => {
-                let bufs: Vec<&[u8]> = c
-                    .prog
+                // SAFETY: the specialization (if any) is kept alive by `hold`
+                // for as long as the invoker, and its heap contents never move
+                let prog: &'a Program = match plan {
+                    Some(sp) => unsafe { &*(&sp.prog as *const Program) },
+                    None => &c.prog,
+                };
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                let (jit, wide): (Option<&'a super::jit::Jit>, Option<&'a super::jit::Jit>) = match plan {
+                    Some(sp) => unsafe {
+                        (
+                            sp.jit.as_ref().map(|j| &*(j as *const super::jit::Jit)),
+                            sp.wide.as_ref().map(|j| &*(j as *const super::jit::Jit)),
+                        )
+                    },
+                    None => (c.jit.as_ref(), c.wide.as_ref()),
+                };
+                let hold = plan.clone();
+                let bufs: Vec<&[u8]> = prog
                     .bufs
                     .iter()
                     .map(|k| res.bufs.get(k).copied().unwrap_or(&[]))
                     .collect();
-                let texs: Vec<TexRef> = c
-                    .prog
+                let texs: Vec<TexRef> = prog
                     .texs
                     .iter()
                     .map(|k| res.texs.get(k).copied().unwrap_or(TexRef::EMPTY))
                     .collect();
-                let smps: Vec<SmpRef> = c
-                    .prog
+                let smps: Vec<SmpRef> = prog
                     .smps
                     .iter()
                     .map(|k| res.smps.get(k).copied().unwrap_or(SmpRef::DEFAULT))
                     .collect();
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                if let Some(j) = &c.jit {
+                if let Some(j) = jit {
                     let refs: Vec<super::jit::BufRef> = bufs
                         .iter()
                         .map(|b| super::jit::BufRef { ptr: b.as_ptr(), len: b.len() })
                         .collect();
-                    if let Some(w) = &c.wide {
+                    if let Some(w) = wide {
                         let scalar = Box::new(Invoker::Jit {
-                            p: &c.prog,
+                            p: prog,
                             j,
-                            regs: c.prog.init.clone(),
+                            regs: prog.init.clone(),
                             refs: refs.clone(),
                             texs: texs.clone(),
                             smps: smps.clone(),
+                            hold: hold.clone(),
                         });
                         return Invoker::Wide {
-                            p: &c.prog,
+                            p: prog,
                             w,
-                            regs: c.prog.init.iter().map(|&v| super::jit::L4([v; 4])).collect(),
+                            regs: prog.init.iter().map(|&v| super::jit::L4([v; 4])).collect(),
                             refs,
                             texs,
                             smps,
                             scalar,
-                            span: SpanRegs::new(&c.prog),
+                            span: SpanRegs::new(prog),
+                            hold,
                         };
                     }
-                    return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs, texs, smps };
+                    return Invoker::Jit { p: prog, j, regs: prog.init.clone(), refs, texs, smps, hold };
                 }
-                Invoker::Vm { p: &c.prog, regs: c.prog.init.clone(), bufs, texs, smps }
+                Invoker::Vm { p: prog, regs: prog.init.clone(), bufs, texs, smps, hold }
             }
         }
     }
@@ -265,6 +389,7 @@ pub enum Invoker<'a> {
         bufs: Vec<&'a [u8]>,
         texs: Vec<TexRef>,
         smps: Vec<SmpRef>,
+        hold: Plan,
     },
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     Jit {
@@ -274,6 +399,7 @@ pub enum Invoker<'a> {
         refs: Vec<super::jit::BufRef>,
         texs: Vec<TexRef>,
         smps: Vec<SmpRef>,
+        hold: Plan,
     },
     /// 4 invocations per call; `scalar` re-runs a batch whose lanes diverged
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -286,6 +412,7 @@ pub enum Invoker<'a> {
         smps: Vec<SmpRef>,
         scalar: Box<Invoker<'a>>,
         span: SpanRegs,
+        hold: Plan,
     },
 }
 
@@ -320,13 +447,13 @@ impl Invoker<'_> {
     pub fn run_vertex(&mut self, vertex_index: u32, instance_index: u32, attrs: &Varyings) -> RawVertex {
         match self {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
-            Invoker::Vm { p, regs, bufs, texs, smps } => {
+            Invoker::Vm { p, regs, bufs, texs, smps, .. } => {
                 vertex_in(p, regs, vertex_index, instance_index, attrs);
                 vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops, &p.memos);
                 vertex_out(p, regs)
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            Invoker::Jit { p, j, regs, refs, texs, smps } => {
+            Invoker::Jit { p, j, regs, refs, texs, smps, .. } => {
                 vertex_in(p, regs, vertex_index, instance_index, attrs);
                 j.run(regs, refs, texs, smps);
                 vertex_out(p, regs)
@@ -355,7 +482,7 @@ impl Invoker<'_> {
     pub fn run_fragment(&mut self, varyings: &Varyings, frag_pos: [f32; 4]) -> Option<[u32; 4]> {
         match self {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),
-            Invoker::Vm { p, regs, bufs, texs, smps } => {
+            Invoker::Vm { p, regs, bufs, texs, smps, .. } => {
                 frag_in(p, regs, varyings, frag_pos);
                 if vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops, &p.memos) {
                     return None;
@@ -363,7 +490,7 @@ impl Invoker<'_> {
                 Some(frag_out(p, regs))
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            Invoker::Jit { p, j, regs, refs, texs, smps } => {
+            Invoker::Jit { p, j, regs, refs, texs, smps, .. } => {
                 frag_in(p, regs, varyings, frag_pos);
                 if j.run(regs, refs, texs, smps) {
                     return None;

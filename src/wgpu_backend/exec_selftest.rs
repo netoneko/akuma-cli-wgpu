@@ -229,7 +229,13 @@ const N_VERTS: u32 = 300;
 
 /// through the batch entry point, so a wide stage really runs 4 lanes at a time
 fn run_stage(st: &Stage, res: &Resources<'_>) -> Vec<RawVertex> {
-    let mut inv = st.begin(res);
+    run_stage_with(st, res, false)
+}
+
+/// `spec`: run the program specialized to this draw's buffer contents
+fn run_stage_with(st: &Stage, res: &Resources<'_>, spec: bool) -> Vec<RawVertex> {
+    let plan = if spec { st.plan(res, u64::MAX) } else { None };
+    let mut inv = st.begin_with(res, &plan);
     let ids: Vec<(u32, u32)> = (0..N_VERTS).map(|v| (v, 0)).collect();
     let attrs = vec![[[0u32; 4]; super::exec::MAX_LOC]; N_VERTS as usize];
     let mut out = Vec::new();
@@ -284,12 +290,15 @@ pub fn run() -> i32 {
                     }
                 }
                 Ok(st) => {
-                    let got = run_stage(&st, &res);
-                    match got.iter().zip(&want).enumerate().find_map(|(i, (g, w))| diff(g, w).map(|d| (i, d))) {
-                        None => line.push_str(&format!("  {mode}: ok")),
-                        Some((i, d)) => {
-                            ok = false;
-                            line.push_str(&format!("  {mode}: MISMATCH at vertex {i}: {d}"));
+                    for spec in [false, true] {
+                        let got = run_stage_with(&st, &res, spec);
+                        let tag = if spec { format!("{mode}+spec") } else { mode.to_string() };
+                        match got.iter().zip(&want).enumerate().find_map(|(i, (g, w))| diff(g, w).map(|d| (i, d))) {
+                            None => line.push_str(&format!("  {tag}: ok")),
+                            Some((i, d)) => {
+                                ok = false;
+                                line.push_str(&format!("  {tag}: MISMATCH at vertex {i}: {d}"));
+                            }
                         }
                     }
                 }

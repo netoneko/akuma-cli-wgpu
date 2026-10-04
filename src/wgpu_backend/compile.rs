@@ -114,6 +114,12 @@ struct Lowerer<'m> {
 }
 
 pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
+    compile_with_template(sh, entry).map(|(p, _)| p)
+}
+
+/// The program, and the same program before memoization (the starting point
+/// for per-draw specialization, which must memoize after it has folded).
+pub fn compile_with_template(sh: &Shader, entry: usize) -> Res<(Program, Program)> {
     let m = &sh.module;
     let mut lw = Lowerer {
         m,
@@ -185,10 +191,11 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         memos: Vec::new(),
     };
     super::opt::optimize(&mut prog, None);
+    let template = prog.clone();
     if ep.stage == naga::ShaderStage::Fragment {
         super::memo::apply(&mut prog);
     }
-    Ok(prog)
+    Ok((prog, template))
 }
 
 fn scalar_k(s: naga::Scalar) -> Res<K> {

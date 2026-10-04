@@ -1339,9 +1339,6 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     for &(g, b, d) in &smp_binds {
         res.smps.insert((g, b), d);
     }
-    let mut vs_inv = pipe.vs.stage.begin(&res);
-    let mut fs_inv = fs_stage.begin(&res);
-
     let (cw, ch) = (st.color.size.width, st.color.size.height);
     let mut color_guard = match &*st.color.store {
         TexStore::Color(c) => c.lock().unwrap(),
@@ -1390,6 +1387,8 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         }
     }
     let mut verts: Vec<super::exec::RawVertex> = Vec::with_capacity(ids.len());
+    let vplan = pipe.vs.stage.plan(&res, ids.len() as u64);
+    let mut vs_inv = pipe.vs.stage.begin_with(&res, &vplan);
     vs_inv.run_vertex_batch(&ids, &attrs, &mut verts);
     // (a, b, c, provoking) as indices into `verts`
     let mut prims: Vec<[u32; 4]> = Vec::new();
@@ -1429,6 +1428,9 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         max_depth: 1.0,
     });
     let scissor = st.scissor.unwrap_or([0, 0, cw, ch]);
+    let est_frags = estimate_fragments(&prims, &verts, &viewport, cw, ch);
+    let fplan = fs_stage.plan(&res, est_frags);
+    let mut fs_inv = fs_stage.begin_with(&res, &fplan);
     let interp = fs_stage.frag_interp();
     let bpt = super::format::bytes_per_texel(target.format).unwrap() as usize;
     let depth_cfg = depth_state.map(|ds| {
@@ -1506,10 +1508,11 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     } else {
         let queue = Mutex::new(bands);
         let res_ref = &res;
+        let fplan_ref = &fplan;
         std::thread::scope(|sc| {
             for _ in 0..threads {
                 sc.spawn(|| {
-                    let mut fs = fs_stage.begin(res_ref);
+                    let mut fs = fs_stage.begin_with(res_ref, fplan_ref);
                     loop {
                         let next = queue.lock().unwrap().pop();
                         match next {
@@ -1521,6 +1524,51 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
             }
         });
     }
+}
+
+/// Rough upper bound on the fragments of a draw: the summed screen bounding
+/// boxes of its primitives, clipped to the target. Decides whether a stage is
+/// worth specializing; precision does not matter.
+fn estimate_fragments(
+    prims: &[[u32; 4]],
+    verts: &[super::exec::RawVertex],
+    vp: &super::raster::Viewport,
+    cw: u32,
+    ch: u32,
+) -> u64 {
+    let full = cw as u64 * ch as u64;
+    let mut total = 0u64;
+    for p in prims {
+        let mut x0 = f32::INFINITY;
+        let mut x1 = f32::NEG_INFINITY;
+        let mut y0 = f32::INFINITY;
+        let mut y1 = f32::NEG_INFINITY;
+        let mut behind = false;
+        for &i in &p[..3] {
+            let [x, y, _, w] = verts[i as usize].position;
+            if !(w > 1e-9) {
+                behind = true;
+                break;
+            }
+            let sx = vp.x + (x / w * 0.5 + 0.5) * vp.w;
+            let sy = vp.y + (0.5 - y / w * 0.5) * vp.h;
+            x0 = x0.min(sx);
+            x1 = x1.max(sx);
+            y0 = y0.min(sy);
+            y1 = y1.max(sy);
+        }
+        if behind {
+            total += full;
+        } else {
+            let w = (x1.min(cw as f32) - x0.max(0.0)).max(0.0);
+            let h = (y1.min(ch as f32) - y0.max(0.0)).max(0.0);
+            total += (w * h) as u64;
+        }
+        if total >= 1 << 40 {
+            break;
+        }
+    }
+    total
 }
 
 /// Worker count for a draw: 1 unless the draw is big enough to repay thread
