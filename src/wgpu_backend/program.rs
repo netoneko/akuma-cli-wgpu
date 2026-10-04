@@ -129,6 +129,43 @@ pub struct Program {
     pub tex_ops: Vec<super::texture::TexOp>,
 }
 
+impl Inst {
+    /// call `f` with every register this instruction reads
+    pub fn reads(&self, mut f: impl FnMut(R)) {
+        use Inst::*;
+        match *self {
+            Mov { s, .. } => f(s),
+            Const { .. } | Jmp { .. } | Kill | Ret => {}
+            FAdd { a, b, .. } | FSub { a, b, .. } | FMul { a, b, .. } | FDiv { a, b, .. }
+            | IAdd { a, b, .. } | ISub { a, b, .. } | IMul { a, b, .. } | And { a, b, .. }
+            | Or { a, b, .. } | Xor { a, b, .. } | Shl { a, b, .. } | ShrS { a, b, .. }
+            | ShrU { a, b, .. } | Cmp { a, b, .. } | Call { a, b, .. } => {
+                f(a);
+                f(b);
+            }
+            FNeg { a, .. } | FAbs { a, .. } | Sqrt { a, .. } | Not { a, .. } | I2F { a, .. }
+            | U2F { a, .. } => f(a),
+            Select { c, a, b, .. } => {
+                f(c);
+                f(a);
+                f(b);
+            }
+            // the cache registers are read and written by the instruction itself
+            CallC { a, b, c, .. } => {
+                f(a);
+                f(b);
+                for i in 0..4 {
+                    f(c + i);
+                }
+            }
+            LoadBuf { off, .. } => f(off),
+            // texture ops read their coordinates (Size reads none)
+            Tex { .. } => {}
+            Jz { c, .. } | Jnz { c, .. } => f(c),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

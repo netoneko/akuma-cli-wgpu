@@ -242,6 +242,20 @@ impl Invoker<'_> {
         }
     }
 
+    /// True when every fragment of a primitive produces the same result: the
+    /// stage reads no position and only flat varyings (buffers/textures are
+    /// constant for the draw). The rasterizer then runs it once per triangle.
+    pub fn constant_per_primitive(&self) -> bool {
+        let prog = match self {
+            Invoker::Vm { p, .. } => p,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Invoker::Jit { p, .. } => p,
+            Invoker::Interp { .. } => return false,
+        };
+        prog.interp.iter().all(|(_, m)| *m == Interp::Flat)
+            && !prog.inputs.iter().any(|(_, s)| matches!(s, Src::Position(_)))
+    }
+
     pub fn run_fragment(&mut self, varyings: &Varyings, frag_pos: [f32; 4]) -> Option<[u32; 4]> {
         match self {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),

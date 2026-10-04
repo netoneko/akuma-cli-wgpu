@@ -1536,6 +1536,10 @@ fn raster_tri(
     let provoking: &Varyings = &v[0].varyings;
     // per-fragment timers cost a syscall each on this kernel: only when asked
     let profiling = super::prof::level() >= 2;
+    // a stage that depends on neither position nor non-flat varyings gives
+    // the same answer for every pixel of this triangle: run it once
+    let constant_fs = fs.constant_per_primitive();
+    let mut cached: Option<Option<[u32; 4]>> = None;
 
     // scanline raster with per-pixel z interpolated along the edges
     let (wi, hi) = (w as i64, h as i64);
@@ -1578,7 +1582,14 @@ fn raster_tri(
                 // fragment stage for this pixel; it returns the four raw
                 // target-component values
                 let tf = if profiling { crate::clock::monotonic() } else { 0.0 };
-                let frag = fs.run_fragment(provoking, [x as f32 + 0.5, yy, z, 1.0]);
+                let frag = match (constant_fs, cached) {
+                    (true, Some(c)) => c,
+                    _ => {
+                        let c = fs.run_fragment(provoking, [x as f32 + 0.5, yy, z, 1.0]);
+                        cached = Some(c);
+                        c
+                    }
+                };
                 if profiling {
                     super::prof::add_ns(6, crate::clock::monotonic() - tf);
                     super::prof::inc(9, 1);

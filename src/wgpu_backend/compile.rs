@@ -150,6 +150,23 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
     lw.push(Inst::Ret);
     lw.resolve_labels()?;
 
+    // drop inputs nothing reads (e.g. an unused `@builtin(position)` member of
+    // a fragment input struct): they need not be written per invocation, and
+    // "does this stage depend on position?" becomes answerable
+    {
+        let mut read = vec![false; lw.nregs as usize];
+        for i in &lw.code {
+            i.reads(|r| read[r as usize] = true);
+        }
+        for op in &lw.tex_ops {
+            read[op.x as usize] = true;
+            read[op.y as usize] = true;
+        }
+        for (_, r) in &outputs {
+            read[*r as usize] = true;
+        }
+        lw.inputs.retain(|(r, _)| read[*r as usize]);
+    }
     let mut init = vec![0u32; lw.nregs as usize];
     for (r, v) in &lw.init {
         init[*r as usize] = *v;

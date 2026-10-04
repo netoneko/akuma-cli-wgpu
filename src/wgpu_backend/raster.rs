@@ -212,6 +212,9 @@ impl Raster<'_> {
         let (max_x, max_y) = (max_x.min(cw), max_y.min(ch));
         let flat_all = self.interp.iter().all(|(_, m)| *m == Interp::Flat);
         let mut var: Varyings = *provoking;
+        // position-independent flat shader: one evaluation per triangle
+        let constant_fs = fs.constant_per_primitive();
+        let mut cached: Option<Option<[u32; 4]>> = None;
 
         for py in min_y..max_y {
             let mut w = w_row;
@@ -238,7 +241,15 @@ impl Raster<'_> {
                         if !flat_all {
                             self.interpolate(&mut var, provoking, &s, &l, invw);
                         }
-                        if let Some(c) = fs.run_fragment(&var, [px as f32 + 0.5, py as f32 + 0.5, zf, invw as f32]) {
+                        let frag = match (constant_fs, cached) {
+                            (true, Some(c)) => c,
+                            _ => {
+                                let c = fs.run_fragment(&var, [px as f32 + 0.5, py as f32 + 0.5, zf, invw as f32]);
+                                cached = Some(c);
+                                c
+                            }
+                        };
+                        if let Some(c) = frag {
                             if let Some(d) = &mut self.depth {
                                 if d.write {
                                     d.data[idx] = zf;
