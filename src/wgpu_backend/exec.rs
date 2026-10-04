@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::compile;
 use super::interp::{self, Resources, Shader, Value};
-use super::program::{Dst, Program, Src};
+use super::program::{Dst, Interp, Program, Src};
 use super::vm;
 
 /// How many `@location` slots a stage interface may use (rio's shaders use
@@ -129,6 +129,25 @@ impl Stage {
         Ok(Stage::Interp(InterpStage::new(shader, entry)))
     }
 
+    /// (location, interpolation) of the stage's `@location` inputs
+    pub fn frag_interp(&self) -> Vec<(u32, Interp)> {
+        match self {
+            Stage::Compiled(c) => c.prog.interp.clone(),
+            Stage::Interp(s) => s
+                .frag_inputs
+                .iter()
+                .map(|(l, ty)| {
+                    let float = matches!(
+                        &s.shader.module.types[*ty].inner,
+                        naga::TypeInner::Scalar(sc) | naga::TypeInner::Vector { scalar: sc, .. }
+                            if sc.kind == naga::ScalarKind::Float
+                    );
+                    (*l, if float { Interp::Perspective } else { Interp::Flat })
+                })
+                .collect(),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Interp(_) => "interp",
@@ -171,17 +190,18 @@ pub enum Invoker<'a> {
 }
 
 impl Invoker<'_> {
-    pub fn run_vertex(&mut self, vertex_index: u32, instance_index: u32) -> RawVertex {
+    /// `attrs`: the vertex-buffer attributes for this invocation, by location
+    pub fn run_vertex(&mut self, vertex_index: u32, instance_index: u32, attrs: &Varyings) -> RawVertex {
         match self {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
             Invoker::Vm { p, regs, bufs } => {
-                vertex_in(p, regs, vertex_index, instance_index);
+                vertex_in(p, regs, vertex_index, instance_index, attrs);
                 vm::run(&p.code, regs, bufs);
                 vertex_out(p, regs)
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             Invoker::Jit { p, j, regs, refs } => {
-                vertex_in(p, regs, vertex_index, instance_index);
+                vertex_in(p, regs, vertex_index, instance_index, attrs);
                 j.run(regs, refs);
                 vertex_out(p, regs)
             }
@@ -306,13 +326,13 @@ fn bits_value(sh: &Shader, ty: naga::Handle<naga::Type>, bits: &[u32; 4]) -> Val
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn vertex_in(p: &Program, regs: &mut [u32], vertex_index: u32, instance_index: u32) {
+fn vertex_in(p: &Program, regs: &mut [u32], vertex_index: u32, instance_index: u32, attrs: &Varyings) {
     for &(r, src) in &p.inputs {
         regs[r as usize] = match src {
             Src::VertexIndex => vertex_index,
             Src::InstanceIndex => instance_index,
-            // vertex attributes: no vertex buffers yet
-            _ => 0,
+            Src::Location(l, c) => attrs[l as usize][c as usize],
+            Src::Position(_) => 0,
         };
     }
 }

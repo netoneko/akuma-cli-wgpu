@@ -33,7 +33,7 @@ use naga::{
 use super::interp::{
     align_of, array_stride, member_offsets, size_of, vec_stride, vsize, w, Shader,
 };
-use super::program::{Cmp, Dst, Fun, Inst, Program, Src, R};
+use super::program::{Cmp, Dst, Fun, Inst, Interp, Program, Src, R};
 
 type Res<T> = Result<T, String>;
 
@@ -98,6 +98,7 @@ struct Lowerer<'m> {
     kconst: HashMap<R, u32>,
     bufs: Vec<(u32, u32)>,
     inputs: Vec<(R, Src)>,
+    interp: Vec<(u32, Interp)>,
     labels: Vec<Option<u32>>,
     gmemo: Vec<Option<Lv>>,
 }
@@ -113,6 +114,7 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         kconst: HashMap::new(),
         bufs: Vec::new(),
         inputs: Vec::new(),
+        interp: Vec::new(),
         labels: Vec::new(),
         gmemo: vec![None; m.global_expressions.len()],
     };
@@ -146,6 +148,7 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         bufs: lw.bufs,
         inputs: lw.inputs,
         outputs,
+        interp: lw.interp,
     })
 }
 
@@ -311,6 +314,17 @@ impl<'m> Lowerer<'m> {
                 let lv = self.alloc(ty)?;
                 let mut ls = Vec::new();
                 leaves(&lv, &mut ls);
+                if let naga::Binding::Location { location, interpolation, .. } = b {
+                    // integers cannot be interpolated; floats default to perspective
+                    let int_typed = ls.first().is_some_and(|(_, k)| *k != K::F);
+                    let mode = match interpolation {
+                        _ if int_typed => Interp::Flat,
+                        Some(naga::Interpolation::Flat) => Interp::Flat,
+                        Some(naga::Interpolation::Linear) => Interp::Linear,
+                        _ => Interp::Perspective,
+                    };
+                    self.interp.push((*location, mode));
+                }
                 for (i, (r, _)) in ls.iter().enumerate() {
                     let src = match b {
                         naga::Binding::BuiltIn(BuiltIn::VertexIndex) => Src::VertexIndex,

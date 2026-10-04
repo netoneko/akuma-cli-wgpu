@@ -74,6 +74,14 @@ pub enum Inst {
     Ret,
 }
 
+/// How a fragment `@location` input varies across a primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interp {
+    Flat,
+    Linear,
+    Perspective,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Src {
     VertexIndex,
@@ -102,6 +110,8 @@ pub struct Program {
     pub bufs: Vec<(u32, u32)>,
     pub inputs: Vec<(R, Src)>,
     pub outputs: Vec<(Dst, R)>,
+    /// (location, interpolation) of each `@location` input (fragment stage)
+    pub interp: Vec<(u32, Interp)>,
 }
 
 // ---------------------------------------------------------------------------

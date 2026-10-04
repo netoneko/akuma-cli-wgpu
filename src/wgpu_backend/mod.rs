@@ -41,6 +41,8 @@ pub mod interp;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod jit;
 pub mod program;
+pub mod raster;
+pub mod vertex;
 pub mod vm;
 pub mod shaders;
 

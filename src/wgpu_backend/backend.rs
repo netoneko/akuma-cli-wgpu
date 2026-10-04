@@ -108,6 +108,41 @@ pub struct RenderPipelineData {
     pub fs: Option<StageData>,
     pub depth: Option<wgpu::DepthStencilState>,
     pub groups: Vec<Arc<BindGroupLayoutData>>,
+    pub topology: wgpu::PrimitiveTopology,
+    pub cull: Option<wgpu::Face>,
+    pub front: wgpu::FrontFace,
+    /// color target 0 (the only one the backend draws to)
+    pub target: Option<TargetInfo>,
+    pub vbufs: Vec<VtxLayout>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TargetInfo {
+    pub format: wgpu::TextureFormat,
+    pub blend: Option<wgpu::BlendState>,
+    pub write_mask: wgpu::ColorWrites,
+}
+
+#[derive(Clone, Debug)]
+pub struct VtxAttr {
+    pub format: wgpu::VertexFormat,
+    pub offset: u64,
+    pub location: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct VtxLayout {
+    pub stride: u64,
+    pub step: wgpu::VertexStepMode,
+    pub attrs: Vec<VtxAttr>,
+}
+
+impl RenderPipelineData {
+    /// the demo's raw-bytes contract (pixel-space positions, flat varyings,
+    /// no blending) vs. standard wgpu semantics
+    pub fn legacy(&self) -> bool {
+        self.target.as_ref().is_none_or(|t| super::format::is_legacy_raw(t.format))
+    }
 }
 
 pub struct CommandBufferShared {
@@ -179,8 +214,8 @@ pub enum Cmd {
 pub struct RenderPassData {
     /// (texture, load: true = clear to the color, false = keep contents)
     pub color: Option<(Arc<TextureData>, bool, wgpu::Color)>,
-    /// (depth texture, clear value)
-    pub depth: Option<(Arc<TextureData>, f32)>,
+    /// (depth texture, clear value; None = keep contents)
+    pub depth: Option<(Arc<TextureData>, Option<f32>)>,
     pub cmds: Vec<PassCmd>,
 }
 
@@ -192,6 +227,29 @@ pub enum PassCmd {
         vertices: std::ops::Range<u32>,
         instances: std::ops::Range<u32>,
     },
+    DrawIndexed {
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
+    },
+    SetVertexBuffer {
+        slot: u32,
+        buf: Option<BufBind>,
+    },
+    SetIndexBuffer {
+        buf: BufBind,
+        format: wgpu::IndexFormat,
+    },
+    SetViewport(super::raster::Viewport),
+    SetScissor([u32; 4]),
+    SetBlendConstant(wgpu::Color),
+}
+
+/// a buffer bound at an offset (vertex/index buffers)
+#[derive(Debug, Clone)]
+pub struct BufBind {
+    pub bytes: Arc<Mutex<Vec<u8>>>,
+    pub offset: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,11 +485,10 @@ impl wgpu::custom::DeviceInterface for Device {
     ) -> wgpu::custom::DispatchRenderPipeline {
         if let Some(f) = &desc.fragment {
             for t in f.targets.iter().flatten() {
-                match t.format {
-                    wgpu::TextureFormat::Rgba8Uint => {}
-                    other => panic!(
-                        "akuma backend: only bgra8uint render targets are supported, got {other:?}"
-                    ),
+                if super::format::bytes_per_texel(t.format).is_none()
+                    || super::format::is_depth(t.format)
+                {
+                    panic!("akuma backend: unsupported render target format {:?}", t.format);
                 }
             }
         }
@@ -448,11 +505,46 @@ impl wgpu::custom::DeviceInterface for Device {
             .and_then(|l| l.as_custom::<PipelineLayoutData>())
             .map(|pl| pl.groups.clone())
             .unwrap_or_default();
+        let target = desc
+            .fragment
+            .as_ref()
+            .and_then(|f| f.targets.first().cloned().flatten())
+            .map(|t| TargetInfo { format: t.format, blend: t.blend, write_mask: t.write_mask });
+        let vbufs = desc
+            .vertex
+            .buffers
+            .iter()
+            .map(|b| match b {
+                None => VtxLayout { stride: 0, step: wgpu::VertexStepMode::Vertex, attrs: Vec::new() },
+                Some(b) => VtxLayout {
+                stride: b.array_stride,
+                step: b.step_mode,
+                attrs: b
+                    .attributes
+                    .iter()
+                    .map(|a| {
+                        assert!(
+                            (a.shader_location as usize) < super::exec::MAX_LOC,
+                            "akuma backend: vertex attribute location {} >= {}",
+                            a.shader_location,
+                            super::exec::MAX_LOC
+                        );
+                        VtxAttr { format: a.format, offset: a.offset, location: a.shader_location }
+                    })
+                    .collect(),
+                },
+            })
+            .collect();
         wgpu::custom::DispatchRenderPipeline::custom(RenderPipelineData {
             vs,
             fs,
             depth: desc.depth_stencil.clone(),
             groups,
+            topology: desc.primitive.topology,
+            cull: desc.primitive.cull_mode,
+            front: desc.primitive.front_face,
+            target,
+            vbufs,
         })
     }
 
@@ -931,45 +1023,60 @@ struct Vtx {
 }
 
 fn execute_render(data: RenderPassData) {
-    // clear / load
-    if let Some((tex, do_clear, clear)) = &data.color {
-        if *do_clear {
-            // rgba8uint: the clear color components land on the raw texel
-            // components in r,g,b,a order (no conversion — this target is
-            // bytes; the demo only ever uses Load anyway)
-            let mut c = match &*tex.store {
-                TexStore::Color(c) => c.lock().unwrap(),
-                TexStore::Depth(_) => unreachable!(),
-            };
+    let (color_tex, do_clear, clear) = match &data.color {
+        Some((tex, do_clear, clear)) => (tex.clone(), *do_clear, *clear),
+        None => panic!("akuma backend: render pass without color attachment"),
+    };
+
+    // color clear: the demo's raw Rgba8Uint target takes the components as
+    // bytes; every other format goes through the format encoder (so sRGB
+    // targets get the linear clear color encoded properly)
+    if do_clear {
+        let mut c = match &*color_tex.store {
+            TexStore::Color(c) => c.lock().unwrap(),
+            TexStore::Depth(_) => unreachable!(),
+        };
+        if super::format::is_legacy_raw(color_tex.format) {
             for px in c.chunks_exact_mut(4) {
                 px[0] = clear.r as u8;
                 px[1] = clear.g as u8;
                 px[2] = clear.b as u8;
                 px[3] = clear.a as u8;
             }
+        } else {
+            let bpt = color_tex.bytes_per_texel() as usize;
+            let mut one = [0u8; 4];
+            super::format::encode(
+                color_tex.format,
+                [clear.r as f32, clear.g as f32, clear.b as f32, clear.a as f32],
+                &mut one,
+            );
+            for px in c.chunks_exact_mut(bpt) {
+                px.copy_from_slice(&one[..bpt]);
+            }
         }
     }
     let mut depth: Option<Arc<TextureData>> = None;
     if let Some((dtex, clear)) = &data.depth {
-        let mut z = match &*dtex.store {
-            TexStore::Depth(d) => d.lock().unwrap(),
-            TexStore::Color(_) => unreachable!(),
-        };
-        z.fill(*clear);
+        if let Some(v) = clear {
+            let mut z = match &*dtex.store {
+                TexStore::Depth(d) => d.lock().unwrap(),
+                TexStore::Color(_) => unreachable!(),
+            };
+            z.fill(*v);
+        }
         depth = Some(dtex.clone());
     }
 
-    let (color_store, w, h) = match &data.color {
-        Some((tex, ..)) => (
-            tex.store.clone(),
-            tex.size.width as usize,
-            tex.size.height as usize,
-        ),
-        None => panic!("akuma backend: render pass without color attachment"),
-    };
+    let (w, h) = (color_tex.size.width as usize, color_tex.size.height as usize);
 
     let mut pipe: Option<RenderPipelineData> = None;
     let mut groups: Vec<Option<BindGroupData>> = Vec::new();
+    let mut vbufs: Vec<Option<BufBind>> = Vec::new();
+    let mut ibuf: Option<(BufBind, wgpu::IndexFormat)> = None;
+    let mut viewport: Option<super::raster::Viewport> = None;
+    let mut scissor: Option<[u32; 4]> = None;
+    let mut blend_const = [0.0f32; 4];
 
     for cmd in data.cmds {
         match cmd {
@@ -980,54 +1087,315 @@ fn execute_render(data: RenderPassData) {
                 }
                 groups[i as usize] = Some(bg);
             }
-            PassCmd::Draw {
-                vertices,
-                instances,
-            } => {
+            PassCmd::SetVertexBuffer { slot, buf } => {
+                if vbufs.len() <= slot as usize {
+                    vbufs.resize(slot as usize + 1, None);
+                }
+                vbufs[slot as usize] = buf;
+            }
+            PassCmd::SetIndexBuffer { buf, format } => ibuf = Some((buf, format)),
+            PassCmd::SetViewport(v) => viewport = Some(v),
+            PassCmd::SetScissor(s) => scissor = Some(s),
+            PassCmd::SetBlendConstant(c) => {
+                blend_const = [c.r as f32, c.g as f32, c.b as f32, c.a as f32]
+            }
+            PassCmd::Draw { vertices, instances } => {
                 let pipe = pipe.as_ref().expect("draw without a pipeline");
-                let depth_st = pipe
-                    .depth
-                    .as_ref()
-                    .expect("akuma backend: draws require a depth-stencil state");
-                let ztex = depth
-                    .as_ref()
-                    .expect("akuma backend: draws require a depth attachment");
-                let guards = lock_buffers(&groups);
-                let res = build_resources(&guards);
-                let mut zbuf = match &*ztex.store {
-                    TexStore::Depth(d) => d.lock().unwrap(),
-                    TexStore::Color(_) => unreachable!(),
+                if pipe.legacy() {
+                    draw_legacy(pipe, &groups, &color_tex, depth.as_ref(), w, h, vertices, instances);
+                } else {
+                    let st = StdDrawState {
+                        pipe,
+                        groups: &groups,
+                        vbufs: &vbufs,
+                        ibuf: None,
+                        color: &color_tex,
+                        depth: depth.as_ref(),
+                        viewport,
+                        scissor,
+                        blend_const,
+                    };
+                    draw_standard(&st, StdDraw::Direct { vertices, instances });
+                }
+            }
+            PassCmd::DrawIndexed { indices, base_vertex, instances } => {
+                let pipe = pipe.as_ref().expect("draw without a pipeline");
+                assert!(!pipe.legacy(), "akuma backend: indexed draws need a standard-mode target");
+                let st = StdDrawState {
+                    pipe,
+                    groups: &groups,
+                    vbufs: &vbufs,
+                    ibuf: ibuf.as_ref().map(|(b, f)| (b, *f)),
+                    color: &color_tex,
+                    depth: depth.as_ref(),
+                    viewport,
+                    scissor,
+                    blend_const,
                 };
-                let mut color = match &*color_store {
-                    TexStore::Color(c) => c.lock().unwrap(),
-                    TexStore::Depth(_) => unreachable!(),
-                };
-                let mut vs_inv = pipe.vs.stage.begin(&res);
-                let mut fs_inv = pipe
-                    .fs
-                    .as_ref()
-                    .expect("akuma backend: draw needs a fragment stage")
-                    .stage
-                    .begin(&res);
-                for inst in instances.clone() {
-                    // vertex stage: one interpreter invocation per corner
-                    let tv = crate::clock::monotonic();
-                    let mut verts = Vec::with_capacity((vertices.end - vertices.start) as usize);
-                    for vi in vertices.clone() {
-                        verts.push(vs_inv.run_vertex(vi, inst));
-                    }
-                    super::prof::add_ns(4, crate::clock::monotonic() - tv);
-                    super::prof::inc(8, verts.len() as u64);
-                    let tr = crate::clock::monotonic();
-                    for tri in verts.chunks_exact(3) {
-                        raster_tri(tri, &mut fs_inv, depth_st, &mut zbuf, &mut color, w, h);
-                    }
-                    // raster total minus the fragment time raster_tri booked
-                    super::prof::add_ns(5, crate::clock::monotonic() - tr);
+                draw_standard(&st, StdDraw::Indexed { indices, base_vertex, instances });
+            }
+        }
+    }
+}
+
+/// The demo's draw: raw Rgba8Uint target, pixel-space positions, flat
+/// varyings, the softrender-contract scanline walk (`raster_tri`).
+#[allow(clippy::too_many_arguments)]
+fn draw_legacy(
+    pipe: &RenderPipelineData,
+    groups: &[Option<BindGroupData>],
+    color_tex: &Arc<TextureData>,
+    depth: Option<&Arc<TextureData>>,
+    w: usize,
+    h: usize,
+    vertices: std::ops::Range<u32>,
+    instances: std::ops::Range<u32>,
+) {
+    let depth_st = pipe
+        .depth
+        .as_ref()
+        .expect("akuma backend: draws require a depth-stencil state");
+    let ztex = depth.expect("akuma backend: draws require a depth attachment");
+    let guards = lock_buffers(groups);
+    let res = build_resources(&guards);
+    let mut zbuf = match &*ztex.store {
+        TexStore::Depth(d) => d.lock().unwrap(),
+        TexStore::Color(_) => unreachable!(),
+    };
+    let mut color = match &*color_tex.store {
+        TexStore::Color(c) => c.lock().unwrap(),
+        TexStore::Depth(_) => unreachable!(),
+    };
+    let mut vs_inv = pipe.vs.stage.begin(&res);
+    let mut fs_inv = pipe
+        .fs
+        .as_ref()
+        .expect("akuma backend: draw needs a fragment stage")
+        .stage
+        .begin(&res);
+    for inst in instances {
+        // vertex stage: one invocation per corner
+        let tv = crate::clock::monotonic();
+        let mut verts = Vec::with_capacity((vertices.end - vertices.start) as usize);
+        for vi in vertices.clone() {
+            verts.push(vs_inv.run_vertex(vi, inst, &[[0u32; 4]; super::exec::MAX_LOC]));
+        }
+        super::prof::add_ns(4, crate::clock::monotonic() - tv);
+        super::prof::inc(8, verts.len() as u64);
+        let tr = crate::clock::monotonic();
+        for tri in verts.chunks_exact(3) {
+            raster_tri(tri, &mut fs_inv, depth_st, &mut zbuf, &mut color, w, h);
+        }
+        // raster total minus the fragment time raster_tri booked
+        super::prof::add_ns(5, crate::clock::monotonic() - tr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standard-mode draws (real wgpu semantics): vertex fetch, primitive
+// assembly, `raster.rs`
+// ---------------------------------------------------------------------------
+
+struct StdDrawState<'a> {
+    pipe: &'a RenderPipelineData,
+    groups: &'a [Option<BindGroupData>],
+    vbufs: &'a [Option<BufBind>],
+    ibuf: Option<(&'a BufBind, wgpu::IndexFormat)>,
+    color: &'a Arc<TextureData>,
+    depth: Option<&'a Arc<TextureData>>,
+    viewport: Option<super::raster::Viewport>,
+    scissor: Option<[u32; 4]>,
+    blend_const: [f32; 4],
+}
+
+enum StdDraw {
+    Direct { vertices: std::ops::Range<u32>, instances: std::ops::Range<u32> },
+    Indexed { indices: std::ops::Range<u32>, base_vertex: i32, instances: std::ops::Range<u32> },
+}
+
+/// Collects buffer locks without ever locking the same mutex twice.
+struct Locks<'a> {
+    guards: Vec<std::sync::MutexGuard<'a, Vec<u8>>>,
+    seen: Vec<*const Mutex<Vec<u8>>>,
+}
+
+impl<'a> Locks<'a> {
+    fn new() -> Self {
+        Locks { guards: Vec::new(), seen: Vec::new() }
+    }
+    fn lock(&mut self, a: &'a Arc<Mutex<Vec<u8>>>) -> usize {
+        let p = Arc::as_ptr(a);
+        if let Some(i) = self.seen.iter().position(|&q| q == p) {
+            return i;
+        }
+        self.seen.push(p);
+        self.guards.push(a.lock().unwrap());
+        self.guards.len() - 1
+    }
+}
+
+fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
+    use wgpu::PrimitiveTopology as T;
+    let pipe = st.pipe;
+    let target = pipe.target.as_ref().expect("standard draw needs a color target");
+    let fs_stage = &pipe
+        .fs
+        .as_ref()
+        .expect("akuma backend: draw needs a fragment stage")
+        .stage;
+
+    // lock every buffer once
+    let mut locks = Locks::new();
+    let mut bind_idx: Vec<(u32, u32, usize)> = Vec::new();
+    for (gi, g) in st.groups.iter().enumerate() {
+        let g = g.as_ref().expect("bind group not set");
+        for (binding, r) in &g.entries {
+            match r {
+                BindRes::Buffer(bytes) => bind_idx.push((gi as u32, *binding, locks.lock(bytes))),
+                BindRes::Texture(_) | BindRes::Sampler => {
+                    panic!("akuma backend: texture/sampler bindings are not wired into draws yet")
                 }
             }
         }
     }
+    let vb_idx: Vec<Option<usize>> = st
+        .vbufs
+        .iter()
+        .map(|b| b.as_ref().map(|b| locks.lock(&b.bytes)))
+        .collect();
+    let ib_idx = st.ibuf.map(|(b, _)| locks.lock(&b.bytes));
+
+    let mut res = Resources::default();
+    for &(g, b, at) in &bind_idx {
+        res = res.with_buffer(g, b, &locks.guards[at][..]);
+    }
+    let mut vs_inv = pipe.vs.stage.begin(&res);
+    let mut fs_inv = fs_stage.begin(&res);
+
+    let (cw, ch) = (st.color.size.width, st.color.size.height);
+    let mut color_guard = match &*st.color.store {
+        TexStore::Color(c) => c.lock().unwrap(),
+        TexStore::Depth(_) => unreachable!(),
+    };
+    let mut depth_guard = st.depth.map(|d| match &*d.store {
+        TexStore::Depth(z) => z.lock().unwrap(),
+        TexStore::Color(_) => unreachable!(),
+    });
+    let depth_state = pipe.depth.as_ref();
+
+    let mut raster = super::raster::Raster {
+        color: super::raster::ColorTarget {
+            format: target.format,
+            data: &mut color_guard[..],
+            width: cw,
+            height: ch,
+            blend: target.blend,
+            write_mask: target.write_mask,
+        },
+        depth: match (&mut depth_guard, depth_state) {
+            (Some(z), Some(ds)) => Some(super::raster::DepthTarget {
+                data: &mut z[..],
+                compare: ds.depth_compare.unwrap_or(wgpu::CompareFunction::Always),
+                write: ds.depth_write_enabled.unwrap_or(false),
+            }),
+            _ => None,
+        },
+        viewport: st.viewport.unwrap_or(super::raster::Viewport {
+            x: 0.0,
+            y: 0.0,
+            w: cw as f32,
+            h: ch as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }),
+        scissor: st.scissor.unwrap_or([0, 0, cw, ch]),
+        cull: pipe.cull,
+        front: pipe.front,
+        blend_constant: st.blend_const,
+        interp: fs_stage.frag_interp(),
+    };
+
+    let (instances, vertex_ids): (std::ops::Range<u32>, Vec<i64>) = match &what {
+        StdDraw::Direct { vertices, instances } => {
+            (instances.clone(), vertices.clone().map(|v| v as i64).collect())
+        }
+        StdDraw::Indexed { indices, base_vertex, instances } => {
+            let (b, fmt) = st.ibuf.expect("indexed draw without an index buffer");
+            let bytes = &locks.guards[ib_idx.unwrap()][..];
+            let ids = indices
+                .clone()
+                .map(|i| {
+                    let off = b.offset as usize
+                        + i as usize * if fmt == wgpu::IndexFormat::Uint16 { 2 } else { 4 };
+                    let v = match fmt {
+                        wgpu::IndexFormat::Uint16 => bytes
+                            .get(off..off + 2)
+                            .map_or(0, |s| u16::from_le_bytes([s[0], s[1]]) as i64),
+                        wgpu::IndexFormat::Uint32 => bytes
+                            .get(off..off + 4)
+                            .map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as i64),
+                    };
+                    v + *base_vertex as i64
+                })
+                .collect();
+            (instances.clone(), ids)
+        }
+    };
+
+    for inst in instances {
+        let mut verts: Vec<super::exec::RawVertex> = Vec::with_capacity(vertex_ids.len());
+        for &vid in &vertex_ids {
+            let attrs = fetch_attrs(pipe, st.vbufs, &vb_idx, &locks, vid, inst);
+            verts.push(vs_inv.run_vertex(vid as u32, inst, &attrs));
+        }
+        match pipe.topology {
+            T::TriangleList => {
+                for t in verts.chunks_exact(3) {
+                    raster.triangle(&mut fs_inv, [&t[0], &t[1], &t[2]], &t[0].varyings);
+                }
+            }
+            T::TriangleStrip => {
+                for i in 0..verts.len().saturating_sub(2) {
+                    let (a, b, c) = (&verts[i], &verts[i + 1], &verts[i + 2]);
+                    // odd triangles are reversed to keep the winding; the
+                    // provoking vertex stays the primitive's first
+                    if i % 2 == 0 {
+                        raster.triangle(&mut fs_inv, [a, b, c], &a.varyings);
+                    } else {
+                        raster.triangle(&mut fs_inv, [b, a, c], &a.varyings);
+                    }
+                }
+            }
+            other => panic!("akuma backend: topology {other:?} unsupported"),
+        }
+    }
+}
+
+/// One vertex's attributes from the bound vertex buffers, by location.
+fn fetch_attrs(
+    pipe: &RenderPipelineData,
+    vbufs: &[Option<BufBind>],
+    vb_idx: &[Option<usize>],
+    locks: &Locks<'_>,
+    vertex_id: i64,
+    instance: u32,
+) -> super::exec::Varyings {
+    let mut out = [[0u32; 4]; super::exec::MAX_LOC];
+    for (slot, layout) in pipe.vbufs.iter().enumerate() {
+        let (Some(Some(bind)), Some(Some(gi))) = (vbufs.get(slot), vb_idx.get(slot)) else {
+            continue;
+        };
+        let bytes = &locks.guards[*gi][..];
+        let index = match layout.step {
+            wgpu::VertexStepMode::Vertex => vertex_id.max(0) as u64,
+            wgpu::VertexStepMode::Instance => instance as u64,
+        };
+        let base = bind.offset + index * layout.stride;
+        for a in &layout.attrs {
+            out[a.location as usize] = super::vertex::fetch(a.format, bytes, (base + a.offset) as usize);
+        }
+    }
+    out
 }
 
 /// Lock every buffer the bound groups reference, once per draw. The same
@@ -1332,11 +1700,11 @@ impl wgpu::custom::CommandEncoderInterface for Encoder {
                 .expect("akuma backend: foreign texture view");
             let clear = match &d.depth_ops {
                 Some(ops) => match ops.load {
-                    wgpu::LoadOp::Clear(v) => v,
-                    wgpu::LoadOp::Load => f32::INFINITY,
+                    wgpu::LoadOp::Clear(v) => Some(v),
+                    wgpu::LoadOp::Load => None,
                     other => panic!("akuma backend: unsupported depth load op {other:?}"),
                 },
-                None => f32::INFINITY,
+                None => None,
             };
             depth = Some((view.tex.clone(), clear));
         }
@@ -1482,46 +1850,65 @@ impl wgpu::custom::RenderPassInterface for RenderPassRec {
 
     fn set_index_buffer(
         &mut self,
-        _buffer: &wgpu::custom::DispatchBuffer,
-        _index_format: wgpu::IndexFormat,
-        _offset: BufferAddress,
+        buffer: &wgpu::custom::DispatchBuffer,
+        index_format: wgpu::IndexFormat,
+        offset: BufferAddress,
         _size: Option<BufferSize>,
     ) {
-        panic!("akuma backend: index buffers unused");
+        let b = buffer
+            .as_custom::<BufferData>()
+            .expect("akuma backend: foreign buffer");
+        self.data.cmds.push(PassCmd::SetIndexBuffer {
+            buf: BufBind { bytes: Arc::clone(&b.bytes), offset },
+            format: index_format,
+        });
     }
 
     fn set_vertex_buffer(
         &mut self,
-        _slot: u32,
-        _buffer: Option<&wgpu::custom::DispatchBuffer>,
-        _offset: BufferAddress,
+        slot: u32,
+        buffer: Option<&wgpu::custom::DispatchBuffer>,
+        offset: BufferAddress,
         _size: Option<BufferSize>,
     ) {
-        panic!("akuma backend: vertex buffers unused (vertex_index-driven reads only)");
+        let buf = buffer.map(|b| {
+            let b = b
+                .as_custom::<BufferData>()
+                .expect("akuma backend: foreign buffer");
+            BufBind { bytes: Arc::clone(&b.bytes), offset }
+        });
+        self.data.cmds.push(PassCmd::SetVertexBuffer { slot, buf });
     }
 
     fn set_immediates(&mut self, _offset: u32, _data: &[u8]) {
         panic!("akuma backend: immediates unused");
     }
 
-    fn set_blend_constant(&mut self, _color: wgpu::Color) {
-        panic!("akuma backend: blending unused");
+    fn set_blend_constant(&mut self, color: wgpu::Color) {
+        self.data.cmds.push(PassCmd::SetBlendConstant(color));
     }
 
-    fn set_scissor_rect(&mut self, _x: u32, _y: u32, _width: u32, _height: u32) {
-        panic!("akuma backend: scissor unused");
+    fn set_scissor_rect(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        self.data.cmds.push(PassCmd::SetScissor([x, y, width, height]));
     }
 
     fn set_viewport(
         &mut self,
-        _x: f32,
-        _y: f32,
-        _width: f32,
-        _height: f32,
-        _min_depth: f32,
-        _max_depth: f32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        min_depth: f32,
+        max_depth: f32,
     ) {
-        panic!("akuma backend: viewport unused (positions are already pixels)");
+        self.data.cmds.push(PassCmd::SetViewport(super::raster::Viewport {
+            x,
+            y,
+            w: width,
+            h: height,
+            min_depth,
+            max_depth,
+        }));
     }
 
     fn set_stencil_reference(&mut self, _reference: u32) {
@@ -1536,11 +1923,13 @@ impl wgpu::custom::RenderPassInterface for RenderPassRec {
 
     fn draw_indexed(
         &mut self,
-        _indices: std::ops::Range<u32>,
-        _base_vertex: i32,
-        _instances: std::ops::Range<u32>,
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
     ) {
-        panic!("akuma backend: indexed draws unused");
+        self.data
+            .cmds
+            .push(PassCmd::DrawIndexed { indices, base_vertex, instances });
     }
 
     fn draw_mesh_tasks(&mut self, _x: u32, _y: u32, _z: u32) {

@@ -218,7 +218,7 @@ const N_VERTS: u32 = 300;
 
 fn run_stage(st: &Stage, res: &Resources<'_>) -> Vec<RawVertex> {
     let mut inv = st.begin(res);
-    (0..N_VERTS).map(|vi| inv.run_vertex(vi, 0)).collect()
+    (0..N_VERTS).map(|vi| inv.run_vertex(vi, 0, &[[0u32; 4]; super::exec::MAX_LOC])).collect()
 }
 
 pub fn run() -> i32 {
