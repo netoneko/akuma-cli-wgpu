@@ -441,8 +441,10 @@ pub struct SpanRegs {
     out: [u32; 4],
     /// the code overwrites an input register: re-set the inputs every batch
     inputs_clobbered: bool,
-    /// the varyings differ between the pixels of a batch
-    per_lane: bool,
+    /// indices into `locs` of the varyings that differ between the pixels of a
+    /// batch (the rest are set once per span)
+    dyn_idx: [u8; 32],
+    n_dyn: usize,
 }
 
 /// What `Invoker::shade4` produced for up to 4 consecutive pixels.
@@ -587,10 +589,11 @@ impl Invoker<'_> {
     /// Wide stages only: set the inputs that stay fixed along a run of
     /// pixels on one row of a flat-varying primitive (the varyings and the
     /// row's y). Returns false for any other executor.
-    pub fn span_begin(&mut self, var: &Varyings, py: f32, per_lane: bool) -> bool {
+    pub fn span_begin(&mut self, var: &Varyings, py: f32, dyn_locs: &[u8]) -> bool {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if let Invoker::Wide { regs, span, .. } = self {
-            span.per_lane = per_lane;
+            span.n_dyn = dyn_locs.len().min(32);
+            span.dyn_idx[..span.n_dyn].copy_from_slice(&dyn_locs[..span.n_dyn]);
             for &(r, l, c) in &span.locs {
                 regs[r as usize].0 = [var[l as usize][c as usize]; 4];
             }
@@ -599,7 +602,7 @@ impl Invoker<'_> {
             }
             return true;
         }
-        let _ = (var, py, per_lane);
+        let _ = (var, py, dyn_locs);
         false
     }
 
@@ -638,7 +641,7 @@ impl Invoker<'_> {
         }
         // varyings that differ per lane (or inputs the code overwrites) are
         // written for every batch
-        if span.per_lane || span.inputs_clobbered {
+        if span.inputs_clobbered {
             for &r in &span.pos_y {
                 regs[r as usize].0 = [py.to_bits(); 4];
             }
@@ -648,6 +651,15 @@ impl Invoker<'_> {
                     *x = f(k.min(n - 1), i);
                 }
                 regs[r as usize].0 = v;
+            }
+        } else {
+            for j in 0..span.n_dyn {
+                let i = span.dyn_idx[j] as usize;
+                let mut v = [0u32; 4];
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x = f(k.min(n - 1), i);
+                }
+                regs[span.locs[i].0 as usize].0 = v;
             }
         }
         let status = w.run_wide(regs, refs, texs, smps);
@@ -796,7 +808,8 @@ impl SpanRegs {
             pos_y: vec![],
             locs: vec![],
             out: [0; 4],
-            per_lane: false,
+            dyn_idx: [0; 32],
+            n_dyn: 0,
             inputs_clobbered: p.code.iter().any(|i| {
                 i.dst().is_some_and(|d| p.inputs.iter().any(|&(r, _)| r == d))
             }) || p.tex_ops.iter().any(|t| p.inputs.iter().any(|&(r, _)| r >= t.d && r < t.d + 4)),

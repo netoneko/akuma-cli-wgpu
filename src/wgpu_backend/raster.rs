@@ -26,6 +26,34 @@ use super::program::Interp;
 /// pixels produced by run replication (tests check the mechanism is exercised)
 pub static RUN_PIXELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `f64::round` as an integer without a libm call (musl's `round`/`ceil` are
+/// real function calls on baseline x86-64): half away from zero
+#[inline]
+fn round_i64(x: f64) -> i64 {
+    if x >= 0.0 { (x + 0.5) as i64 } else { -((0.5 - x) as i64) }
+}
+
+/// `f64::ceil` as an integer, likewise
+#[inline]
+fn ceil_i64(x: f64) -> i64 {
+    let t = x as i64;
+    if (t as f64) < x { t + 1 } else { t }
+}
+
+/// floor(n / d) for d > 0 through one f64 division (a 64-bit `idiv` is 40+
+/// cycles on this CPU); exact for |n| < 2^53 after the fix-up
+#[inline]
+fn floor_div(n: i64, d: i64) -> i64 {
+    let mut q = (n as f64 / d as f64) as i64;
+    let r = n - q * d;
+    if r < 0 {
+        q -= 1;
+    } else if r >= d {
+        q += 1;
+    }
+    q
+}
+
 /// sub-pixel precision: coordinates are snapped to 1/256 pixel
 const SUB: i64 = 256;
 /// clip x/y to this many times w (NDC ±GUARD): keeps snapped coordinates
@@ -136,8 +164,8 @@ impl Raster<'_> {
         let sy = vp.y as f64 + (0.5 - ny * 0.5) * vp.h as f64;
         let sz = vp.min_depth as f64 + nz * (vp.max_depth - vp.min_depth) as f64;
         SV {
-            x: (sx * SUB as f64).round() as i64,
-            y: (sy * SUB as f64).round() as i64,
+            x: round_i64(sx * SUB as f64),
+            y: round_i64(sy * SUB as f64),
             z: sz,
             invw,
             var: p.var,
@@ -174,10 +202,10 @@ impl Raster<'_> {
         // iff its centre is inside the rectangle.
         let sc = self.scissor;
         let vp = &self.viewport;
-        let vp_x0 = (vp.x as f64 - 0.5).ceil() as i64;
-        let vp_x1 = ((vp.x + vp.w) as f64 - 0.5).ceil() as i64;
-        let vp_y0 = (vp.y as f64 - 0.5).ceil() as i64;
-        let vp_y1 = ((vp.y + vp.h) as f64 - 0.5).ceil() as i64;
+        let vp_x0 = ceil_i64(vp.x as f64 - 0.5);
+        let vp_x1 = ceil_i64((vp.x + vp.w) as f64 - 0.5);
+        let vp_y0 = ceil_i64(vp.y as f64 - 0.5);
+        let vp_y1 = ceil_i64((vp.y + vp.h) as f64 - 0.5);
         let min_x = (s.iter().map(|p| p.x).min().unwrap() - SUB / 2)
             .div_euclid(SUB)
             .max(sc[0] as i64)
@@ -309,10 +337,10 @@ impl Raster<'_> {
                     }
                 } else if d > 0 {
                     // w0 + d*k >= t  <=>  k >= ceil((t - w0) / d)
-                    lo = lo.max(-((w0 - t).div_euclid(d)));
+                    lo = lo.max(-floor_div(w0 - t, d));
                 } else {
                     // k <= floor((w0 - t) / -d)
-                    hi = hi.min((w0 - t).div_euclid(-d) + 1);
+                    hi = hi.min(floor_div(w0 - t, -d) + 1);
                 }
             }
             // a position-independent shader whose result simply replaces the
@@ -496,9 +524,6 @@ impl Raster<'_> {
         use super::exec::Shade4;
         let bgra = plan.unorm8.unwrap();
         let ypos = py as f32 + 0.5;
-        if !fs.span_begin(provoking, ypos, !flat_all) {
-            return false;
-        }
         // every pixel of the span came straight from the shader (no blending
         // with the destination, no discard): the row can be copied downwards
         let mut pure = true;
@@ -520,6 +545,20 @@ impl Raster<'_> {
                     },
                 };
             }
+        }
+        // inputs that vary along the span are refreshed per batch, the rest once
+        let mut dyn_idx = [0u8; 32];
+        let mut nd = 0usize;
+        if let Some(tp) = tp {
+            for i in 0..tp.n {
+                if !matches!(planes[i], Plane::Const(_)) {
+                    dyn_idx[nd] = i as u8;
+                    nd += 1;
+                }
+            }
+        }
+        if !fs.span_begin(provoking, ypos, &dyn_idx[..nd]) {
+            return false;
         }
         let mut done = 0usize;
         while done < n {
