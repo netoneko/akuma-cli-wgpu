@@ -168,11 +168,13 @@ impl MemoInfo {
 const NO_SLOT: u32 = u32::MAX;
 
 fn memo_hash(m: &MemoInfo, key: impl Fn(usize) -> u32) -> u32 {
+    // Fibonacci hashing: for one key, consecutive values (cell indices) land in
+    // distinct slots
     let mut h = 0u32;
     for i in 0..m.ins.len() {
-        h = (h ^ key(i)).wrapping_mul(0x9E37_79B1).rotate_left(13);
+        h = (h.rotate_left(5) ^ key(i)).wrapping_mul(0x9E37_79B1);
     }
-    h.wrapping_mul(0x85EB_CA6B) >> (32 - m.bits)
+    h >> (32 - m.bits)
 }
 
 /// `MemoGet`: returns 1 on a hit (the live-outs are already written). `regs`

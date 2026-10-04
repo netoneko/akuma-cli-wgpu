@@ -279,6 +279,12 @@ impl Stage {
             Ok(x) => x,
             Err(_) => return None,
         };
+        if std::env::var_os("AKUMA_DUMP_SPEC").is_some() {
+            for (k, i) in prog.code.iter().enumerate() {
+                eprintln!("  {k:4}: {i:?}");
+            }
+            eprintln!("  memos {:?}", prog.memos.iter().map(|m| (&m.ins, &m.outs)).collect::<Vec<_>>());
+        }
         if verbose {
             eprintln!(
                 "[exec] specialized: {} -> {} insts ({} folded loads) in {:.2} ms",

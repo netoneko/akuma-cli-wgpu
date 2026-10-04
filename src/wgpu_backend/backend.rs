@@ -1378,18 +1378,72 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     };
 
     // ---- vertex stage (batched) + primitive assembly ----
+    let t_draw0 = crate::clock::monotonic();
     let mut ids: Vec<(u32, u32)> = Vec::with_capacity(instances.len() * vertex_ids.len());
-    let mut attrs: Vec<super::exec::Varyings> = Vec::with_capacity(ids.capacity());
     for inst in instances.clone() {
         for &vid in &vertex_ids {
             ids.push((vid as u32, inst));
-            attrs.push(fetch_attrs(pipe, st.vbufs, &vb_idx, &locks, vid, inst));
         }
     }
-    let mut verts: Vec<super::exec::RawVertex> = Vec::with_capacity(ids.len());
+    // vertex memory is recycled between draws: fresh pages cost a page fault
+    // each (several microseconds on Akuma), which at 100k vertices rivals the
+    // shader work itself
+    let mut verts: Vec<super::exec::RawVertex> = scratch_take(&VERT_POOL);
+    verts.clear();
+    let t_vs0 = crate::clock::monotonic();
     let vplan = pipe.vs.stage.plan(&res, ids.len() as u64);
-    let mut vs_inv = pipe.vs.stage.begin_with(&res, &vplan);
-    vs_inv.run_vertex_batch(&ids, &attrs, &mut verts);
+    let t_vs1 = crate::clock::monotonic();
+    // vertices are independent: big draws fetch attributes and run the
+    // vertex stage in chunks on all workers, results joined in order
+    let vthreads = if ids.len() >= 4096 { raster_threads(&[[0; 4]; 64], 1, 1).min(ids.len() / 1024) } else { 1 };
+    // `Locks` holds raw pointers only for identity checks while locking;
+    // fetching just reads the guarded bytes
+    struct SyncLocks<'l, 'm>(&'l Locks<'m>);
+    unsafe impl Sync for SyncLocks<'_, '_> {}
+    impl<'m> SyncLocks<'_, 'm> {
+        // a method, so closures capture the wrapper, not its field
+        fn get(&self) -> &Locks<'m> {
+            self.0
+        }
+    }
+    let sync_locks = SyncLocks(&locks);
+    let run_chunk = |chunk: &[(u32, u32)]| -> Vec<super::exec::RawVertex> {
+        let locks = sync_locks.get();
+        let tc0 = crate::clock::monotonic();
+        let attrs: Vec<super::exec::Varyings> = chunk
+            .iter()
+            .map(|&(vid, inst)| fetch_attrs(pipe, st.vbufs, &vb_idx, locks, vid as i64, inst))
+            .collect();
+        let tc1 = crate::clock::monotonic();
+        let mut inv = pipe.vs.stage.begin_with(&res, &vplan);
+        let mut out = scratch_take(&CHUNK_POOL);
+        out.clear();
+        out.reserve(chunk.len());
+        let tc2 = crate::clock::monotonic();
+        inv.run_vertex_batch(chunk, &attrs, &mut out);
+        if super::prof::enabled() {
+            let tc3 = crate::clock::monotonic();
+            eprintln!("[vchunk] {} verts: fetch {:.2} ms, begin {:.2} ms, run {:.2} ms", chunk.len(), (tc1 - tc0) * 1e3, (tc2 - tc1) * 1e3, (tc3 - tc2) * 1e3);
+        }
+        out
+    };
+    if vthreads <= 1 {
+        let part = run_chunk(&ids);
+        verts.extend_from_slice(&part);
+        scratch_give(&CHUNK_POOL, part);
+    } else {
+        let per = ids.len().div_ceil(vthreads).div_ceil(4) * 4;
+        let parts: Vec<Vec<super::exec::RawVertex>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = ids.chunks(per).map(|c| sc.spawn(|| run_chunk(c))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        verts.reserve(ids.len());
+        for part in parts {
+            verts.extend_from_slice(&part);
+            scratch_give(&CHUNK_POOL, part);
+        }
+    }
+    let t_vs2 = crate::clock::monotonic();
     // (a, b, c, provoking) as indices into `verts`
     let mut prims: Vec<[u32; 4]> = Vec::new();
     for inst_i in 0..instances.len() as u32 {
@@ -1439,6 +1493,7 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
             ds.depth_write_enabled.unwrap_or(false),
         )
     });
+    let t_r0 = crate::clock::monotonic();
     let threads = raster_threads(&prims, cw, ch);
     // many more bands than threads: bands cost very different amounts
     let n_bands = if threads > 1 { (threads * 8).min(ch as usize).max(1) } else { 1 };
@@ -1467,6 +1522,11 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         });
     }
 
+    // conservative row range of every primitive, so a band skips the ones
+    // that cannot touch it (a terminal draw is tens of thousands of tiny
+    // quads; without this every band would set up every one of them)
+    let prim_rows: Option<Vec<(i64, i64)>> =
+        (n_bands > 1 && prims.len() >= 64).then(|| prim_row_ranges(&prims, &verts, &viewport, ch));
     let run_band = |band: Band<'_>, fs: &mut Invoker<'_>| {
         let mut raster = super::raster::Raster {
             color: super::raster::ColorTarget {
@@ -1492,12 +1552,23 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
             band: (band.y0, band.y1),
             row0: band.y0,
         };
-        for p in &prims {
+        // only the primitives whose rows reach this band, in draw order
+        let mut each = |p: &[u32; 4]| {
             raster.triangle(
                 fs,
                 [&verts[p[0] as usize], &verts[p[1] as usize], &verts[p[2] as usize]],
                 &verts[p[3] as usize].varyings,
             );
+        };
+        match &prim_rows {
+            Some(rows) => {
+                for (p, &(r0, r1)) in prims.iter().zip(rows) {
+                    if r1 > band.y0 && r0 < band.y1 {
+                        each(p);
+                    }
+                }
+            }
+            None => prims.iter().for_each(each),
         }
     };
 
@@ -1524,6 +1595,66 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
             }
         });
     }
+    scratch_give(&VERT_POOL, verts);
+    if super::prof::enabled() {
+        let t_end = crate::clock::monotonic();
+        eprintln!(
+            "[draw] {} verts, {} prims, est {} frags, {} threads: fetch {:.2} ms, vs plan {:.2} ms, vs run {:.2} ms, assembly+plan {:.2} ms, raster {:.2} ms",
+            ids.len(),
+            prims.len(),
+            est_frags,
+            threads,
+            (t_vs0 - t_draw0) * 1e3,
+            (t_vs1 - t_vs0) * 1e3,
+            (t_vs2 - t_vs1) * 1e3,
+            (t_r0 - t_vs2) * 1e3,
+            (t_end - t_r0) * 1e3
+        );
+    }
+}
+
+static VERT_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
+static CHUNK_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
+
+fn scratch_take(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>) -> Vec<super::exec::RawVertex> {
+    pool.lock().unwrap().pop().unwrap_or_default()
+}
+
+fn scratch_give(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>, mut v: Vec<super::exec::RawVertex>) {
+    v.clear();
+    let mut g = pool.lock().unwrap();
+    if g.len() < 8 {
+        g.push(v);
+    }
+}
+
+/// Rows [lo, hi) each primitive can reach, with margin; the whole target for
+/// anything near or behind the eye (those get clipped, and clipping may move
+/// vertices a long way).
+fn prim_row_ranges(
+    prims: &[[u32; 4]],
+    verts: &[super::exec::RawVertex],
+    vp: &super::raster::Viewport,
+    ch: u32,
+) -> Vec<(i64, i64)> {
+    prims
+        .iter()
+        .map(|p| {
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for &i in &p[..3] {
+                let [x, y, z, w] = verts[i as usize].position;
+                // inside the clip volume with room to spare: plain projection
+                if !(w > 1e-6 && z >= 0.0 && z <= w && x.abs() <= 4.0 * w && y.abs() <= 4.0 * w) {
+                    return (0, ch as i64);
+                }
+                let sy = vp.y + (0.5 - y / w * 0.5) * vp.h;
+                lo = lo.min(sy);
+                hi = hi.max(sy);
+            }
+            ((lo.floor() as i64 - 2).max(0), (hi.ceil() as i64 + 3).min(ch as i64))
+        })
+        .collect()
 }
 
 /// Rough upper bound on the fragments of a draw: the summed screen bounding

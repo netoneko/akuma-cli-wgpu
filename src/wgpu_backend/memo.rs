@@ -34,7 +34,7 @@ use super::texture::TexKind;
 /// at most this many key registers
 const MAX_KEYS: usize = 2;
 /// table size: 1 << BITS entries
-const BITS: u32 = 8;
+const BITS: u32 = 10;
 /// a region must be worth at least this many (weighted) instructions
 const MIN_WEIGHT: u32 = 60;
 
@@ -145,7 +145,17 @@ fn select(p: &Program) -> Option<Pick> {
         if weight_sum < MIN_WEIGHT || weight_sum <= overhead {
             continue;
         }
-        let score = weight_sum as i64 - overhead as i64;
+        // keys loaded from memory (a cell word, a glyph id) take few distinct
+        // values, unlike keys computed from the pixel position (a cell
+        // index): prefer them even for a somewhat smaller region
+        let data_keys = pick.ins.iter().all(|&k| {
+            p.code[..s]
+                .iter()
+                .rev()
+                .find(|i| i.dst() == Some(k))
+                .is_some_and(|i| matches!(i, Inst::LoadBuf { .. }))
+        });
+        let score = weight_sum as i64 - overhead as i64 + if data_keys { 60 } else { 0 };
         if best.as_ref().is_none_or(|(b, _)| score >= *b) {
             best = Some((score, pick));
         }
