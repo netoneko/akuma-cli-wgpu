@@ -246,6 +246,7 @@ impl Stage {
                             texs,
                             smps,
                             scalar,
+                            span: SpanRegs::new(&c.prog),
                         };
                     }
                     return Invoker::Jit { p: &c.prog, j, regs: c.prog.init.clone(), refs, texs, smps };
@@ -284,7 +285,34 @@ pub enum Invoker<'a> {
         texs: Vec<TexRef>,
         smps: Vec<SmpRef>,
         scalar: Box<Invoker<'a>>,
+        span: SpanRegs,
     },
+}
+
+/// Where a wide stage's inputs and colour outputs live, resolved once per
+/// draw for `Invoker::shade4`.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub struct SpanRegs {
+    /// registers of @builtin(position).x / .y
+    pos_x: Vec<u32>,
+    pos_y: Vec<u32>,
+    /// (register, location, component) varying inputs
+    locs: Vec<(u32, u32, u32)>,
+    /// registers of colour target 0's r, g, b, a (0 = the always-zero register)
+    out: [u32; 4],
+    /// the code overwrites an input register: re-set the inputs every batch
+    inputs_clobbered: bool,
+}
+
+/// What `Invoker::shade4` produced for up to 4 consecutive pixels.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub enum Shade4 {
+    /// r, g, b, a of the 4 lanes (f32 bits)
+    Colors([super::jit::L4; 4]),
+    /// the lanes disagreed at a branch and were run one by one
+    Lanes([Option<[u32; 4]>; 4]),
+    /// every lane was discarded
+    Killed,
 }
 
 impl Invoker<'_> {
@@ -362,6 +390,72 @@ impl Invoker<'_> {
         prog.inputs.iter().any(|(_, s)| matches!(s, Src::Position(2) | Src::Position(3)))
     }
 
+    /// Wide stages only: set the inputs that stay fixed along a run of
+    /// pixels on one row of a flat-varying primitive (the varyings and the
+    /// row's y). Returns false for any other executor.
+    pub fn span_begin(&mut self, var: &Varyings, py: f32) -> bool {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { regs, span, .. } = self {
+            for &(r, l, c) in &span.locs {
+                regs[r as usize].0 = [var[l as usize][c as usize]; 4];
+            }
+            for &r in &span.pos_y {
+                regs[r as usize].0 = [py.to_bits(); 4];
+            }
+            return true;
+        }
+        let _ = (var, py);
+        false
+    }
+
+    /// Shade the `n` (1..=4) pixels at x = `x0 + 0.5 ..` of the row `span_begin`
+    /// was given. Lanes past `n` repeat the last pixel so they cannot diverge.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[inline]
+    pub fn shade4(&mut self, var: &Varyings, x0: f32, py: f32, n: usize) -> Shade4 {
+        let Invoker::Wide { w, regs, refs, texs, smps, scalar, span, .. } = self else {
+            unreachable!("shade4 on a non-wide invoker")
+        };
+        let mut xs = [0u32; 4];
+        for (k, x) in xs.iter_mut().enumerate() {
+            *x = (x0 + k.min(n - 1) as f32 + 0.5).to_bits();
+        }
+        for &r in &span.pos_x {
+            regs[r as usize].0 = xs;
+        }
+        if span.inputs_clobbered {
+            for &r in &span.pos_y {
+                regs[r as usize].0 = [py.to_bits(); 4];
+            }
+            for &(r, l, c) in &span.locs {
+                regs[r as usize].0 = [var[l as usize][c as usize]; 4];
+            }
+        }
+        let status = w.run_wide(regs, refs, texs, smps);
+        if super::prof::enabled() {
+            super::prof::inc(11, 1);
+            if status == super::jit::STATUS_DIVERGED {
+                super::prof::inc(12, 1);
+            }
+        }
+        match status {
+            0 => Shade4::Colors([
+                regs[span.out[0] as usize],
+                regs[span.out[1] as usize],
+                regs[span.out[2] as usize],
+                regs[span.out[3] as usize],
+            ]),
+            1 => Shade4::Killed,
+            _ => {
+                let mut out = [None; 4];
+                for (k, o) in out.iter_mut().enumerate().take(n) {
+                    *o = scalar.run_fragment(var, [x0 + k as f32 + 0.5, py, 0.0, 0.0]);
+                }
+                Shade4::Lanes(out)
+            }
+        }
+    }
+
     /// invocations this invoker prefers to be handed at once
     pub fn lanes(&self) -> usize {
         match self {
@@ -377,7 +471,7 @@ impl Invoker<'_> {
     pub fn run_vertex_batch(&mut self, ids: &[(u32, u32)], attrs: &[Varyings], out: &mut Vec<RawVertex>) {
         debug_assert_eq!(ids.len(), attrs.len());
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar } = self {
+        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar, .. } = self {
             for (ci, chunk) in ids.chunks(4).enumerate() {
                 let base = ci * 4;
                 for &(r, src) in &p.inputs {
@@ -427,7 +521,7 @@ impl Invoker<'_> {
     pub fn run_fragment_batch(&mut self, ins: &[([f32; 4], &Varyings)], out: &mut [Option<[u32; 4]>]) {
         debug_assert_eq!(ins.len(), out.len());
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar } = self {
+        if let Invoker::Wide { p, w, regs, refs, texs, smps, scalar, .. } = self {
             for (ci, chunk) in ins.chunks(4).enumerate() {
                 let base = ci * 4;
                 for &(r, src) in &p.inputs {
@@ -478,6 +572,35 @@ impl Invoker<'_> {
         for (i, (pos, var)) in ins.iter().enumerate() {
             out[i] = self.run_fragment(var, *pos);
         }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl SpanRegs {
+    fn new(p: &Program) -> SpanRegs {
+        let mut s = SpanRegs {
+            pos_x: vec![],
+            pos_y: vec![],
+            locs: vec![],
+            out: [0; 4],
+            inputs_clobbered: p.code.iter().any(|i| {
+                i.dst().is_some_and(|d| p.inputs.iter().any(|&(r, _)| r == d))
+            }) || p.tex_ops.iter().any(|t| p.inputs.iter().any(|&(r, _)| r >= t.d && r < t.d + 4)),
+        };
+        for &(r, src) in &p.inputs {
+            match src {
+                Src::Position(0) => s.pos_x.push(r),
+                Src::Position(1) => s.pos_y.push(r),
+                Src::Location(l, c) => s.locs.push((r, l, c as u32)),
+                _ => {}
+            }
+        }
+        for &(d, r) in &p.outputs {
+            if let Dst::Location(0, c) = d {
+                s.out[c as usize] = r;
+            }
+        }
+        s
     }
 }
 

@@ -130,6 +130,22 @@ pub struct Program {
 }
 
 impl Inst {
+    /// the register this instruction writes, if it writes exactly one
+    /// (`Tex` writes several: see `Program::tex_ops`; `CallC` also updates its
+    /// cache registers)
+    pub fn dst(&self) -> Option<R> {
+        use Inst::*;
+        match *self {
+            Mov { d, .. } | Const { d, .. } | FAdd { d, .. } | FSub { d, .. } | FMul { d, .. }
+            | FDiv { d, .. } | FNeg { d, .. } | FAbs { d, .. } | Sqrt { d, .. } | IAdd { d, .. }
+            | ISub { d, .. } | IMul { d, .. } | And { d, .. } | Or { d, .. } | Xor { d, .. }
+            | Not { d, .. } | Shl { d, .. } | ShrS { d, .. } | ShrU { d, .. } | Cmp { d, .. }
+            | Select { d, .. } | I2F { d, .. } | U2F { d, .. } | Call { d, .. } | CallC { d, .. }
+            | LoadBuf { d, .. } => Some(d),
+            Tex { .. } | Jmp { .. } | Jz { .. } | Jnz { .. } | Kill | Ret => None,
+        }
+    }
+
     /// call `f` with every register this instruction reads
     pub fn reads(&self, mut f: impl FnMut(R)) {
         use Inst::*;

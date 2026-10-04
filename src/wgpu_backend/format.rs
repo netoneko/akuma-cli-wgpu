@@ -145,3 +145,39 @@ pub fn encode(f: F, c: [f32; 4], out: &mut [u8]) {
         other => panic!("akuma backend: encode to {other:?}"),
     }
 }
+
+/// 4 pixels of an 8-bit unorm RGBA/BGRA target at once (SSE2, in the baseline
+/// x86-64 feature set): `lanes` = the r, g, b, a channels, each holding the 4
+/// pixels' values as f32 bits.
+/// Returns the 4 packed texels (little-endian u32: bytes in memory order) and
+/// whether every alpha is exactly 1.0. Bit-identical to `encode` per pixel:
+/// clamp (NaN -> 0), x255, +0.5, truncate.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn encode4_unorm8(lanes: [&[u32; 4]; 4], bgra: bool) -> ([u32; 4], bool) {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 is part of the x86_64 baseline; loads are unaligned-safe
+    unsafe {
+        let zero = _mm_setzero_ps();
+        let one = _mm_set1_ps(1.0);
+        let k255 = _mm_set1_ps(255.0);
+        let half = _mm_set1_ps(0.5);
+        let ld = |p: &[u32; 4]| _mm_loadu_ps(p.as_ptr() as *const f32);
+        let q = |v: __m128| {
+            // max(v, 0) returns 0 for NaN (second operand), then min(.., 1)
+            let c = _mm_min_ps(_mm_max_ps(v, zero), one);
+            _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(c, k255), half))
+        };
+        let a_raw = ld(lanes[3]);
+        let all_one = _mm_movemask_ps(_mm_cmpeq_ps(a_raw, one)) == 15;
+        let (c0, c2) = if bgra { (lanes[2], lanes[0]) } else { (lanes[0], lanes[2]) };
+        let b0 = q(ld(c0));
+        let b1 = _mm_slli_epi32(q(ld(lanes[1])), 8);
+        let b2 = _mm_slli_epi32(q(ld(c2)), 16);
+        let b3 = _mm_slli_epi32(q(a_raw), 24);
+        let px = _mm_or_si128(_mm_or_si128(b0, b1), _mm_or_si128(b2, b3));
+        let mut out = [0u32; 4];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, px);
+        (out, all_one)
+    }
+}

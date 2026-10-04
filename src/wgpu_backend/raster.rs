@@ -236,13 +236,44 @@ impl Raster<'_> {
         let mut pend_var = [[[0u32; 4]; MAX_LOC]; 4];
         let mut np = 0usize;
 
+        // edge i admits a pixel iff w_i >= thr_i (strict inside, or on a
+        // top/left edge)
+        let thr = [!tl[0] as i64, !tl[1] as i64, !tl[2] as i64];
+        let width = max_x - min_x;
+        // the straight-line case: flat varyings, nothing reading depth or
+        // barycentrics, a 4-lane stage, a plain unorm8 target
+        let span_fast = flat_all
+            && !need_geom
+            && !constant_fs
+            && self.depth.is_none()
+            && lanes == 4
+            && plan.unorm8.is_some();
+
         for py in min_y..max_y {
-            let mut w = w_row;
-            for px in min_x..max_x {
-                let inside = (w[0] > 0 || (w[0] == 0 && tl[0]))
-                    && (w[1] > 0 || (w[1] == 0 && tl[1]))
-                    && (w[2] > 0 || (w[2] == 0 && tl[2]));
-                if inside {
+            // the covered pixels of this row are one interval [lo, hi) of
+            // offsets from min_x: each edge function is linear in x, so each
+            // edge bounds the interval from one side
+            let (mut lo, mut hi) = (0i64, width);
+            for i in 0..3 {
+                let (d, w0, t) = (dwdx[i], w_row[i], thr[i]);
+                if d == 0 {
+                    if w0 < t {
+                        hi = 0;
+                    }
+                } else if d > 0 {
+                    // w0 + d*k >= t  <=>  k >= ceil((t - w0) / d)
+                    lo = lo.max(-((w0 - t).div_euclid(d)));
+                } else {
+                    // k <= floor((w0 - t) / -d)
+                    hi = hi.min((w0 - t).div_euclid(-d) + 1);
+                }
+            }
+            if lo < hi && span_fast {
+                self.fast_span(fs, &plan, &var, py, min_x + lo, (hi - lo) as usize);
+            } else {
+                for k in lo..hi {
+                    let px = min_x + k;
+                    let w = [w_row[0] + dwdx[0] * k, w_row[1] + dwdx[1] * k, w_row[2] + dwdx[2] * k];
                     let (mut zf, mut invw, mut l) = (0.0f32, 0.0f64, [0.0f64; 3]);
                     if need_geom {
                         // barycentric weights (screen space)
@@ -301,9 +332,6 @@ impl Raster<'_> {
                         }
                     }
                 }
-                for i in 0..3 {
-                    w[i] += dwdx[i];
-                }
             }
             for i in 0..3 {
                 w_row[i] += dwdy[i];
@@ -312,6 +340,63 @@ impl Raster<'_> {
         if np > 0 {
             self.flush(fs, &plan, &pend[..np], &pend_var, &var, flat_all);
         }
+    }
+
+    /// One run of `n` covered pixels starting at (`px0`, `py`), shaded four at
+    /// a time with the wide stage and written straight to the target: no
+    /// per-pixel gather, marshalling or format dispatch.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn fast_span(&mut self, fs: &mut Invoker<'_>, plan: &PixelPlan, var: &Varyings, py: i64, px0: i64, n: usize) {
+        use super::exec::Shade4;
+        let bgra = plan.unorm8.unwrap();
+        let ypos = py as f32 + 0.5;
+        if !fs.span_begin(var, ypos) {
+            return;
+        }
+        let cw = self.color.width as i64;
+        let base = ((py - self.row0) * cw + px0) as usize * 4;
+        let dst = &mut self.color.data[base..base + n * 4];
+        let mut done = 0usize;
+        while done < n {
+            let m = (n - done).min(4);
+            let x0 = (px0 + done as i64) as f32;
+            let out = &mut dst[done * 4..(done + m) * 4];
+            match fs.shade4(var, x0, ypos, m) {
+                Shade4::Colors(c) => {
+                    let (px, all_opaque) = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra);
+                    if plan.blend.is_none() || (plan.opaque_is_store && all_opaque) {
+                        if m == 4 {
+                            for (i, p) in px.iter().enumerate() {
+                                out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+                            }
+                        } else {
+                            for i in 0..m {
+                                out[i * 4..i * 4 + 4].copy_from_slice(&px[i].to_le_bytes());
+                            }
+                        }
+                    } else {
+                        for i in 0..m {
+                            let col = [c[0].0[i], c[1].0[i], c[2].0[i], c[3].0[i]];
+                            plan.write(&mut out[i * 4..i * 4 + 4], col, false, &mut None, &mut None);
+                        }
+                    }
+                }
+                Shade4::Lanes(l) => {
+                    for i in 0..m {
+                        if let Some(col) = l[i] {
+                            plan.write(&mut out[i * 4..i * 4 + 4], col, false, &mut None, &mut None);
+                        }
+                    }
+                }
+                Shade4::Killed => {}
+            }
+            done += m;
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    fn fast_span(&mut self, _fs: &mut Invoker<'_>, _plan: &PixelPlan, _var: &Varyings, _py: i64, _px0: i64, _n: usize) {
+        unreachable!("span_fast needs a wide stage")
     }
 
     /// shade the gathered pixels in one batch, then depth-write and blend each
@@ -528,6 +613,9 @@ struct PixelPlan {
     /// straight "over": dst factor is 1 - src alpha, src factor is 1 or src
     /// alpha), so alpha == 1 pixels can skip the destination read
     opaque_is_store: bool,
+    /// 8-bit RGBA/BGRA unorm target (Some(true) = BGRA) whose texels the
+    /// vector encoder can write: 4 bytes, no sRGB conversion, all channels
+    unorm8: Option<bool>,
 }
 
 impl PixelPlan {
@@ -545,6 +633,11 @@ impl PixelPlan {
             ],
             mask_all: wm == wgpu::ColorWrites::ALL,
             k,
+            unorm8: match c.format {
+                wgpu::TextureFormat::Bgra8Unorm if wm == wgpu::ColorWrites::ALL => Some(true),
+                wgpu::TextureFormat::Rgba8Unorm if wm == wgpu::ColorWrites::ALL => Some(false),
+                _ => None,
+            },
             opaque_is_store: c.blend.is_some_and(|b| {
                 let over = |c: &wgpu::BlendComponent| {
                     c.operation == BlendOperation::Add
