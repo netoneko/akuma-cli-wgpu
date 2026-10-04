@@ -1537,10 +1537,16 @@ pub fn bench() -> i32 {
     let (cols, rows, cw, ch) = (240u32, 67u32, 16u32, 32u32);
     for (what, glyphs) in [("bg pass only", 0u32), ("bg + a glyph in every cell", cols * rows)] {
         match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 24) {
-            Ok((_px, ms)) => println!(
-                "{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps)",
-                cols * cw, rows * ch, last_best(), 1000.0 / ms
-            ),
+            Ok((px, ms)) => {
+                if let Err(e) = verify_scene(&px, false, cols, rows, cw, ch, cols * cw) {
+                    println!("FAIL {what}: wrong pixels: {e}");
+                    return 1;
+                }
+                println!(
+                    "{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps), pixels verified",
+                    cols * cw, rows * ch, last_best(), 1000.0 / ms
+                )
+            }
             Err(e) => {
                 println!("FAIL {what}: {e}");
                 return 1;
@@ -1552,7 +1558,13 @@ pub fn bench() -> i32 {
     TERMINAL_SCENE.store(true, std::sync::atomic::Ordering::Relaxed);
     for (what, glyphs) in [("terminal-like, bg pass only", 0u32), ("terminal-like, bg + glyphs in 60% of cells", cols * rows * 6 / 10)] {
         match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 24) {
-            Ok((_px, ms)) => println!("{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps)", cols * cw, rows * ch, last_best(), 1000.0 / ms),
+            Ok((px, ms)) => {
+                if let Err(e) = verify_scene(&px, true, cols, rows, cw, ch, cols * cw) {
+                    println!("FAIL {what}: wrong pixels: {e}");
+                    return 1;
+                }
+                println!("{}x{} grid, {what}: {ms:.1} ms/frame, best {:.1} ({:.1} fps), pixels verified", cols * cw, rows * ch, last_best(), 1000.0 / ms)
+            }
             Err(e) => {
                 println!("FAIL {what}: {e}");
                 return 1;
@@ -1626,6 +1638,38 @@ fn last_best() -> f64 {
     f64::from_bits(LAST_BEST_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// the colour of cell (c, r) in the bench scenes: every cell its own, or a dark
+/// background with runs of three highlight colours ("terminal"); 8 bits per channel
+fn scene_cell_rgb(terminal: bool, c: u32, r: u32) -> [u32; 3] {
+    if terminal {
+        const PAL: [[u32; 3]; 3] = [[70, 40, 90], [30, 80, 60], [110, 70, 30]];
+        let k = ((c / 6) * 7 + r * 13) % 10;
+        if k < 7 { [30, 30, 46] } else { PAL[(k - 7) as usize] }
+    } else {
+        [(40 * c + 20) & 255, (80 * r + 30) & 255, 200u32.wrapping_sub(20 * c) & 255]
+    }
+}
+
+/// Check a rendered bench frame at scale: the cell background shows at three
+/// corners of every cell (the fourth is where the glyph quads may reach).
+/// Catches band, thread, run and copy bugs that the small tests are too small to hit.
+fn verify_scene(px: &[u8], terminal: bool, cols: u32, rows: u32, cw: u32, ch: u32, w: u32) -> Result<(), String> {
+    for r in 0..rows {
+        for c in 0..cols {
+            let want = scene_cell_rgb(terminal, c, r);
+            for (dx, dy) in [(1, 1), (cw - 2, 1), (1, ch - 2), (cw - 2, ch - 2)] {
+                let (x, y) = (c * cw + dx, r * ch + dy);
+                let o = ((y * w + x) * 4) as usize;
+                let got = [px[o + 2] as i32, px[o + 1] as i32, px[o] as i32, px[o + 3] as i32];
+                if (0..3).any(|k| (got[k] - want[k] as i32).abs() > 1) || got[3] != 255 {
+                    return Err(format!("cell ({c},{r}) pixel ({x},{y}) = {got:?}, expected {want:?}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 static TERMINAL_SCENE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Run sugarloaf's `grid.wgsl` bg pass and, if `glyphs > 0`, a glyph pass with
@@ -1673,15 +1717,7 @@ fn sugarloaf_scene(
     // the default scene gives every cell its own colour; the "terminal" scene
     // is a dark background with runs of a few highlight colours
     let terminal = TERMINAL_SCENE.load(std::sync::atomic::Ordering::Relaxed);
-    let cell_rgb = |c: u32, r: u32| {
-        if terminal {
-            const PAL: [[u32; 3]; 3] = [[70, 40, 90], [30, 80, 60], [110, 70, 30]];
-            let k = ((c / 6) * 7 + r * 13) % 10;
-            if k < 7 { [30, 30, 46] } else { PAL[(k - 7) as usize] }
-        } else {
-            [40 * c + 20, 80 * r + 30, 200 - 20 * c]
-        }
-    };
+    let cell_rgb = |c: u32, r: u32| scene_cell_rgb(terminal, c, r);
     let mut cells = Vec::new();
     for r in 0..rows {
         for c in 0..cols {
