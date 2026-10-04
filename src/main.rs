@@ -203,6 +203,10 @@ fn main() {
     if argv.first().map(String::as_str) == Some("shader-check") {
         std::process::exit(wgpu_backend::exec_selftest::shader_check(&argv[1..]));
     }
+    if argv.first().map(String::as_str) == Some("thread-probe") {
+        thread_probe();
+        return;
+    }
     let opts = match parse_args(&argv) {
         Ok(o) => o,
         Err(msg) => {
@@ -500,4 +504,25 @@ fn print_metrics(opts: &Options, meter: &FpsMeter, frame: &Frame, switches: u64,
     out.push_str(&format!("Asset switches: {switches}\n"));
     out.push_str("============================\n");
     let _ = std::io::stderr().write_all(out.as_bytes());
+}
+
+/// `akuma-wgpu thread-probe`: can this machine run std threads in parallel?
+/// Spawns 1, 2, 4 and 8 busy threads of equal work and reports wall time.
+fn thread_probe() {
+    println!("available_parallelism: {:?}", std::thread::available_parallelism());
+    fn work() -> u64 {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..150_000_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+        }
+        x
+    }
+    for n in [1usize, 2, 4, 8] {
+        let t0 = monotonic();
+        let hs: Vec<_> = (0..n).map(|_| std::thread::spawn(work)).collect();
+        let sum = hs.into_iter().fold(0u64, |a, h| a ^ h.join().unwrap());
+        println!("{n} threads, same work each: {:.2} s (checksum {sum:x})", monotonic() - t0);
+    }
 }

@@ -1353,38 +1353,6 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     });
     let depth_state = pipe.depth.as_ref();
 
-    let mut raster = super::raster::Raster {
-        color: super::raster::ColorTarget {
-            format: target.format,
-            data: &mut color_guard[..],
-            width: cw,
-            height: ch,
-            blend: target.blend,
-            write_mask: target.write_mask,
-        },
-        depth: match (&mut depth_guard, depth_state) {
-            (Some(z), Some(ds)) => Some(super::raster::DepthTarget {
-                data: &mut z[..],
-                compare: ds.depth_compare.unwrap_or(wgpu::CompareFunction::Always),
-                write: ds.depth_write_enabled.unwrap_or(false),
-            }),
-            _ => None,
-        },
-        viewport: st.viewport.unwrap_or(super::raster::Viewport {
-            x: 0.0,
-            y: 0.0,
-            w: cw as f32,
-            h: ch as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }),
-        scissor: st.scissor.unwrap_or([0, 0, cw, ch]),
-        cull: pipe.cull,
-        front: pipe.front,
-        blend_constant: st.blend_const,
-        interp: fs_stage.frag_interp(),
-    };
-
     let (instances, vertex_ids): (std::ops::Range<u32>, Vec<i64>) = match &what {
         StdDraw::Direct { vertices, instances } => {
             (instances.clone(), vertices.clone().map(|v| v as i64).collect())
@@ -1412,32 +1380,158 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         }
     };
 
+    // ---- vertex stage + primitive assembly (serial) ----
+    let mut verts: Vec<super::exec::RawVertex> = Vec::new();
+    // (a, b, c, provoking) as indices into `verts`
+    let mut prims: Vec<[u32; 4]> = Vec::new();
     for inst in instances {
-        let mut verts: Vec<super::exec::RawVertex> = Vec::with_capacity(vertex_ids.len());
+        let base = verts.len() as u32;
         for &vid in &vertex_ids {
             let attrs = fetch_attrs(pipe, st.vbufs, &vb_idx, &locks, vid, inst);
             verts.push(vs_inv.run_vertex(vid as u32, inst, &attrs));
         }
+        let n = vertex_ids.len() as u32;
         match pipe.topology {
             T::TriangleList => {
-                for t in verts.chunks_exact(3) {
-                    raster.triangle(&mut fs_inv, [&t[0], &t[1], &t[2]], &t[0].varyings);
+                for t in 0..n / 3 {
+                    let a = base + t * 3;
+                    prims.push([a, a + 1, a + 2, a]);
                 }
             }
             T::TriangleStrip => {
-                for i in 0..verts.len().saturating_sub(2) {
-                    let (a, b, c) = (&verts[i], &verts[i + 1], &verts[i + 2]);
+                for i in 0..n.saturating_sub(2) {
+                    let a = base + i;
                     // odd triangles are reversed to keep the winding; the
                     // provoking vertex stays the primitive's first
                     if i % 2 == 0 {
-                        raster.triangle(&mut fs_inv, [a, b, c], &a.varyings);
+                        prims.push([a, a + 1, a + 2, a]);
                     } else {
-                        raster.triangle(&mut fs_inv, [b, a, c], &a.varyings);
+                        prims.push([a + 1, a, a + 2, a]);
                     }
                 }
             }
             other => panic!("akuma backend: topology {other:?} unsupported"),
         }
+    }
+
+    // ---- raster: row bands, in parallel when the draw is big enough ----
+    let viewport = st.viewport.unwrap_or(super::raster::Viewport {
+        x: 0.0,
+        y: 0.0,
+        w: cw as f32,
+        h: ch as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    let scissor = st.scissor.unwrap_or([0, 0, cw, ch]);
+    let interp = fs_stage.frag_interp();
+    let bpt = super::format::bytes_per_texel(target.format).unwrap() as usize;
+    let depth_cfg = depth_state.map(|ds| {
+        (
+            ds.depth_compare.unwrap_or(wgpu::CompareFunction::Always),
+            ds.depth_write_enabled.unwrap_or(false),
+        )
+    });
+    let threads = raster_threads(&prims, cw, ch);
+    // many more bands than threads: bands cost very different amounts
+    let n_bands = if threads > 1 { (threads * 8).min(ch as usize).max(1) } else { 1 };
+    let rows_per_band = (ch as usize).div_ceil(n_bands);
+
+    struct Band<'b> {
+        y0: i64,
+        y1: i64,
+        color: &'b mut [u8],
+        depth: Option<&'b mut [f32]>,
+    }
+    let color_all: &mut [u8] = &mut color_guard[..];
+    let mut depth_bands: Vec<Option<&mut [f32]>> = match (&mut depth_guard, depth_cfg) {
+        (Some(z), Some(_)) => z[..].chunks_mut(rows_per_band * cw as usize).map(Some).collect(),
+        _ => (0..n_bands).map(|_| None).collect(),
+    };
+    depth_bands.reverse();
+    let mut bands: Vec<Band<'_>> = Vec::with_capacity(n_bands);
+    for (bi, c) in color_all.chunks_mut(rows_per_band * cw as usize * bpt).enumerate() {
+        let y0 = (bi * rows_per_band) as i64;
+        bands.push(Band {
+            y0,
+            y1: (y0 + (c.len() / (cw as usize * bpt)) as i64),
+            color: c,
+            depth: depth_bands.pop().flatten(),
+        });
+    }
+
+    let run_band = |band: Band<'_>, fs: &mut Invoker<'_>| {
+        let mut raster = super::raster::Raster {
+            color: super::raster::ColorTarget {
+                format: target.format,
+                data: band.color,
+                width: cw,
+                height: ch,
+                blend: target.blend,
+                write_mask: target.write_mask,
+            },
+            depth: match (band.depth, depth_cfg) {
+                (Some(z), Some((compare, write))) => {
+                    Some(super::raster::DepthTarget { data: z, compare, write })
+                }
+                _ => None,
+            },
+            viewport,
+            scissor,
+            cull: pipe.cull,
+            front: pipe.front,
+            blend_constant: st.blend_const,
+            interp: interp.clone(),
+            band: (band.y0, band.y1),
+            row0: band.y0,
+        };
+        for p in &prims {
+            raster.triangle(
+                fs,
+                [&verts[p[0] as usize], &verts[p[1] as usize], &verts[p[2] as usize]],
+                &verts[p[3] as usize].varyings,
+            );
+        }
+    };
+
+    if threads <= 1 {
+        for band in bands {
+            run_band(band, &mut fs_inv);
+        }
+    } else {
+        let queue = Mutex::new(bands);
+        let res_ref = &res;
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| {
+                    let mut fs = fs_stage.begin(res_ref);
+                    loop {
+                        let next = queue.lock().unwrap().pop();
+                        match next {
+                            Some(b) => run_band(b, &mut fs),
+                            None => break,
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Worker count for a draw: 1 unless the draw is big enough to repay thread
+/// start-up (`AKUMA_THREADS=n` overrides; default = available parallelism).
+fn raster_threads(prims: &[[u32; 4]], w: u32, h: u32) -> usize {
+    let want = std::env::var("AKUMA_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .clamp(1, 8);
+    // threads cost ~100 us each to start; a draw of a handful of small
+    // triangles is not worth it. Coarse test: enough primitives, or a big target.
+    if want > 1 && (prims.len() >= 64 || (prims.len() >= 1 && (w as u64 * h as u64) >= 1_000_000 && prims.len() <= 4)) {
+        want
+    } else {
+        1
     }
 }
 

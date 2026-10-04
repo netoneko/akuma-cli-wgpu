@@ -65,6 +65,11 @@ pub struct Raster<'a> {
     pub blend_constant: [f32; 4],
     /// fragment-stage input locations and how each varies
     pub interp: Vec<(u32, Interp)>,
+    /// rows [band.0, band.1) this rasterizer may touch (for tile-parallel
+    /// draws; the whole target otherwise) and the target row that
+    /// `color.data` / `depth.data` index 0 corresponds to
+    pub band: (i64, i64),
+    pub row0: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -184,7 +189,8 @@ impl Raster<'_> {
         let max_y = ((s.iter().map(|p| p.y).max().unwrap() + SUB / 2).div_euclid(SUB) + 1)
             .min((sc[1] + sc[3]) as i64)
             .min(vp_y1);
-        let (min_x, min_y) = (min_x.max(0), min_y.max(0));
+        let (min_x, min_y) = (min_x.max(0), min_y.max(self.band.0));
+        let max_y = max_y.min(self.band.1);
         if min_x >= max_x || min_y >= max_y {
             return;
         }
@@ -241,7 +247,7 @@ impl Raster<'_> {
                         zf = (l[0] * s[0].z + l[1] * s[1].z + l[2] * s[2].z) as f32;
                         invw = l[0] * s[0].invw + l[1] * s[1].invw + l[2] * s[2].invw;
                     }
-                    let idx = (py * cw + px) as usize;
+                    let idx = ((py - self.row0) * cw + px) as usize;
                     let pass = match &self.depth {
                         Some(d) => compare(d.compare, zf, d.data[idx]),
                         None => true,
@@ -510,7 +516,13 @@ impl PixelPlan {
                         format::encode(self.fmt, src, &mut t);
                         t
                     });
-                    texel.copy_from_slice(&t[..self.bpt]);
+                    // fixed-size stores: a variable-length copy_from_slice is a
+                    // real memcpy call per pixel on musl
+                    match self.bpt {
+                        4 => texel.copy_from_slice(&t[..4]),
+                        2 => texel.copy_from_slice(&t[..2]),
+                        _ => texel[0] = t[0],
+                    }
                 } else {
                     format::encode(self.fmt, src, texel);
                 }

@@ -23,6 +23,11 @@ pub struct TexRef {
     pub format: wgpu::TextureFormat,
 }
 
+// the pointer targets texture storage that the draw keeps locked and
+// read-only for its whole duration; worker threads only read through it
+unsafe impl Send for TexRef {}
+unsafe impl Sync for TexRef {}
+
 impl TexRef {
     pub const EMPTY: TexRef = TexRef {
         data: std::ptr::null(),
