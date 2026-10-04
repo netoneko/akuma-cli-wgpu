@@ -288,6 +288,11 @@ impl Raster<'_> {
             None
         };
 
+        let (runs_x, runs_y) = if span_fast { fs.has_runs() } else { (false, false) };
+        // y runs: the previous row's covered interval when it was produced purely
+        // by stores, and how many further rows share its quantized y values
+        let mut prev_row: Option<(i64, i64)> = None;
+        let mut y_budget = 0usize;
         for py in min_y..max_y {
             // the covered pixels of this row are one interval [lo, hi) of
             // offsets from min_x: each edge function is linear in x, so each
@@ -342,13 +347,55 @@ impl Raster<'_> {
             }
             if filled {
                 // nothing more for this row
+                prev_row = None;
+                y_budget = 0;
             } else if lo < hi && span_fast {
-                let w0 = [w_row[0] + dwdx[0] * lo, w_row[1] + dwdx[1] * lo, w_row[2] + dwdx[2] * lo];
-                self.fast_span(
-                    fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, py, min_x + lo, w0, (hi - lo) as usize,
-                    (lo, py - min_y),
-                );
+                let mut row = |this: &mut Self, fs: &mut Invoker<'_>, a: i64, b: i64| -> bool {
+                    let w0 = [w_row[0] + dwdx[0] * a, w_row[1] + dwdx[1] * a, w_row[2] + dwdx[2] * a];
+                    this.fast_span(
+                        fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, py, min_x + a, w0, (b - a) as usize,
+                        (a, py - min_y), runs_x,
+                    )
+                };
+                let mut copied = false;
+                if runs_y && y_budget > 0 {
+                    if let Some((plo, phi)) = prev_row {
+                        let (olo, ohi) = (lo.max(plo), hi.min(phi));
+                        if ohi - olo >= 16 {
+                            // same quantized y as the row above: copy what overlaps
+                            // it, shade the few pixels that do not
+                            let mut pure = true;
+                            if lo < olo {
+                                pure &= row(self, fs, lo, olo);
+                            }
+                            let src = ((py - 1 - self.row0) * cw + min_x + olo) as usize * 4;
+                            let dst = ((py - self.row0) * cw + min_x + olo) as usize * 4;
+                            self.color.data.copy_within(src..src + (ohi - olo) as usize * 4, dst);
+                            if ohi < hi {
+                                pure &= row(self, fs, ohi, hi);
+                            }
+                            y_budget -= 1;
+                            prev_row = pure.then_some((lo, hi));
+                            if !pure {
+                                y_budget = 0;
+                            }
+                            copied = true;
+                        }
+                    }
+                }
+                if !copied {
+                    let pure = row(self, fs, lo, hi);
+                    if runs_y && pure {
+                        prev_row = Some((lo, hi));
+                        y_budget = fs.y_extent(py, (max_y - py - 1) as usize);
+                    } else {
+                        prev_row = None;
+                        y_budget = 0;
+                    }
+                }
             } else {
+                prev_row = None;
+                y_budget = 0;
                 for k in lo..hi {
                     let px = min_x + k;
                     let w = [w_row[0] + dwdx[0] * k, w_row[1] + dwdx[1] * k, w_row[2] + dwdx[2] * k];
@@ -440,13 +487,17 @@ impl Raster<'_> {
         w0: [i64; 3],
         n: usize,
         (kx0, ky): (i64, i64),
-    ) {
+        runs_x: bool,
+    ) -> bool {
         use super::exec::Shade4;
         let bgra = plan.unorm8.unwrap();
         let ypos = py as f32 + 0.5;
         if !fs.span_begin(provoking, ypos, !flat_all) {
-            return;
+            return false;
         }
+        // every pixel of the span came straight from the shader (no blending
+        // with the destination, no discard): the row can be copied downwards
+        let mut pure = true;
         let cw = self.color.width as i64;
         let base = ((py - self.row0) * cw + px0) as usize * 4;
         // the triangle's planes, evaluated at this span's first pixel:
@@ -482,11 +533,13 @@ impl Raster<'_> {
             match shade {
                 Shade4::Colors(c) => {
                     let (px, all_opaque) = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra);
-                    if plan.blend.is_none() || (plan.opaque_is_store && all_opaque) {
+                    let stored = plan.blend.is_none() || (plan.opaque_is_store && all_opaque);
+                    if stored {
                         for (i, p) in px.iter().take(m).enumerate() {
                             out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
                     } else if let Some((sfc, sfa)) = plan.over {
+                        pure = false;
                         // blend all four against the destination at once
                         let mut d = [0u8; 16];
                         d[..m * 4].copy_from_slice(out);
@@ -495,13 +548,32 @@ impl Raster<'_> {
                             out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
                         }
                     } else {
+                        pure = false;
                         for i in 0..m {
                             let col = [c[0].0[i], c[1].0[i], c[2].0[i], c[3].0[i]];
                             plan.write(&mut out[i * 4..i * 4 + 4], col, false, &mut None, &mut None);
                         }
                     }
+                    // a run: the last pixel's result also holds for the pixels after
+                    // it while the shader's quantized position values stay the same
+                    if runs_x
+                        && m == 4
+                        && (stored || (plan.opaque_is_store && c[3].0[3] == 1.0f32.to_bits()))
+                        && n - done > 4
+                    {
+                        let extra = fs.x_extent(px0 + done as i64 + 3, n - done - 4);
+                        if extra > 0 {
+                            let t = px[3].to_le_bytes();
+                            let at = base + (done + 4) * 4;
+                            for q in self.color.data[at..at + extra * 4].chunks_exact_mut(4) {
+                                q.copy_from_slice(&t);
+                            }
+                            done += extra;
+                        }
+                    }
                 }
                 Shade4::Diverged => {
+                    pure = false;
                     // the lanes branched differently: one scalar run each
                     for i in 0..m {
                         let mut var = *provoking;
@@ -522,10 +594,11 @@ impl Raster<'_> {
                         }
                     }
                 }
-                Shade4::Killed => {}
+                Shade4::Killed => pure = false,
             }
             done += m;
         }
+        pure
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -543,7 +616,8 @@ impl Raster<'_> {
         _w0: [i64; 3],
         _n: usize,
         _k: (i64, i64),
-    ) {
+        _runs_x: bool,
+    ) -> bool {
         unreachable!("span_fast needs a wide stage")
     }
 

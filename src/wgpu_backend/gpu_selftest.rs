@@ -986,6 +986,149 @@ fn t_over_blend_vector(g: &Gpu) -> TestResult {
     Ok(())
 }
 
+
+/// Run detection (`runs.rs`): a cell-grid shader whose position dependence is
+/// pure quantization must render identically with run replication on and off,
+/// across cell sizes and offsets that are not multiples of anything, for a
+/// fullscreen triangle and for a slanted two-triangle quad; a shader that
+/// uses the position directly must be unaffected.
+fn t_runs(g: &Gpu) -> TestResult {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (w, h) = (211u32, 131u32);
+    let fmt = wgpu::TextureFormat::Bgra8Unorm;
+    let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let bgl = g.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: vis,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
+    });
+    let pl = g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let grid_fs = "
+struct U { pad: vec4<f32>, dims: vec4<u32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> cells: array<u32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let f = (p.xy - u.pad.xy) / u.pad.zw;
+    var gp = vec2<i32>(floor(f));
+    let cols = i32(u.dims.x);
+    let rows = i32(u.dims.y);
+    if (gp.x < 0) { gp.x = 0; } else if (gp.x > cols - 1) { gp.x = cols - 1; }
+    if (gp.y < 0) { gp.y = 0; } else if (gp.y > rows - 1) { gp.y = rows - 1; }
+    let wd = cells[u32(gp.y) * u.dims.x + u32(gp.x)];
+    let r = pow(f32(wd & 255u) / 255.0, 2.2);
+    let gg = pow(f32((wd >> 8u) & 255u) / 255.0, 0.7);
+    let b = pow(f32((wd >> 16u) & 255u) / 255.0, 1.4);
+    return vec4<f32>(r, gg, b, 1.0);
+}";
+    // the position leaks into the colour: no run may be assumed
+    let leaky_fs = "
+struct U { pad: vec4<f32>, dims: vec4<u32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> cells: array<u32>;
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let f = (p.xy - u.pad.xy) / u.pad.zw;
+    let gp = vec2<i32>(floor(f));
+    let wd = cells[u32(clamp(gp.y, 0, i32(u.dims.y) - 1)) * u.dims.x + u32(clamp(gp.x, 0, i32(u.dims.x) - 1))];
+    return vec4<f32>(f32(wd & 255u) / 255.0, fract(p.x * 0.05), fract(p.y * 0.03), 1.0);
+}";
+    let vs_tri = "@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> { return full(vi); }";
+    // a quad inset from the edges; its two triangles meet on a diagonal
+    let vs_quad = "@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let x = select(-0.93, 0.88, (vi & 1u) == 1u);
+    let y = select(-0.81, 0.91, (vi & 2u) == 2u);
+    return vec4<f32>(x, y, 0.5, 1.0);
+}";
+    let geoms: [[f32; 4]; 5] = [
+        [0.0, 0.0, 16.0, 32.0],
+        [3.5, 7.25, 9.3, 13.7],
+        [-5.5, 2.0, 5.0, 5.0],
+        [0.0, 0.0, 3.0, 2.5],
+        [10.0, 4.0, 40.0, 1.0],
+    ];
+    let run = |vs: &str, fs: &str, topo: wgpu::PrimitiveTopology, verts: u32, geo: [f32; 4], force_spec: bool| -> Vec<u8> {
+        let (cols, rows) = (((w as f32 - geo[0]) / geo[2]).ceil().max(1.0) as u32 + 1, ((h as f32 - geo[1]) / geo[3]).ceil().max(1.0) as u32 + 1);
+        let mut cells = Vec::new();
+        let mut x = 0xCAFE_F00Du32 ^ cols;
+        for i in 0..cols * rows {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = if i % 5 == 0 { 0x00_40_80_20 } else { x & 0x00ff_ffff };
+            cells.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut u = Vec::new();
+        for v in geo {
+            u.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [cols, rows, 0, 0] {
+            u.extend_from_slice(&v.to_le_bytes());
+        }
+        let src = format!("{FULL_TRI}\n{vs}\n{fs}");
+        let m = g.module(&src);
+        let p = g.pipeline(&m, &pl, fmt, None, topo, None, &[]);
+        let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
+        let cbuf = g.buffer(&cells, wgpu::BufferUsages::STORAGE);
+        let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cbuf.as_entire_binding() },
+            ],
+        });
+        crate::wgpu_backend::exec::FORCE_SPEC.store(force_spec, Relaxed);
+        let target = g.texture(w, h, fmt);
+        g.pass(&target, Some(wgpu::Color { r: 0.25, g: 0.5, b: 0.75, a: 1.0 }), |rp| {
+            rp.set_pipeline(&p);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..verts, 0..1);
+        });
+        crate::wgpu_backend::exec::FORCE_SPEC.store(false, Relaxed);
+        g.read(&target, w, h, 4)
+    };
+    for (name, vs, verts, topo) in [
+        ("fullscreen triangle", vs_tri, 3u32, wgpu::PrimitiveTopology::TriangleList),
+        ("slanted quad", vs_quad, 4u32, wgpu::PrimitiveTopology::TriangleStrip),
+    ] {
+        for fs in [grid_fs, leaky_fs] {
+            for &geo in &geoms {
+                for spec in [false, true] {
+                    crate::wgpu_backend::runs::ENABLED.store(false, Relaxed);
+                    let want = run(vs, fs, topo, verts, geo, spec);
+                    crate::wgpu_backend::runs::ENABLED.store(true, Relaxed);
+                    let got = run(vs, fs, topo, verts, geo, spec);
+                    if got != want {
+                        let i = got.iter().zip(&want).position(|(a, b)| a != b).unwrap() / 4;
+                        return Err(format!(
+                            "{name}, {} shader, cells {geo:?}, spec {spec}: first difference at pixel ({}, {}): runs {:?}, no runs {:?}",
+                            if fs == grid_fs { "grid" } else { "leaky" },
+                            i as u32 % w,
+                            i as u32 / w,
+                            &got[i * 4..i * 4 + 4],
+                            &want[i * 4..i * 4 + 4]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// rio/sugarloaf's real `grid.wgsl` through the real wgpu API with its own
 /// pipeline layout: the cell-background pass (storage-buffer cells, 160-byte
 /// uniforms, colour-space maths, premultiplied blend into Bgra8Unorm) and the
@@ -1461,6 +1604,7 @@ pub fn run() -> i32 {
         ("texture-to-texture copy with origins", t_texture_copy),
         ("memoized + specialized fragment shader vs CPU", t_memo_spec),
         ("over-blending onto random texels vs scalar definition", t_over_blend_vector),
+        ("position-quantization runs match per-pixel shading", t_runs),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
     ];
     let mut failed = 0;

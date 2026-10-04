@@ -136,6 +136,8 @@ pub struct Program {
     pub tex_ops: Vec<super::texture::TexOp>,
     /// memoized regions (see `memo.rs`). Heap-stable like `tex_ops`.
     pub memos: Vec<MemoInfo>,
+    /// where the result is constant along rows / columns of pixels (see `runs.rs`)
+    pub runs: super::runs::RunInfo,
 }
 
 /// A pure region of the program whose result depends only on a few registers:

@@ -277,6 +277,7 @@ impl Stage {
         let was = prog.code.len();
         if self.is_fragment_program(&prog) {
             super::memo::apply(&mut prog);
+            prog.runs = super::runs::analyze(&prog);
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         let (jit, wide) = match backends(&prog, &c.force, name, false) {
@@ -542,6 +543,43 @@ impl Invoker<'_> {
             return n;
         }
         let _ = out;
+        0
+    }
+
+    /// Wide stages: (x runs, y runs) are usable — see `runs.rs`.
+    pub fn has_runs(&self) -> (bool, bool) {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { p, .. } = self {
+            if super::runs::enabled() {
+                return (p.runs.x.is_some(), p.runs.y.is_some());
+            }
+        }
+        (false, false)
+    }
+
+    /// After a batch ran: how many pixels past pixel column `last_px` (up to
+    /// `max`) provably produce the same result as it does.
+    pub fn x_extent(&self, last_px: i64, max: usize) -> usize {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { p, regs, .. } = self {
+            if let Some(ax) = &p.runs.x {
+                return ax.extent(&|r| regs[r as usize].0[0], last_px as f32 + 0.5, max);
+            }
+        }
+        let _ = (last_px, max);
+        0
+    }
+
+    /// As `x_extent`, in rows: how many rows after row `py` produce, for the
+    /// same column, the same result.
+    pub fn y_extent(&self, py: i64, max: usize) -> usize {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Invoker::Wide { p, regs, .. } = self {
+            if let Some(ay) = &p.runs.y {
+                return ay.extent(&|r| regs[r as usize].0[0], py as f32 + 0.5, max);
+            }
+        }
+        let _ = (py, max);
         0
     }
 
