@@ -1493,7 +1493,14 @@ impl<'m> Lowerer<'m> {
 
     fn call(&mut self, f: Fun, a: R, b: R, k: K) -> (R, K) {
         let d = self.nr();
-        self.push(Inst::Call { d, a, b, f });
+        if f.cacheable() {
+            // four consecutive persistent registers: valid, key a, key b, result
+            let c = self.nregs;
+            self.nregs += 4;
+            self.push(Inst::CallC { d, a, b, f, c });
+        } else {
+            self.push(Inst::Call { d, a, b, f });
+        }
         (d, k)
     }
 

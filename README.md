@@ -175,6 +175,70 @@ for every vertex — hoisting uniform-only computation out of the per-invocation
 obvious next win for the executor itself.
 
 
+## M4: the standard-mode GPU — what rio/sugarloaf needs (2026-10-04)
+
+The M3 backend had a private contract (pixel-space positions, flat varyings, one raw
+`Rgba8Uint` target) that is exactly right for the demo's bit-exact acceptance and wrong for any
+real wgpu client. M4 adds the real thing **beside** it: a pipeline whose target is anything but
+`Rgba8Uint` takes the *standard* path (`PipelineData::legacy()` decides); the demo path is
+untouched and its checksums still match softrender.
+
+| file | what |
+|---|---|
+| `raster.rs` | clip (0≤z≤w + x/y guard band) → perspective divide → viewport (y flipped) → 1/256-pixel fixed point → winding cull → i64 edge-function fill with the **top-left rule** → flat / linear / perspective-correct varyings → depth test → fragment stage → blend → write mask → format encode. Fragments are bounded by viewport ∩ scissor ∩ target |
+| `format.rs` | `R8`, `Rg8`, `Rgba8`, `Bgra8` unorm (+ sRGB variants), `Rgba8Uint`; decode/encode |
+| `vertex.rs` | vertex-buffer attribute fetch (Float32xN, Uint/Sint 8/16/32, Unorm/Snorm 8/16, defaults (0,0,0,1)) |
+| `texture.rs` | `textureLoad`, `textureSample*`, `textureDimensions`: nearest/bilinear, clamp/repeat/mirror/border, sRGB decoded before filtering; level 0 only (one mip) |
+| `backend.rs` | pipeline state capture (targets, blend, topology, cull, vertex layouts), vertex/index buffers, viewport, scissor, blend constant, `draw`/`draw_indexed`, instancing, triangle lists and strips, `copy_buffer_to_texture` / `copy_texture_to_texture` / origins in `write_texture` |
+| `compile.rs` | now also: texture/sampler globals, dynamic indexing of local arrays, fragment interpolation modes |
+
+`akuma-wgpu gpu-selftest` drives all of it through the real wgpu API and checks pixels against
+hand-computed values — 16 tests, all passing on host (VM) and on the trashcan (JIT): fullscreen
+triangle, **watertight shared edge** (a quad's two triangles cover every pixel centre on the
+diagonal exactly once, top-left rule at the boundary), linear and **perspective-correct**
+varyings, **instancing** with `Float32x2` + `Uint32x2` + `Unorm8x4` + `Sint16x2` attributes on
+a triangle strip, back-face culling, premultiplied-alpha blending, scissor and viewport, target
+formats, `textureLoad`, nearest/bilinear/repeat sampling, sRGB decode, texture copies — and
+**sugarloaf's real `grid.wgsl`**: its cell-background pass (160-byte uniforms, storage-buffer
+cells, colour-space maths) and instanced glyph pass (7 attributes in 4 formats, mat4
+projection, atlas `textureLoad`), through the same pipeline layout rio uses, pixel-correct
+(±1) in Bgra8Unorm. Run it with `AKUMA_SUGARLOAF=<rio>/sugarloaf/src` (the shader is read from
+rio's checkout, not vendored here). `shader-check` on all of sugarloaf's WGSL:
+**15 of 15 entry points lower and JIT.**
+
+### The remaining problem: fragment cost at 4K
+
+`akuma-wgpu gpu-bench` (same `AKUMA_SUGARLOAF`) times 3840×2144 passes on the trashcan, JIT:
+
+| pass | ms/frame | per fragment |
+|---|---|---|
+| constant-colour shader, no blend | 536 | 65 ns |
+| constant-colour shader, premultiplied blend | 600 | 73 ns |
+| sugarloaf cell backgrounds (382-instruction fragment shader) | 1590 | 195 ns |
+| + a glyph in every cell (16k instanced quads) | 1700 | — |
+
+A full 4K redraw in ~1.6 s is correct but far too slow for interactive use; rio redraws the
+whole grid background on any change. What the numbers say, and what has been tried:
+
+* **~65 ns is pure per-fragment pipeline overhead** (edge setup, depth check, varyings
+  copy, `run_fragment` marshalling, decode + blend + encode) before the shader runs a single
+  instruction. That fixed cost is the first target: it dominates anything simple and
+  caps everything else.
+* The shader itself is ~130 ns for 382 template-JIT instructions. It was ~230 ns until a
+  **per-call-site result cache for transcendentals** (`Inst::CallC`: last arguments → last
+  result in persistent registers) removed most of the 6 `powf` calls per fragment, which
+  repeat their arguments across a flat cell. The same cache helps the demo, where
+  `sin`/`cos` of per-frame uniforms were recomputed for every vertex.
+* Not yet done, in expected-value order: (1) cut the fixed per-fragment cost — span-level
+  loops that skip the depth/blend machinery when it is a no-op, no per-pixel varyings copy
+  for flat-only shaders, cheaper encode; (2) specialize the program per draw on the
+  (constant) uniform buffer — folds `input_colorspace`/`padding_extend`/cursor branches
+  away; (3) evaluate fragments in batches of 4-8 lanes with SSE/AVX in the JIT (uniform
+  branches stay fast, divergence falls back to scalar); (4) parallelize over tiles if the
+  kernel's threads are usable; (5) real register allocation in the JIT.
+  The box has no `/proc/cpuinfo`; check SSE4.1/AVX2 with `is_x86_feature_detected!` before
+  designing (3).
+
 ## Baseline: selftest checksums and timings (re-measured 2026-10-04)
 
 These are the acceptance numbers for M3: the wgpu path must reproduce these frames (same
@@ -404,42 +468,43 @@ what its absence does.
 - **Not done:** textures/samplers, vertex buffers, blending, standard viewport semantics —
   see "Next steps".
 
+### Task 9 — the standard-mode GPU (M4) — DONE 2026-10-04
+
+- Surveyed rio's real wgpu use first (formats, vertex formats, blend factors, samplers, draw
+  calls) so the subset is the one that matters; see the M4 section for what was built.
+- `gpu-selftest` (16 tests) is the acceptance; writing it exposed real bugs before any client
+  could: the compiler could not index a local array dynamically (sugarloaf does), the
+  interpreter could not return a bare `@builtin(position)`, and fragments were not bounded by
+  the viewport rectangle (the guard-band clip lets geometry run past NDC ±1).
+- sugarloaf's own `grid.wgsl` renders pixel-correct through its own pipeline layout, on host
+  and on the trashcan. 15/15 sugarloaf entry points lower and JIT.
+- `gpu-bench` found the next wall: ~65 ns of fixed per-fragment cost plus the shader, i.e. a
+  full 4K redraw takes ~1.6 s. The transcendental result cache (`CallC`) already took the
+  grid shader from 2.8 s to 1.6 s.
+- **Could not verify:** rio itself (not built against this backend); any `Surface`/swapchain
+  path; mipmaps; HDR formats; that bilinear sampling matches a real GPU's rounding bit for
+  bit (it does not claim to).
+
 ## Next steps (updated 2026-10-04, branch `jit-shader-executor`)
 
-Done this session, in the order the previous version of this section laid out: (1) mesh parity
-— verified, it was already fixed; (2) profiled — the interpreter was ~97% of the frame; (3) the
-`Stage` executor interface; (4) the naga-IR → register-program compiler and VM; (5) the x86-64
-JIT. All bit-identical to softrender, all diffed by `exec-selftest`. The wgpu path went from
-254 ms/frame at 256x144 to 7 ms at 720p. Remaining, in rough order of value:
+Done: the compiler/VM/JIT executors (M3 speed), the standard-mode GPU and its test suite
+(M4), real sugarloaf shaders running on the trashcan. In order:
 
-1. **Make real shaders compile: textures.** `shader-check` against sugarloaf's actual WGSL
-   (`rio/sugarloaf/src/**/*.wgsl`) says **10 of 16 entry points already lower and JIT** — all 7
-   vertex shaders and the 382-instruction grid background fragment shader — and **all 6
-   declines are one cause**: texture/sampler globals (`textureLoad`, `textureSample`,
-   `textureSampleLevel`, `textureDimensions`). Needs `ImageLoad`/`ImageSample`/`ImageQuery`
-   lowering plus texture and sampler bindings in the backend (today `build_resources` panics on
-   them) — nearest first (`textureLoad` is what the grid text pass uses), then bilinear.
-2. **Backend features rio needs that the fixed-function side does not have yet** (this is
-   most of the distance to rio, and it is backend work, not shader work):
-   * standard clip → NDC → viewport transform and varying interpolation. Today the contract is
-     "`@builtin(position)` is already in pixels, varyings are flat" — right for this demo's
-     bit-exactness, wrong for any real wgpu client. Make it a per-pipeline mode so the demo
-     keeps its contract.
-   * vertex buffers + instancing (sugarloaf's text/quad passes are instanced attribute
-     streams: `Uint32x2`, `Sint16x2`, `Unorm8x4`, `Uint8` ...). The compiled stages already
-     accept `@location` inputs (`Src::Location`); nothing feeds them yet.
-   * triangle strips, premultiplied-alpha blending (`One`, `OneMinusSrcAlpha`), unorm color
-     targets (`Rgba8Unorm`/`Bgra8Unorm`, today only `Rgba8Uint`), optional depth,
-     scissor/viewport state, multiple bind groups beyond what `execute_render` handles.
-   * `discard` already works in all executors (`Kill`).
-3. **Executor speed, if the demo's 4K frame matters:** hoist uniform-only computation (the
-   `sin`/`cos` of per-frame uniforms is recomputed per vertex) out of the per-invocation path;
-   evaluate flat-varying, position-independent fragment shaders once per triangle; real
-   register allocation in the JIT (every virtual register currently lives in memory).
-4. **Then rio itself:** a framebuffer platform in `rio-window` (screen = `/dev/fb0`, input = the
-   console tty), a `Surface` whose texture is presented into the mapping with whole-row
-   copies, and this backend as sugarloaf's wgpu. rio redraws on change with 2D quads and a
-   glyph atlas, so it needs far less than full-screen 60 fps shading.
+1. **Fragment throughput** — see "The remaining problem" above; this is what stands between
+   the current backend and a usable 4K rio. Re-run `gpu-bench` after every change.
+2. **Verify on `/dev/fb0`** that the demo still looks right with everything above (only
+   headless `selftest` and `screensaver --timeout` runs were done this session, no human
+   looked at the panel).
+3. **rio itself**, which is outside this repo: a framebuffer platform in `rio-window`
+   (screen = `/dev/fb0`, input = the console tty), a `Surface` whose texture is presented
+   into the mapping with whole-row copies, and building rio against this wgpu backend. Known
+   gaps to check against rio's real use once it builds: surface/swapchain semantics
+   (`get_current_texture`, `present`), `Rgba16Float` / HDR filter targets, `Rgba8Snorm`,
+   mipmapped textures (rio's filter chain creates them), depth/stencil, multisampling
+   (rio uses `sample_count: 1`), and the 2 `copy_texture_to_texture` / 2 `set_viewport`
+   call sites.
+4. Smaller: uniform-only computation is still recomputed per invocation in the demo's vertex
+   shader (the call cache removed the transcendental cost; the rest is cheap).
 
 ## Tasks, in order
 

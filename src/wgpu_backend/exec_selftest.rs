@@ -342,7 +342,23 @@ pub fn shader_check(files: &[String]) -> i32 {
                     };
                     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
                     let j = "no jit on this target".to_string();
-                    format!("ok: {} insts, {} regs, {} buffers, {j}", p.code.len(), p.nregs, p.bufs.len())
+                    // instruction mix: what the per-invocation cost is made of
+                    let mut calls = std::collections::BTreeMap::<String, u32>::new();
+                    let (mut loads, mut tex, mut jumps) = (0, 0, 0);
+                    for i in &p.code {
+                        match i {
+                            super::program::Inst::Call { f, .. } => *calls.entry(format!("{f:?}")).or_default() += 1,
+                            super::program::Inst::LoadBuf { .. } => loads += 1,
+                            super::program::Inst::Tex { .. } => tex += 1,
+                            super::program::Inst::Jmp { .. } | super::program::Inst::Jz { .. } | super::program::Inst::Jnz { .. } => jumps += 1,
+                            _ => {}
+                        }
+                    }
+                    let ncalls: u32 = calls.values().sum();
+                    format!(
+                        "ok: {} insts ({ncalls} helper calls {calls:?}, {loads} buf loads, {tex} tex, {jumps} jumps), {} regs, {} buffers, {j}",
+                        p.code.len(), p.nregs, p.bufs.len()
+                    )
                 }
             };
             println!("{f}: {:?} {:<22} {verdict}", ep.stage, ep.name);

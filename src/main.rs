@@ -101,6 +101,7 @@ enum Mode {
     Selftest,
     ExecSelftest,
     GpuSelftest,
+    GpuBench,
 }
 
 const USAGE: &str = "\
@@ -113,6 +114,7 @@ COMMANDS:
     screensaver    3D cat logo over the Matrix backdrop
     matrix         Matrix backdrop only
     selftest       render headlessly into RAM, print stats, exit
+    gpu-bench      time sugarloaf's grid passes at 4K scale (needs AKUMA_SUGARLOAF)
     gpu-selftest   drive the standard-mode GPU through the wgpu API, check pixels
     exec-selftest  diff the shader executors (interp/vm/jit) bit for bit
     shader-check <file.wgsl>...  does each entry point compile / jit? (and why not)
@@ -156,6 +158,7 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
             "selftest" => mode = Mode::Selftest,
             "exec-selftest" => mode = Mode::ExecSelftest,
             "gpu-selftest" => mode = Mode::GpuSelftest,
+            "gpu-bench" => mode = Mode::GpuBench,
             "-h" | "--help" | "help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown command `{other}` (try --help)")),
         }
@@ -221,6 +224,7 @@ fn main() {
         Mode::Selftest => run_selftest(&opts),
         Mode::ExecSelftest => wgpu_backend::exec_selftest::run(),
         Mode::GpuSelftest => wgpu_backend::gpu_selftest::run(),
+        Mode::GpuBench => wgpu_backend::gpu_selftest::bench(),
         Mode::Matrix => run_show(&opts, /*asset overlay*/ false),
         Mode::Screensaver => run_show(&opts, true),
     };

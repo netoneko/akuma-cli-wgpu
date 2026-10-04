@@ -97,6 +97,21 @@ impl Asm {
     fn store_eax(&mut self, r: u32) {
         self.rm(&[0x89], 0, r);
     }
+    /// short conditional jump with a placeholder; returns the patch position
+    fn jcc8(&mut self, cc: u8) -> usize {
+        self.bytes(&[cc, 0]);
+        self.b.len() - 1
+    }
+    fn jmp8(&mut self) -> usize {
+        self.bytes(&[0xEB, 0]);
+        self.b.len() - 1
+    }
+    /// point the short jump at `pos` to the current position
+    fn patch8(&mut self, pos: usize) {
+        let rel = self.b.len() - (pos + 1);
+        assert!(rel < 128, "jit: short jump out of range");
+        self.b[pos] = rel as u8;
+    }
     fn movss_load(&mut self, xmm: u8, r: u32) {
         self.rm(&[0xF3, 0x0F, 0x10], xmm, r);
     }
@@ -213,6 +228,38 @@ pub fn compile(p: &Program) -> Result<Jit, String> {
                 a.bytes(&[0x48, 0xB8]); // mov rax, imm64
                 a.bytes(&(f.helper() as usize as u64).to_le_bytes());
                 a.bytes(&[0xFF, 0xD0]); // call rax
+                a.store_eax(d);
+            }
+            Inst::CallC { d, a: x, b, f, c } => {
+                a.rm(&[0x83], 7, c); // cmp dword [valid], 0
+                a.u8(0);
+                let j_miss0 = a.jcc8(0x74); // je miss
+                a.load_eax(x);
+                a.rm(&[0x3B], 0, c + 1); // cmp eax,[key a]
+                let j_miss1 = a.jcc8(0x75); // jne miss
+                a.load_ecx(b);
+                a.rm(&[0x3B], 1, c + 2); // cmp ecx,[key b]
+                let j_miss2 = a.jcc8(0x75); // jne miss
+                a.rm(&[0x8B], 0, c + 3); // mov eax,[result]
+                let j_done = a.jmp8();
+                // miss: call the helper, refill the cache
+                a.patch8(j_miss0);
+                a.patch8(j_miss1);
+                a.patch8(j_miss2);
+                a.rm(&[0x8B], 7, x); // mov edi,[a]
+                a.rm(&[0x8B], 6, b); // mov esi,[b]
+                a.bytes(&[0x48, 0xB8]); // mov rax, imm64
+                a.bytes(&(f.helper() as usize as u64).to_le_bytes());
+                a.bytes(&[0xFF, 0xD0]); // call rax
+                a.store_eax(c + 3); // result
+                // edi/esi are caller-saved: reload the keys from the registers
+                a.load_ecx(x);
+                a.rm(&[0x89], 1, c + 1);
+                a.load_ecx(b);
+                a.rm(&[0x89], 1, c + 2);
+                a.rm(&[0xC7], 0, c); // mov dword [valid], 1
+                a.u32(1);
+                a.patch8(j_done);
                 a.store_eax(d);
             }
             Inst::LoadBuf { d, buf, off, imm } => {

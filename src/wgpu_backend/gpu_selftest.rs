@@ -793,11 +793,89 @@ fn t_sugarloaf_grid(g: &Gpu) -> TestResult {
         println!("      (sugarloaf grid.wgsl: set AKUMA_SUGARLOAF=<rio>/sugarloaf/src to run)");
         return Ok(());
     };
-    let path = std::path::Path::new(&dir).join("grid/shaders/grid.wgsl");
+    let (cols, rows, cw, ch) = (6u32, 3u32, 12u32, 16u32);
+    let (w, h) = (cols * cw, rows * ch);
+    let (px, _ms) = sugarloaf_scene(g, &dir, cols, rows, cw, ch, 1, 1)?;
+    sugarloaf_check(&px, cols, rows, cw, ch, w)
+}
+
+/// `AKUMA_SUGARLOAF=<rio>/sugarloaf/src akuma-wgpu gpu-bench`: the same two
+/// passes at 4K scale — a full-screen cell-background pass over a 240x67 grid
+/// and a glyph quad in every cell — timed per frame.
+pub fn bench() -> i32 {
+    let Some(dir) = std::env::var_os("AKUMA_SUGARLOAF") else {
+        eprintln!("gpu-bench needs AKUMA_SUGARLOAF=<rio>/sugarloaf/src");
+        return 2;
+    };
+    let g = Gpu::new();
+    // fixed per-fragment overhead of the pipeline: a constant-colour shader
+    // over the same 3840x2144 target, without and with premultiplied blending
+    {
+        let (w, h) = (3840u32, 2144u32);
+        let src = format!(
+            "{FULL_TRI}
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs() -> @location(0) vec4<f32> {{ return vec4<f32>(0.25, 0.5, 0.75, 1.0); }}"
+        );
+        let m = g.module(&src);
+        let c = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        for (what, blend) in [
+            ("constant shader, no blend", None),
+            ("constant shader, premultiplied blend", Some(wgpu::BlendState { color: c, alpha: c })),
+        ] {
+            let fmt = wgpu::TextureFormat::Bgra8Unorm;
+            let tex = g.texture(w, h, fmt);
+            let p = g.pipeline(&m, &g.empty_layout(), fmt, blend, wgpu::PrimitiveTopology::TriangleList, None, &[]);
+            let t0 = crate::clock::monotonic();
+            for _ in 0..3 {
+                g.pass(&tex, Some(BLACK), |rp| {
+                    rp.set_pipeline(&p);
+                    rp.draw(0..3, 0..1);
+                });
+            }
+            let ms = (crate::clock::monotonic() - t0) * 1000.0 / 3.0;
+            println!("{w}x{h}, {what}: {ms:.1} ms/frame ({:.0} ns/fragment)", ms * 1e6 / (w * h) as f64);
+        }
+    }
+    let (cols, rows, cw, ch) = (240u32, 67u32, 16u32, 32u32);
+    for (what, glyphs) in [("bg pass only", 0u32), ("bg + a glyph in every cell", cols * rows)] {
+        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 3) {
+            Ok((_px, ms)) => println!(
+                "{}x{} grid, {what}: {ms:.1} ms/frame ({:.1} fps)",
+                cols * cw, rows * ch, 1000.0 / ms
+            ),
+            Err(e) => {
+                println!("FAIL {what}: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Run sugarloaf's `grid.wgsl` bg pass and, if `glyphs > 0`, a glyph pass with
+/// that many instances (the first at grid (2,1) as the verified glyph, the
+/// rest spread over the grid). Returns the pixels of the last frame and the
+/// mean milliseconds per frame over `frames` timed repetitions.
+#[allow(clippy::too_many_arguments)]
+fn sugarloaf_scene(
+    g: &Gpu,
+    dir: &std::ffi::OsStr,
+    cols: u32,
+    rows: u32,
+    cw: u32,
+    ch: u32,
+    glyphs: u32,
+    frames: u32,
+) -> Result<(Vec<u8>, f64), String> {
+    let path = std::path::Path::new(dir).join("grid/shaders/grid.wgsl");
     let src = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let m = g.module(&src);
 
-    let (cols, rows, cw, ch) = (6u32, 3u32, 12u32, 16u32);
     let (w, h) = (cols * cw, rows * ch);
     let fmt = wgpu::TextureFormat::Bgra8Unorm;
 
@@ -946,32 +1024,49 @@ fn t_sugarloaf_grid(g: &Gpu) -> TestResult {
         multiview_mask: None,
         cache: None,
     });
-    // one glyph at grid (2,1): atlas pos (1,1), size 6x8, bearings (3,12), white
+    // glyph instances; the first is the verified one: grid (2,1), atlas pos
+    // (1,1), size 6x8, bearings (3,12), white. The rest are the same glyph
+    // spread over the other cells (cell 16x32 in the bench has room for it).
     let mut inst = Vec::new();
-    inst.extend_from_slice(&1u32.to_le_bytes());
-    inst.extend_from_slice(&1u32.to_le_bytes());
-    inst.extend_from_slice(&6u32.to_le_bytes());
-    inst.extend_from_slice(&8u32.to_le_bytes());
-    inst.extend_from_slice(&3i16.to_le_bytes());
-    inst.extend_from_slice(&12i16.to_le_bytes());
-    inst.extend_from_slice(&2u16.to_le_bytes());
-    inst.extend_from_slice(&1u16.to_le_bytes());
-    inst.extend_from_slice(&[255, 255, 255, 255]);
-    inst.extend_from_slice(&[0, 0, 0, 0]); // atlas = grayscale, bools = 0, pad
+    for i in 0..glyphs {
+        let (gx, gy) = if i == 0 { (2, 1) } else { (i % cols, (i / cols) % rows) };
+        inst.extend_from_slice(&1u32.to_le_bytes());
+        inst.extend_from_slice(&1u32.to_le_bytes());
+        inst.extend_from_slice(&6u32.to_le_bytes());
+        inst.extend_from_slice(&8u32.to_le_bytes());
+        inst.extend_from_slice(&3i16.to_le_bytes());
+        inst.extend_from_slice(&12i16.to_le_bytes());
+        inst.extend_from_slice(&(gx as u16).to_le_bytes());
+        inst.extend_from_slice(&(gy as u16).to_le_bytes());
+        inst.extend_from_slice(&[255, 255, 255, 255]);
+        inst.extend_from_slice(&[0, 0, 0, 0]); // atlas = grayscale, bools = 0, pad
+    }
     let vb = g.buffer(&inst, wgpu::BufferUsages::VERTEX);
 
     let target = g.texture(w, h, fmt);
-    g.pass(&target, Some(BLACK), |rp| {
-        rp.set_pipeline(&bg_pipe);
-        rp.set_bind_group(0, &bg0, &[]);
-        rp.draw(0..3, 0..1);
-        rp.set_pipeline(&text_pipe);
-        rp.set_bind_group(0, &bg0, &[]);
-        rp.set_bind_group(1, &bg1, &[]);
-        rp.set_vertex_buffer(0, vb.slice(..));
-        rp.draw(0..4, 0..1);
-    });
+    let mut total = 0.0;
+    for _ in 0..frames.max(1) {
+        let t0 = crate::clock::monotonic();
+        g.pass(&target, Some(BLACK), |rp| {
+            rp.set_pipeline(&bg_pipe);
+            rp.set_bind_group(0, &bg0, &[]);
+            rp.draw(0..3, 0..1);
+            if glyphs > 0 {
+                rp.set_pipeline(&text_pipe);
+                rp.set_bind_group(0, &bg0, &[]);
+                rp.set_bind_group(1, &bg1, &[]);
+                rp.set_vertex_buffer(0, vb.slice(..));
+                rp.draw(0..4, 0..glyphs);
+            }
+        });
+        total += crate::clock::monotonic() - t0;
+    }
     let px = g.read(&target, w, h, 4);
+    Ok((px, total / frames.max(1) as f64 * 1000.0))
+}
+
+fn sugarloaf_check(px: &[u8], cols: u32, rows: u32, cw: u32, ch: u32, w: u32) -> TestResult {
+    let cell_rgb = |c: u32, r: u32| [40 * c + 20, 80 * r + 30, 200 - 20 * c];
     // Bgra8Unorm bytes: b, g, r, a
     let at = |x: u32, y: u32| {
         let o = ((y * w + x) * 4) as usize;

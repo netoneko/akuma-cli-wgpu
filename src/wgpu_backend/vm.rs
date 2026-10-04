@@ -70,6 +70,20 @@ pub fn run(
             Inst::Call { d, a, b, f } => {
                 regs[d as usize] = (f.helper())(regs[a as usize], regs[b as usize])
             }
+            Inst::CallC { d, a, b, f, c } => {
+                let (ka, kb) = (regs[a as usize], regs[b as usize]);
+                let c = c as usize;
+                if regs[c] != 0 && regs[c + 1] == ka && regs[c + 2] == kb {
+                    regs[d as usize] = regs[c + 3];
+                } else {
+                    let r = (f.helper())(ka, kb);
+                    regs[c] = 1;
+                    regs[c + 1] = ka;
+                    regs[c + 2] = kb;
+                    regs[c + 3] = r;
+                    regs[d as usize] = r;
+                }
+            }
             Inst::LoadBuf { d, buf, off, imm } => {
                 let addr = regs[off as usize].wrapping_add(imm) as usize;
                 let bytes = bufs[buf as usize];

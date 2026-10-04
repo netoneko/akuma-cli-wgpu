@@ -65,6 +65,13 @@ pub enum Inst {
     I2F { d: R, a: R },
     U2F { d: R, a: R },
     Call { d: R, a: R, b: R, f: Fun },
+    /// `Call` with a one-entry result cache in four *persistent* registers
+    /// `c..c+4` = (valid, key a, key b, result). The register file is only
+    /// initialized once per draw, so the cache survives across invocations:
+    /// shaders whose neighbouring pixels/vertices evaluate the same
+    /// transcendental on the same arguments (flat cell colours, per-frame
+    /// uniforms) skip libm almost every time.
+    CallC { d: R, a: R, b: R, f: Fun, c: R },
     /// d = u32 at byte (regs[off] + imm) of buffer slot `buf`, 0 if out of range
     LoadBuf { d: R, buf: u32, off: R, imm: u32 },
     /// texture fetch / sample / size: `Program::tex_ops[op]`
@@ -218,6 +225,16 @@ extern "C" fn h_iremu(a: u32, bb: u32) -> u32 {
 }
 
 impl Fun {
+    /// worth a result cache: libm-class cost (tens of ns), pure in (a, b)
+    pub fn cacheable(self) -> bool {
+        use Fun::*;
+        matches!(
+            self,
+            Sin | Cos | Tan | Sinh | Cosh | Tanh | Asin | Acos | Atan | Asinh | Acosh | Atanh
+                | Atan2 | Pow | Exp | Exp2 | Ln | Log2
+        )
+    }
+
     pub fn helper(self) -> Helper {
         use Fun::*;
         match self {
