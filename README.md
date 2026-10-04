@@ -275,7 +275,8 @@ so `forkpty`/`openpty` failed, and rio silently substituted a *dead context*
 27 (a ~34 px line, 15% under the kernel console's 20×40 cell). Two side-by-side sessions for a
 panel whose right half is dead; every key is on Alt because the console tty cannot send Super
 or Ctrl+Shift (a tty byte stream has no encoding for them; the fb platform only sees bytes).
-**Alt+x also works as Esc, then x.**
+**On the console today, use Esc then x**: the kernel's USB keyboard driver drops Alt
+entirely (Alt+D arrives as `d`; see kernel findings). Over ssh, real Alt works.
 
 | key | action |
 |---|---|
@@ -285,13 +286,14 @@ or Ctrl+Shift (a tty byte stream has no encoding for them; the fb platform only 
 | Alt+W | close the focused pane |
 | Alt+Q | quit (no confirmation: `confirm-before-quit = false`) |
 
-**CRT look** = the `[colors]` table, a green-phosphor palette. To turn it off, delete
-the block between `# --- CRT look` and `# end CRT look` (or the whole `[colors]` table) and
-restart rio. rio's real CRT shader (`[renderer] filters = ["newpixiecrt"]`) **does not run
-yet**: librashader's translated WGSL uses `var<private>` globals, which our shader compiler
-rejects (`exec: main: cannot compile …: global in Private`, rio panics). Only tried under a
-throwaway `HOME=/tmp/crt-home`; do not put it in the real config until the backend handles
-private globals.
+**CRT look** = `[renderer] filters = ["akuma-crt-2"]` (curved glass, scanlines, vignette, beam
+spread — `src/wgpu_backend/crt.rs`, applied while presenting; two tubes = one per pane;
+`"akuma-crt"` = one tube) plus the green-phosphor `[colors]` table. Cost ~35 ms effect + 11 ms
+copy per 4K frame. **To turn it off**, delete the block between `# --- CRT look` and
+`# end CRT look` and restart rio; to keep the colours but get a flat picture, delete just
+the `[renderer]` table. rio's own librashader CRT (`filters = ["newpixiecrt"]`) now *runs*
+(`var<private>` globals were added to the compiler and interpreter) but takes 10-20 s per 4K
+frame on the CPU — unusable; that is why the cheap one exists.
 
 Open: `ssh` from inside rio misbehaves (expected: under the pipe fallback ssh has no tty, so no
 raw mode and no remote pty; kernel ptys fix it). Cursor blink.
@@ -445,6 +447,18 @@ coordinate is not a quantization).
   platform now heals a raw state it finds at startup.
 * **A shell can hang in its own exit** (seen once in four runs): `sh -i` on pipes, stdin at EOF,
   printed its exit newline, last completed syscall `close(0)`, then state R forever, never a zombie.
+* **Close-on-exec is not honoured for socketpairs** (`SOCK_CLOEXEC`; rio's internal
+  sockets showed up as fds 4/5 in every shell). With two panes this kept EOF from ever
+  propagating; the pipe pty now closes fds 3..1024 in the child before exec.
+* **ext2 corruption after truncation** (2026-10-05): after `: > /tmp/akuma-fb.log` (truncate)
+  and further appends, a *different* file (`/tmp/crt-home/.config/rio/config.toml`, rewritten
+  shortly before) contained the trace text, its size (2243 B) disagreeing with its 1391
+  lines — consistent with freed data blocks being handed out again while still owned.
+  Workaround: rotate logs with `mv`, do not truncate. Needs a kernel investigation.
+* **Alt is dropped by the USB keyboard driver** (`crates/akuma-usb/src/hid.rs` `emit_key`:
+  only Shift and Ctrl are looked at). Linux consoles send ESC before the key when Alt is held
+  ("meta sends escape"); doing the same there (emit `0x1b`, then the key, when
+  `MOD_LALT|MOD_RALT` is set and the key produced a byte) makes Alt bindings work.
 * **Orphans are never reaped.** A child whose parent is killed stays a zombie forever
   (`State: Z`, `PPid` = the dead parent); nothing reparents it to init. Killed rio instances
   pile up in `ps` this way.
