@@ -4,7 +4,8 @@ A 3D screensaver of the Akuma cat logo that draws straight into the framebuffer.
 user of a Linux-standard framebuffer device (`/dev/fb0`) on the Akuma amd64 kernel. The real goal
 behind it is to run the **rio terminal** on Akuma's screen later, through a wgpu backend that
 renders into that same framebuffer. The wgpu-backend half of that exists now
-(`src/wgpu_backend/`, milestone M3 — see "The wgpu backend (M3)" below); rio is still ahead.
+(`src/wgpu_backend/`, milestone M3 — see "The wgpu backend (M3)" below), and since
+2026-10-05 **rio runs on the panel with a working shell** — see "rio on the panel" below.
 
 This README is the brief for whoever works on this repo next. If you are an agent, read all of it
 before changing anything.
@@ -233,6 +234,46 @@ The eight `--wgpu` checksums are unchanged; `exec-selftest` and
 `gpu-selftest` green on host. Not yet re-verified on the box after the
 last changes (deploy is `./deploy.sh` as usual).
 
+### rio on the panel: a working shell (2026-10-05)
+
+rio (the `netoneko/rio` fork, built per the kernel repo's
+`docs/archive/AKUMA_AMD64_RIO_FBDEV_BUILD.md`) renders through this backend
+and **runs a shell you can type into from the console keyboard** — verified
+by a person at the panel (`/tmp/rio-bin -e /bin/sh`: prompt, echo, `ls`) and
+over the ssh expect harness (with and without `-e`; ^D exits the shell with
+status 0 and rio with it).
+
+The "keys arrive, nothing echoes, pink frozen cursor" bug was **not** input
+or epoll: the Akuma kernel has **no ptys** (no `/dev/ptmx`, no `/dev/pts`),
+so `forkpty`/`openpty` failed, and rio silently substituted a *dead context*
+(it renders and takes keys, with no shell behind it). The error only went to
+`tracing`, which never reaches disk on the box; a trace line in rioterm's
+`create_context` found it in one run. Fixes, all in the rio fork:
+
+* **Pipe pty fallback** (`teletypewriter/src/unix/pipe_pty.rs`, musl-only,
+  used only when `forkpty`/`openpty` fail): the shell runs as `sh -i` on
+  pipes in its own session; rio's end of the "pty" is one end of an AF_UNIX
+  socketpair, so rio's reactor and epoll code are unchanged; a relay thread
+  plays a cooked line discipline — echo, erase (UTF-8 aware), ^U, ^W,
+  ^C → SIGINT to the shell's process group, ^D → EOF, ICRNL on input, ONLCR
+  on output, escape sequences swallowed. Unit tests run on the host
+  (`cargo test -p teletypewriter --lib pipe_pty`). Limits: no real tty, so
+  `isatty` is false in the shell, no job control, no line editing/history,
+  and full-screen programs (vi, top, less) do not work. Real kernel ptys
+  remove the fallback from the path entirely.
+* **fb platform: `ModifiersChanged` before `KeyboardInput`** (winit's
+  order). rio's `ctrl_seq` reads the modifier state while handling the key;
+  the old order made every key see the *previous* key's modifiers, so
+  Ctrl+D was sent as nothing.
+* Trace points: the pty reactor (`[pty] …` lines: every poll wakeup, read,
+  write, queued input, exit reason) and `[ctx] create_context failed …` are
+  appended to `/tmp/akuma-fb.log` alongside the fb input trace, one `write`
+  per line so threads do not splice.
+
+Note: `/tmp/rio.log` on the box is only the expect harness's stderr
+redirect (the fb trace mirror), not rio's `--enable-log-file` log; the
+latter goes to `~/.config/rio/log/rio.log` and has never appeared on the box.
+
 ### Performance work, 2026-10-04 (fps), and what is left
 
 Demo, the trashcan, 3840×2160, JIT, bit-identical to softrender throughout:
@@ -368,6 +409,13 @@ coordinate is not a quantization).
 * **First-touch page faults cost several µs each** (a 2.3 MB `Vec` filled by a worker was 3–5 ms),
   so per-draw temporaries (vertex output, attribute arrays) are recycled or kept small.
 * Memory write bandwidth tops out around 5–10 GB/s: a 4K clear is 3–6 ms no matter how many threads.
+* **There are no ptys** (no `/dev/ptmx`, no `/dev/pts`; even an `ssh -tt` session is "not a tty").
+  Every terminal emulator's `openpty` fails. rio works around it in userspace (above); the real
+  fix is a kernel pty device — spec in the kernel repo's
+  `docs/archive/AKUMA_AMD64_RIO_FBDEV_BUILD.md`.
+* **Orphans are never reaped.** A child whose parent is killed stays a zombie forever
+  (`State: Z`, `PPid` = the dead parent); nothing reparents it to init. Killed rio instances
+  pile up in `ps` this way.
 
 ## Baseline: selftest checksums and timings (re-measured 2026-10-04)
 
@@ -671,10 +719,10 @@ in ~20 ms. In order:
 2. ~~Verify on `/dev/fb0`~~ done 2026-10-04: a person watched `screensaver --wgpu --timeout 25` on the
    panel after all of Task 11 (876 frames, 34.9 fps) and reported it smooth and looking right. Rio-scale
    output (grid/rect passes) has still only been checked numerically.
-3. **rio itself**, which is outside this repo: a framebuffer platform in `rio-window`
-   (screen = `/dev/fb0`, input = the console tty), a `Surface` whose texture is presented
-   into the mapping with whole-row copies, and building rio against this wgpu backend. Known
-   gaps to check against rio's real use once it builds: surface/swapchain semantics
+3. **rio itself** (outside this repo) — builds, renders and runs a shell on the panel
+   (2026-10-05, "rio on the panel" above). Open: a quit binding the console can type
+   (Super+Q cannot; ^D exits the shell, and rio with it), cursor blink / timed redraws,
+   kernel ptys (then full-screen programs work). Known gaps to check against rio's real use: surface/swapchain semantics
    (`get_current_texture`, `present`), `Rgba16Float` / HDR filter targets, `Rgba8Snorm`,
    mipmapped textures (rio's filter chain creates them), depth/stencil, multisampling
    (rio uses `sample_count: 1`), and the 2 `copy_texture_to_texture` / 2 `set_viewport`

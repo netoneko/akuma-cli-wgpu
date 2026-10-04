@@ -57,7 +57,15 @@ VMIN=0/O_NONBLOCK (tty is O_NONBLOCK now, poll sliced at 33 ms), incomplete esca
 decoding, clipboard panic without X11, no-shell (config now pins /bin/sh), write_buffer_with in
 the wgpu backend.
 
-## Part 1 — make typing work (UNRESOLVED, top priority)
+## Part 1 — make typing work — DONE 2026-10-05
+
+Resolved: the kernel has no ptys, so rio ran a dead context. The rio fork
+now falls back to a pipe pty with a userspace line discipline, and the fb
+platform sends modifiers before the key. Verified at the panel. See README
+"rio on the panel" and the archive doc's "Resolved 2026-10-05" section and
+kernel pty spec. Still open from this part: the Ctrl+Q quit binding. The
+original notes follow for the record.
+
 
 Symptom: keys reach rio, but typed text never appears; cursor frozen. Suspects in order:
 
