@@ -538,4 +538,38 @@ fn thread_probe() {
         let sum = hs.into_iter().fold(0u64, |a, h| a ^ h.join().unwrap());
         println!("{n} threads, same work each: {:.2} s (checksum {sum:x})", monotonic() - t0);
     }
+    // the draw pool: 4 jobs of 5 ms of spinning, start offsets from the post
+    for round in 0..4 {
+        let t0 = monotonic();
+        let starts = std::sync::Mutex::new(Vec::new());
+        wgpu_backend::pool::run(4, &|i| {
+            let s = monotonic();
+            starts.lock().unwrap().push((i, (s - t0) * 1e3));
+            while monotonic() - s < 0.005 {
+                std::hint::spin_loop();
+            }
+        });
+        let mut v = starts.into_inner().unwrap();
+        v.sort_by_key(|x| x.0);
+        println!("pool round {round}: total {:.2} ms, starts {:?}", (monotonic() - t0) * 1e3, v.iter().map(|x| format!("{:.2}", x.1)).collect::<Vec<_>>());
+    }
+    for round in 0..2 {
+        let t0 = monotonic();
+        let starts = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|sc| {
+            for i in 0..4 {
+                let starts = &starts;
+                sc.spawn(move || {
+                    let s = monotonic();
+                    starts.lock().unwrap().push((i, (s - t0) * 1e3));
+                    while monotonic() - s < 0.005 {
+                        std::hint::spin_loop();
+                    }
+                });
+            }
+        });
+        let mut v = starts.into_inner().unwrap();
+        v.sort_by_key(|x| x.0);
+        println!("scope round {round}: total {:.2} ms, starts {:?}", (monotonic() - t0) * 1e3, v.iter().map(|x| format!("{:.2}", x.1)).collect::<Vec<_>>());
+    }
 }

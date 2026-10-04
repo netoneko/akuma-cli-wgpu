@@ -10,7 +10,17 @@
 //! pool workers — and returns when all have finished, so `f` may borrow from
 //! the caller's stack. One job runs at a time.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+
+/// Bumped when a job is posted (and by `warm`). Idle workers spin on it for a
+/// while before sleeping: waking a sleeping thread on Akuma takes up to a
+/// scheduler tick (~4 ms, measured with `thread-probe`; idle CPUs are not
+/// kicked), which is longer than a whole vertex stage. A spinning worker
+/// picks a job up in microseconds.
+static KICK: AtomicU64 = AtomicU64::new(0);
+/// how long an idle worker spins before it sleeps
+const SPIN_SECS: f64 = 0.050;
 
 /// the job as the workers see it: a lifetime-erased borrow that `run` keeps
 /// alive until every worker is done with it
@@ -54,11 +64,28 @@ fn pool() -> &'static Pool {
 fn worker(index: usize) {
     let p = pool();
     let mut seen = 0u64;
+    let mut seen_kick = 0u64;
     loop {
+        // spin phase
+        let t0 = crate::clock::monotonic();
+        let mut n = 0u32;
+        while KICK.load(Ordering::Acquire) == seen_kick {
+            std::hint::spin_loop();
+            n += 1;
+            if n % 2048 == 0 && crate::clock::monotonic() - t0 > SPIN_SECS {
+                break;
+            }
+        }
+        seen_kick = KICK.load(Ordering::Acquire);
         let job = {
             let mut st = p.state.lock().unwrap();
-            while st.epoch == seen {
+            // a `warm` call is not a job: go back to spinning
+            while st.epoch == seen && KICK.load(Ordering::Acquire) == seen_kick {
                 st = p.wake.wait(st).unwrap();
+            }
+            if st.epoch == seen {
+                seen_kick = KICK.load(Ordering::Acquire);
+                continue;
             }
             seen = st.epoch;
             st.job
@@ -105,6 +132,7 @@ pub fn run(n: usize, f: &(dyn Fn(usize) + Sync)) {
         st.job = Some(Job { f: fp, n });
         st.done = 0;
         st.epoch += 1;
+        KICK.fetch_add(1, Ordering::Release);
         p.wake.notify_all();
     }
     f(0);
@@ -113,4 +141,15 @@ pub fn run(n: usize, f: &(dyn Fn(usize) + Sync)) {
         st = p.finished.wait(st).unwrap();
     }
     st.job = None;
+}
+
+/// Tell sleeping workers that draw work is coming soon (a render pass began):
+/// they start spinning now, so the first parallel phase does not pay a wakeup.
+pub fn warm() {
+    if let Some(p) = Some(pool()) {
+        if *p.workers.lock().unwrap() > 0 {
+            KICK.fetch_add(1, Ordering::Release);
+            p.wake.notify_all();
+        }
+    }
 }

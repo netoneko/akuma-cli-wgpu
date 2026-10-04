@@ -1423,7 +1423,8 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         inv.run_vertex_batch(chunk, &attrs, &mut out);
         if super::prof::enabled() {
             let tc3 = crate::clock::monotonic();
-            eprintln!("[vchunk] {} verts: fetch {:.2} ms, begin {:.2} ms, run {:.2} ms", chunk.len(), (tc1 - tc0) * 1e3, (tc2 - tc1) * 1e3, (tc3 - tc2) * 1e3);
+            let post = f64::from_bits(POST_T.load(std::sync::atomic::Ordering::Relaxed));
+            eprintln!("[vchunk] {} verts: starts +{:.2} ms, fetch {:.2} ms, begin {:.2} ms, run {:.2} ms, ends +{:.2}", chunk.len(), (tc0 - post) * 1e3, (tc1 - tc0) * 1e3, (tc2 - tc1) * 1e3, (tc3 - tc2) * 1e3, (tc3 - post) * 1e3);
         }
         out
     };
@@ -1436,6 +1437,7 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
         let nchunks = ids.len().div_ceil(per);
         let slots: Vec<Mutex<Vec<super::exec::RawVertex>>> = (0..nchunks).map(|_| Mutex::new(Vec::new())).collect();
         let tj0 = crate::clock::monotonic();
+        POST_T.store(tj0.to_bits(), std::sync::atomic::Ordering::Relaxed);
         super::pool::run(nchunks, &|i| {
             let lo = i * per;
             let part = run_chunk(&ids[lo..(lo + per).min(ids.len())]);
@@ -1618,6 +1620,7 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     }
 }
 
+static POST_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static VERT_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
 static CHUNK_POOL: Mutex<Vec<Vec<super::exec::RawVertex>>> = Mutex::new(Vec::new());
 
@@ -2035,6 +2038,7 @@ impl wgpu::custom::CommandEncoderInterface for Encoder {
         &self,
         desc: &wgpu::RenderPassDescriptor<'_>,
     ) -> wgpu::custom::DispatchRenderPass {
+        super::pool::warm();
         let mut color = None;
         let mut depth = None;
         for a in desc.color_attachments.iter().flatten() {
