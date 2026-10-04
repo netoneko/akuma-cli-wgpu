@@ -510,6 +510,19 @@ fn print_metrics(opts: &Options, meter: &FpsMeter, frame: &Frame, switches: u64,
 /// Spawns 1, 2, 4 and 8 busy threads of equal work and reports wall time.
 fn thread_probe() {
     println!("available_parallelism: {:?}", std::thread::available_parallelism());
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "cpu: sse2 {} sse3 {} ssse3 {} sse4.1 {} sse4.2 {} avx {} avx2 {} fma {} bmi2 {}",
+        is_x86_feature_detected!("sse2"),
+        is_x86_feature_detected!("sse3"),
+        is_x86_feature_detected!("ssse3"),
+        is_x86_feature_detected!("sse4.1"),
+        is_x86_feature_detected!("sse4.2"),
+        is_x86_feature_detected!("avx"),
+        is_x86_feature_detected!("avx2"),
+        is_x86_feature_detected!("fma"),
+        is_x86_feature_detected!("bmi2"),
+    );
     fn work() -> u64 {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         for _ in 0..150_000_000u64 {

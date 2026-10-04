@@ -355,6 +355,14 @@ pub fn shader_check(files: &[String]) -> i32 {
                         }
                     }
                     let ncalls: u32 = calls.values().sum();
+                    if std::env::var_os("AKUMA_MIX").is_some() {
+                        let mut mix = std::collections::BTreeMap::<String, u32>::new();
+                        for i in &p.code {
+                            let n = format!("{i:?}");
+                            *mix.entry(n.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_string()).or_default() += 1;
+                        }
+                        println!("  mix: {mix:?}");
+                    }
                     format!(
                         "ok: {} insts ({ncalls} helper calls {calls:?}, {loads} buf loads, {tex} tex, {jumps} jumps), {} regs, {} buffers, {j}",
                         p.code.len(), p.nregs, p.bufs.len()

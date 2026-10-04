@@ -458,6 +458,10 @@ struct PixelPlan {
     mask: [bool; 4],
     mask_all: bool,
     k: [f32; 4],
+    /// the blend leaves a fully opaque source untouched (premultiplied or
+    /// straight "over": dst factor is 1 - src alpha, src factor is 1 or src
+    /// alpha), so alpha == 1 pixels can skip the destination read
+    opaque_is_store: bool,
 }
 
 impl PixelPlan {
@@ -475,6 +479,14 @@ impl PixelPlan {
             ],
             mask_all: wm == wgpu::ColorWrites::ALL,
             k,
+            opaque_is_store: c.blend.is_some_and(|b| {
+                let over = |c: &wgpu::BlendComponent| {
+                    c.operation == BlendOperation::Add
+                        && matches!(c.src_factor, BlendFactor::One | BlendFactor::SrcAlpha)
+                        && c.dst_factor == BlendFactor::OneMinusSrcAlpha
+                };
+                over(&b.color) && over(&b.alpha) && wm == wgpu::ColorWrites::ALL
+            }),
         }
     }
 
@@ -506,6 +518,11 @@ impl PixelPlan {
             f32::from_bits(frag[2]),
             f32::from_bits(frag[3]),
         ];
+        if self.opaque_is_store && src[3] == 1.0 {
+            // src*1 + dst*(1 - 1) == src
+            format::encode(self.fmt, src, texel);
+            return;
+        }
         let Some(b) = &self.blend else {
             if self.mask_all {
                 // plain store: for a constant source the texel is the same
