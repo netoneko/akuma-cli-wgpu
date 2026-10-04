@@ -103,6 +103,7 @@ ANSI-terminal screensaver with the same subcommands, `--latin`, arrow keys to sw
 | `src/input.rs` | termios raw mode, `poll(2)` and escape-sequence decoding; SIGINT/SIGTERM exit the process immediately (kernel signal bug — see done-log) |
 | `src/clock.rs` | `Pacer` (sleeps out the frame budget) and `FpsMeter` (live fps, over-budget count, slowest frame) — EINTR-tolerant `CLOCK_MONOTONIC`/`nanosleep`, never std `Instant` (kernel note in `input.rs`) |
 | `src/wgpu_backend/` | **milestone M3, the wgpu custom backend — exists now.** `mod.rs`: `WgpuRenderer`, the exact `new(w, h)`/`render(&mut frame, &mut scene, time, with_rain)` surface of the software `Renderer`, so `--wgpu` swaps paths in one place. `backend.rs`: the `wgpu::custom::*` device/adapter/queue plus the fixed-function rasterizer under contract to mirror softrender's scanline walk. `interp.rs`: the naga-IR interpreter — no JIT *yet* (plan §5b A; a JIT is feasible, see "Next steps"). `shaders.rs`: the WGSL, line-for-line ports of softrender's per-frame math. Status: runs, rain identical, **mesh not yet frame-identical** — see "The wgpu backend (M3)" |
+| `src/wgpu_backend/{opt,memo,runs,pool}.rs` | the performance machinery added in Task 11 (see "rio-scale passes"): program optimizer + per-draw specialization + if-conversion; region memoization; run detection; the spinning worker pool |
 | `src/akuma_{20,40,79,120}.txt` | the logo at four sizes; `akuma_40.txt` is byte-identical to the kernel's boot-banner asset |
 
 Composing each frame in ordinary RAM and copying whole rows into the mapping is deliberate. The
@@ -605,16 +606,49 @@ what its absence does.
   JIT on anything but this CPU (SSE4.1 only — falls back to the scalar JIT without it).
 - Environment switches added: `AKUMA_THREADS`, `AKUMA_WIDE`, `AKUMA_EXEC=jitw`.
 
+### Task 11 — rio-scale redraw: from 320 ms to ~20 ms — DONE 2026-10-04 (second session)
+
+Goal given: make sugarloaf's real shaders redraw a 4K terminal interactively on the trashcan
+(4 cores, SSE4.2, no AVX), target a full redraw under ~50 ms, without regressing the demo.
+Result (`gpu-bench`, 3840×2144, details and per-step numbers in "rio-scale passes"):
+cell-background pass 223 → 5 ms, a full terminal-like redraw (backgrounds + glyphs in 60% of
+the cells) ~20 ms mean / 14.5 ms best (≈ 50 fps), worst case (every cell its own colour and
+a glyph) 320 → 25 ms. The demo's four 4K checksums and 720p checksums are unchanged and
+`screensaver --wgpu` still runs at ~35 fps (present-bound).
+
+- New: `opt.rs` (optimizer, per-draw specialization, if-conversion), `memo.rs` (region
+  memoization), `runs.rs` (position-quantization run detection), `pool.rs` (spinning worker
+  pool); raster span/gather paths, SSE2 encode/over-blend, wide `textureLoad`, lazy clear.
+- Found by measuring: `std::thread::scope` costs ~8 ms per phase here (thread creation 1.5 ms,
+  wake-up at a scheduler tick); first-touch page faults are µs each; every glyph-vertex batch
+  diverged because of naga's lowering of `||`; a 64-bit `idiv` per row edge; the interpreter
+  could not return float fragment colours at all (so the "fallback" for standard-mode
+  fragment shaders never worked — fixed).
+- Tests added (all on host *and* box): `exec-selftest` runs every snippet specialized too
+  and 60+ random vertex shaders (`AKUMA_FUZZ=n`, `AKUMA_FUZZ_SEED=s`) against the
+  interpreter; `gpu-selftest` (now 21 tests) adds: memoized+specialized fragment shader vs a CPU
+  evaluation, vector over-blend vs the scalar definition, run replication on/off over awkward
+  cell geometries (asserting it really fires for the grid shader and not for one that leaks the
+  position), random fragment shaders vs the interpreter (default, runs off, forced
+  specialization, two uniform values), sugarloaf's `renderer.wgsl` rects. Fuzzing: 800 random
+  vertex shaders and 150 random fragment shaders × variants, all executors bit-identical.
+- **Could not verify:** rio itself; anything about how the output looks to a human (all
+  pixel checks are numeric); the wide JIT's numbers on a CPU other than this one; behaviour
+  of the worker pool's 50 ms spin on a busy desktop (it burns up to three cores for 50 ms
+  after each frame — `AKUMA_SPIN_MS` tunes it); the single-thread numbers after the last few
+  changes; `sched_setaffinity` (returns -1 here, so workers cannot be pinned).
+
 ## Next steps (updated 2026-10-04, branch `jit-shader-executor`)
 
 Done: the compiler/VM/JIT executors (M3 speed), the standard-mode GPU and its test suite
-(M4), real sugarloaf shaders running on the trashcan. In order:
+(M4), real sugarloaf shaders running on the trashcan, and (Task 11) a full 4K terminal redraw
+in ~20 ms. In order:
 
-1. **Fragment throughput** — see "Performance work" above; region memoization is the next big
-   lever for rio-style passes. Re-run `gpu-bench` after every change.
+1. **Glyph pass** (now most of a frame): merge the two triangles of an axis-aligned quad into
+   one rectangle fill; cheaper vertex marshalling; a register allocator / 8-lane code for the
+   wide JIT. Re-run `gpu-bench` after every change (it reports mean and best).
 2. **Verify on `/dev/fb0`** that the demo still looks right with everything above (only
-   headless `selftest` and `screensaver --timeout` runs were done this session, no human
-   looked at the panel).
+   headless `selftest` and `screensaver --timeout` runs were done, no human looked at the panel).
 3. **rio itself**, which is outside this repo: a framebuffer platform in `rio-window`
    (screen = `/dev/fb0`, input = the console tty), a `Surface` whose texture is presented
    into the mapping with whole-row copies, and building rio against this wgpu backend. Known
@@ -622,9 +656,12 @@ Done: the compiler/VM/JIT executors (M3 speed), the standard-mode GPU and its te
    (`get_current_texture`, `present`), `Rgba16Float` / HDR filter targets, `Rgba8Snorm`,
    mipmapped textures (rio's filter chain creates them), depth/stencil, multisampling
    (rio uses `sample_count: 1`), and the 2 `copy_texture_to_texture` / 2 `set_viewport`
-   call sites.
-4. Smaller: uniform-only computation is still recomputed per invocation in the demo's vertex
-   shader (the call cache removed the transcendental cost; the rest is cheap).
+   call sites. Not yet exercised by a test: sugarloaf's `image.wgsl`, `text_shader.wgsl` and the
+   filter shaders (they compile and JIT; only `grid.wgsl` and `renderer.wgsl` render under test).
+4. The demo's own legacy raster path (`backend.rs::draw_legacy`) still shades fragment by
+   fragment on one thread; the live demo is present-bound (33 MB write-combined copy ≈ 11 ms)
+   so there is little to gain, but its vertex stage could use the wide path and the worker pool.
+5. Kernel repo: the scheduler/wake-up behaviour in "Things this kernel taught us".
 
 ## Tasks, in order
 
