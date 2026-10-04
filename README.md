@@ -250,6 +250,10 @@ a dark background with runs of three highlight colours and glyphs in 60% of the 
 | trivial position-dependent shader, whole 4K | 87.6 ms | 19.8 ms |
 | constant-colour fill, whole 4K | 29–34 ms | 3.4–8 ms |
 
+`gpu-bench` verifies the rendered pixels of every scene (cell backgrounds at four corners of each
+cell) before it prints a time, so the numbers cannot come from a broken fast path; it also works with
+`AKUMA_THREADS=1`, `AKUMA_RUNS=0` etc. for A/B runs (runs off: bg pass 36 ms, terminal redraw 50 ms).
+
 The mean–best gap (~5 ms) is the kernel scheduler: whether the four pool threads actually get four
 CPUs for a given phase varies from frame to frame (see "Things this kernel taught us").
 
@@ -635,8 +639,7 @@ a glyph) 320 → 25 ms. The demo's four 4K checksums and 720p checksums are unch
 - **Could not verify:** rio itself; anything about how the output looks to a human (all
   pixel checks are numeric); the wide JIT's numbers on a CPU other than this one; behaviour
   of the worker pool's 50 ms spin on a busy desktop (it burns up to three cores for 50 ms
-  after each frame — `AKUMA_SPIN_MS` tunes it); the single-thread numbers after the last few
-  changes; `sched_setaffinity` (returns -1 here, so workers cannot be pinned).
+  after each frame — `AKUMA_SPIN_MS` tunes it); `sched_setaffinity` (returns -1 here, so workers cannot be pinned).
 
 ## Next steps (updated 2026-10-04, branch `jit-shader-executor`)
 
