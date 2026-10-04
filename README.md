@@ -215,6 +215,24 @@ projection, atlas `textureLoad`), through the same pipeline layout rio uses, pix
 rio's checkout, not vendored here). `shader-check` on all of sugarloaf's WGSL:
 **15 of 15 entry points lower and JIT.**
 
+### The wgpu Surface over the framebuffer (2026-10-04, second session)
+
+`src/wgpu_backend/surface.rs`: `Instance::create_surface` opens `/dev/fb0`
+(RAM sink when there is no panel — the same code runs in tests);
+`get_current_texture` hands out a single reused Bgra8/Rgba8 texture rendered
+in place by the normal pipelines; `Queue::present` copies whole rows into
+the mapping via `FbDevice::present_raw` (the WC contract). `gpu-selftest`
+is now **22 tests** — case 22 drives create → capabilities → configure →
+render → present through the real wgpu API and checks the presented bytes.
+The library target (`src/lib.rs`: `wgpu_backend` + `clock`/`fb`/`softrender`
+/`rng`) is what the rio fork's sugarloaf depends on (path dep;
+`netoneko/akuma-wgpu-backend` is the intended future home). Also this
+session: `queue.write_buffer_with` works (write-mode buffer maps; sugarloaf
+needs it), and `fs::present_raw` shares the row-copy rule with `present`.
+The eight `--wgpu` checksums are unchanged; `exec-selftest` and
+`gpu-selftest` green on host. Not yet re-verified on the box after the
+last changes (deploy is `./deploy.sh` as usual).
+
 ### Performance work, 2026-10-04 (fps), and what is left
 
 Demo, the trashcan, 3840×2160, JIT, bit-identical to softrender throughout:
