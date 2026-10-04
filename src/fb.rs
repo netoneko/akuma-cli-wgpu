@@ -417,12 +417,13 @@ impl FbDevice {
 
     /// Present pre-packed device-format pixels: `src` holds one row of
     /// `row_bytes` bytes per screen row (packed exactly like the device
-    /// format, e.g. the wgpu backend's Bgra8 texels), copied one full row
-    /// at a time into the mapping. Same WC contract as `present`: whole
-    /// rows only, every byte of every visible row written.
+    /// format, e.g. the wgpu backend's Bgra8 texels), copied one row at a
+    /// time into the mapping. A narrower or shorter image lands in the
+    /// top-left corner (rio on the live half of a half-dead panel); each
+    /// row is still one contiguous copy — the WC contract.
     pub fn present_raw(&self, src: &[u8], row_bytes: usize) {
-        debug_assert_eq!(row_bytes, self.width * (self.format.bits_per_pixel / 8) as usize);
-        debug_assert!(src.len() >= self.height * row_bytes);
+        let full = self.width * (self.format.bits_per_pixel / 8) as usize;
+        assert!(row_bytes <= full, "present_raw: row wider than the screen");
         for (row, chunk) in src.chunks_exact(row_bytes).enumerate().take(self.height) {
             let dst = unsafe { self.map.add(row * self.pitch) } as *mut u8;
             // SAFETY: rows are within the mapping (map_len >= height*pitch),

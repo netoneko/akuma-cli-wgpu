@@ -275,8 +275,9 @@ impl wgpu::custom::SurfaceOutputDetailInterface for SurfaceOutputDetail {
 }
 
 impl SurfaceOutputDetail {
-    /// Copy the texture's rows into the presentation sink. Whole rows
-    /// only (the WC contract); a mismatched row size is a bug.
+    /// Copy the texture's rows into the presentation sink, one contiguous
+    /// copy per row (the WC contract); a surface smaller than the panel
+    /// lands in its top-left corner.
     pub fn present(&self) {
         let (w, h) = (self.tex.size.width as usize, self.tex.size.height as usize);
         let bpt = super::format::bytes_per_texel(self.tex.format)
@@ -292,8 +293,8 @@ impl SurfaceOutputDetail {
         debug_assert_eq!(bytes.len(), row_bytes * h);
         match &self.sink {
             SinkRef::Fb(fb) => {
-                debug_assert_eq!(w, fb.width, "surface width != fb width");
-                debug_assert_eq!(h, fb.height, "surface height != fb height");
+                // smaller than the panel = top-left corner (see present_raw)
+                assert!(w <= fb.width && h <= fb.height, "surface larger than fb");
                 fb.present_raw(&bytes, row_bytes);
             }
             SinkRef::Ram => {
