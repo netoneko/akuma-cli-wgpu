@@ -680,6 +680,60 @@ impl Invoker<'_> {
         }
     }
 
+    /// As `shade4_with`, for four arbitrary pixels: `xs` / `ys` are their
+    /// `@builtin(position)` coordinates (lanes past `n` should repeat the last
+    /// pixel). Inputs that never vary were set by `span_begin`.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[inline]
+    pub fn shade4_pts(&mut self, xs: [f32; 4], ys: [f32; 4], n: usize, mut f: impl FnMut(usize, usize) -> u32) -> Shade4 {
+        let Invoker::Wide { w, regs, refs, texs, smps, span, .. } = self else {
+            unreachable!("shade4 on a non-wide invoker")
+        };
+        let xb = xs.map(f32::to_bits);
+        let yb = ys.map(f32::to_bits);
+        for &r in &span.pos_x {
+            regs[r as usize].0 = xb;
+        }
+        for &r in &span.pos_y {
+            regs[r as usize].0 = yb;
+        }
+        if span.inputs_clobbered {
+            for (i, &(r, _, _)) in span.locs.iter().enumerate() {
+                let mut v = [0u32; 4];
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x = f(k.min(n - 1), i);
+                }
+                regs[r as usize].0 = v;
+            }
+        } else {
+            for j in 0..span.n_dyn {
+                let i = span.dyn_idx[j] as usize;
+                let mut v = [0u32; 4];
+                for (k, x) in v.iter_mut().enumerate() {
+                    *x = f(k.min(n - 1), i);
+                }
+                regs[span.locs[i].0 as usize].0 = v;
+            }
+        }
+        let status = w.run_wide(regs, refs, texs, smps);
+        if super::prof::enabled() {
+            super::prof::inc(11, 1);
+            if status == super::jit::STATUS_DIVERGED {
+                super::prof::inc(12, 1);
+            }
+        }
+        match status {
+            0 => Shade4::Colors([
+                regs[span.out[0] as usize],
+                regs[span.out[1] as usize],
+                regs[span.out[2] as usize],
+                regs[span.out[3] as usize],
+            ]),
+            1 => Shade4::Killed,
+            _ => Shade4::Diverged,
+        }
+    }
+
     /// invocations this invoker prefers to be handed at once
     pub fn lanes(&self) -> usize {
         match self {

@@ -319,7 +319,30 @@ impl Raster<'_> {
             None
         };
 
-        let (runs_x, runs_y) = if span_fast { fs.has_runs() } else { (false, false) };
+        // Narrow triangles (glyph quads): the covered pixels of successive rows are
+        // gathered into four-pixel batches instead of one batch per row, which
+        // would leave most lanes empty. Run detection has nothing to gain there.
+        let gather = span_fast && width <= 24;
+        let mut gx = [0i64; 4];
+        let mut gy = [0i64; 4];
+        let mut ng = 0usize;
+        if gather {
+            let mut dyn_idx = [0u8; 32];
+            let mut nd = 0usize;
+            if let Some(tp) = tri_planes.as_ref() {
+                for i in 0..tp.n {
+                    if !matches!(tp.p[i], TriPlane::Const(_)) {
+                        dyn_idx[nd] = i as u8;
+                        nd += 1;
+                    }
+                }
+            }
+            if !fs.span_begin(provoking, 0.0, &dyn_idx[..nd]) {
+                return;
+            }
+        }
+        let (runs_x, runs_y) = if span_fast && !gather { fs.has_runs() } else { (false, false) };
+        let w_origin = w_row;
         // y runs: the previous row's covered interval when it was produced purely
         // by stores, and how many further rows share its quantized y values
         let mut prev_row: Option<(i64, i64)> = None;
@@ -380,6 +403,16 @@ impl Raster<'_> {
                 // nothing more for this row
                 prev_row = None;
                 y_budget = 0;
+            } else if lo < hi && gather {
+                for k in lo..hi {
+                    gx[ng] = min_x + k;
+                    gy[ng] = py;
+                    ng += 1;
+                    if ng == 4 {
+                        self.flush_gather(fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, (min_x, min_y), w_origin, dwdy, &gx, &gy, 4);
+                        ng = 0;
+                    }
+                }
             } else if lo < hi && span_fast {
                 let row = |this: &mut Self, fs: &mut Invoker<'_>, a: i64, b: i64| -> bool {
                     let w0 = [w_row[0] + dwdx[0] * a, w_row[1] + dwdx[1] * a, w_row[2] + dwdx[2] * a];
@@ -493,6 +526,9 @@ impl Raster<'_> {
             for i in 0..3 {
                 w_row[i] += dwdy[i];
             }
+        }
+        if ng > 0 {
+            self.flush_gather(fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, (min_x, min_y), w_origin, dwdy, &gx, &gy, ng);
         }
         if np > 0 {
             self.flush(fs, &plan, &pend[..np], &pend_var, &var, flat_all);
@@ -675,6 +711,119 @@ impl Raster<'_> {
         _runs_x: bool,
     ) -> bool {
         unreachable!("span_fast needs a wide stage")
+    }
+
+    /// Shade up to four gathered pixels (`gx[k]`, `gy[k]`, any rows) with the
+    /// wide stage and write each to its own texel.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_gather(
+        &mut self,
+        fs: &mut Invoker<'_>,
+        plan: &PixelPlan,
+        geo: &SpanGeo<'_>,
+        tp: Option<&TriPlanes>,
+        provoking: &Varyings,
+        flat_all: bool,
+        (min_x, min_y): (i64, i64),
+        w00: [i64; 3],
+        dwdy: [i64; 3],
+        gx: &[i64; 4],
+        gy: &[i64; 4],
+        n: usize,
+    ) {
+        use super::exec::Shade4;
+        let bgra = plan.unorm8.unwrap();
+        let mut xs = [0f32; 4];
+        let mut ys = [0f32; 4];
+        for k in 0..4 {
+            let j = k.min(n - 1);
+            xs[k] = gx[j] as f32 + 0.5;
+            ys[k] = gy[j] as f32 + 0.5;
+        }
+        let shade = fs.shade4_pts(xs, ys, n, |lane, i| {
+            let (kx, ky) = ((gx[lane] - min_x) as f64, (gy[lane] - min_y) as f64);
+            match tp.unwrap().p[i] {
+                TriPlane::Const(bits) => bits,
+                TriPlane::Lin { a, bx, by } => ((a + bx * kx + by * ky) as f32).to_bits(),
+                TriPlane::Persp { a, bx, by, da, dbx, dby } => {
+                    (((a + bx * kx + by * ky) / (da + dbx * kx + dby * ky)) as f32).to_bits()
+                }
+            }
+        });
+        let cw = self.color.width as i64;
+        let at = |k: usize| ((gy[k] - self.row0) * cw + gx[k]) as usize * 4;
+        match shade {
+            Shade4::Colors(c) => {
+                let all_one = c[3].0 == [1.0f32.to_bits(); 4];
+                let stored = plan.blend.is_none() || (plan.opaque_is_store && all_one);
+                if stored {
+                    let px = format::encode4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], bgra).0;
+                    for k in 0..n {
+                        let a = at(k);
+                        self.color.data[a..a + 4].copy_from_slice(&px[k].to_le_bytes());
+                    }
+                } else if let Some((sfc, sfa)) = plan.over {
+                    let mut d = [0u8; 16];
+                    for k in 0..n {
+                        let a = at(k);
+                        d[k * 4..k * 4 + 4].copy_from_slice(&self.color.data[a..a + 4]);
+                    }
+                    let px = format::blend_over4_unorm8([&c[0].0, &c[1].0, &c[2].0, &c[3].0], &d, bgra, sfc, sfa);
+                    for k in 0..n {
+                        let a = at(k);
+                        self.color.data[a..a + 4].copy_from_slice(&px[k].to_le_bytes());
+                    }
+                } else {
+                    for k in 0..n {
+                        let col = [c[0].0[k], c[1].0[k], c[2].0[k], c[3].0[k]];
+                        let a = at(k);
+                        plan.write(&mut self.color.data[a..a + 4], col, false, &mut None, &mut None);
+                    }
+                }
+            }
+            Shade4::Diverged => {
+                for k in 0..n {
+                    let mut var = *provoking;
+                    if !flat_all {
+                        let (kx, ky) = (gx[k] - min_x, gy[k] - min_y);
+                        let w = [
+                            w00[0] + geo.dwdx[0] * kx + dwdy[0] * ky,
+                            w00[1] + geo.dwdx[1] * kx + dwdy[1] * ky,
+                            w00[2] + geo.dwdx[2] * kx + dwdy[2] * ky,
+                        ];
+                        let l = [w[0] as f64 * geo.inv_sum, w[1] as f64 * geo.inv_sum, w[2] as f64 * geo.inv_sum];
+                        let invw = l[0] * geo.s[0].invw + l[1] * geo.s[1].invw + l[2] * geo.s[2].invw;
+                        self.interpolate(&mut var, provoking, geo.s, &l, invw);
+                    }
+                    if let Some(col) = fs.run_fragment(&var, [xs[k], ys[k], 0.0, 0.0]) {
+                        let a = at(k);
+                        plan.write(&mut self.color.data[a..a + 4], col, false, &mut None, &mut None);
+                    }
+                }
+            }
+            Shade4::Killed => {}
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_gather(
+        &mut self,
+        _fs: &mut Invoker<'_>,
+        _plan: &PixelPlan,
+        _geo: &SpanGeo<'_>,
+        _tp: Option<&TriPlanes>,
+        _provoking: &Varyings,
+        _flat_all: bool,
+        _origin: (i64, i64),
+        _w00: [i64; 3],
+        _dwdy: [i64; 3],
+        _gx: &[i64; 4],
+        _gy: &[i64; 4],
+        _n: usize,
+    ) {
+        unreachable!("gather needs a wide stage")
     }
 
     /// shade the gathered pixels in one batch, then depth-write and blend each
