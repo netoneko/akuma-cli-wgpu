@@ -1102,6 +1102,19 @@ pub fn bench() -> i32 {
             }
         }
     }
+    // what a terminal actually looks like: a few distinct cell colours in runs
+    // and glyphs in ~60% of the cells
+    TERMINAL_SCENE.store(true, std::sync::atomic::Ordering::Relaxed);
+    for (what, glyphs) in [("terminal-like, bg pass only", 0u32), ("terminal-like, bg + glyphs in 60% of cells", cols * rows * 6 / 10)] {
+        match sugarloaf_scene(&g, &dir, cols, rows, cw, ch, glyphs, 8) {
+            Ok((_px, ms)) => println!("{}x{} grid, {what}: {ms:.1} ms/frame ({:.1} fps)", cols * cw, rows * ch, 1000.0 / ms),
+            Err(e) => {
+                println!("FAIL {what}: {e}");
+                return 1;
+            }
+        }
+    }
+    TERMINAL_SCENE.store(false, std::sync::atomic::Ordering::Relaxed);
     if super::prof::enabled() {
         super::prof::report();
     }
@@ -1162,6 +1175,8 @@ struct VO { @builtin(position) p: vec4<f32>, @location(0) @interpolate(flat) c: 
     }
 }
 
+static TERMINAL_SCENE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Run sugarloaf's `grid.wgsl` bg pass and, if `glyphs > 0`, a glyph pass with
 /// that many instances (the first at grid (2,1) as the verified glyph, the
 /// rest spread over the grid). Returns the pixels of the last frame and the
@@ -1204,7 +1219,18 @@ fn sugarloaf_scene(
     let ubuf = g.buffer(&u, wgpu::BufferUsages::UNIFORM);
 
     // ---- cells: one u32 each, rgba little-endian ----
-    let cell_rgb = |c: u32, r: u32| [40 * c + 20, 80 * r + 30, 200 - 20 * c];
+    // the default scene gives every cell its own colour; the "terminal" scene
+    // is a dark background with runs of a few highlight colours
+    let terminal = TERMINAL_SCENE.load(std::sync::atomic::Ordering::Relaxed);
+    let cell_rgb = |c: u32, r: u32| {
+        if terminal {
+            const PAL: [[u32; 3]; 3] = [[70, 40, 90], [30, 80, 60], [110, 70, 30]];
+            let k = ((c / 6) * 7 + r * 13) % 10;
+            if k < 7 { [30, 30, 46] } else { PAL[(k - 7) as usize] }
+        } else {
+            [40 * c + 20, 80 * r + 30, 200 - 20 * c]
+        }
+    };
     let mut cells = Vec::new();
     for r in 0..rows {
         for c in 0..cols {

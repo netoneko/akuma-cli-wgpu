@@ -1042,6 +1042,7 @@ fn execute_render(data: RenderPassData) {
         None => panic!("akuma backend: render pass without color attachment"),
     };
 
+    let pending_clear: std::cell::Cell<Option<([u8; 4], usize)>> = std::cell::Cell::new(None);
     // color clear: the demo's raw Rgba8Uint target takes the components as
     // bytes; every other format goes through the format encoder (so sRGB
     // targets get the linear clear color encoded properly)
@@ -1065,7 +1066,10 @@ fn execute_render(data: RenderPassData) {
                 [clear.r as f32, clear.g as f32, clear.b as f32, clear.a as f32],
                 &mut one,
             );
-            fill_pattern(&mut c, &one[..bpt]);
+            // lazily: the first standard draw clears each band right before
+            // shading it, while the band is still in cache (one trip to memory
+            // instead of two); anything else clears when it needs the pixels
+            pending_clear.set(Some((one, bpt)));
         }
     }
     let mut depth: Option<Arc<TextureData>> = None;
@@ -1114,6 +1118,7 @@ fn execute_render(data: RenderPassData) {
             PassCmd::Draw { vertices, instances } => {
                 let pipe = pipe.as_ref().expect("draw without a pipeline");
                 if pipe.legacy() {
+                    apply_pending_clear(&pending_clear, &color_tex);
                     draw_legacy(pipe, &groups, &color_tex, depth.as_ref(), w, h, vertices, instances);
                 } else {
                     let st = StdDrawState {
@@ -1127,7 +1132,7 @@ fn execute_render(data: RenderPassData) {
                         scissor,
                         blend_const,
                     };
-                    draw_standard(&st, StdDraw::Direct { vertices, instances });
+                    draw_standard(&st, StdDraw::Direct { vertices, instances }, &pending_clear);
                 }
             }
             PassCmd::DrawIndexed { indices, base_vertex, instances } => {
@@ -1144,8 +1149,18 @@ fn execute_render(data: RenderPassData) {
                     scissor,
                     blend_const,
                 };
-                draw_standard(&st, StdDraw::Indexed { indices, base_vertex, instances });
+                draw_standard(&st, StdDraw::Indexed { indices, base_vertex, instances }, &pending_clear);
             }
+        }
+    }
+    apply_pending_clear(&pending_clear, &color_tex);
+}
+
+/// perform a clear that no draw has consumed
+fn apply_pending_clear(pending: &std::cell::Cell<Option<([u8; 4], usize)>>, tex: &Arc<TextureData>) {
+    if let Some((one, bpt)) = pending.take() {
+        if let TexStore::Color(c) = &*tex.store {
+            fill_pattern_par(&mut c.lock().unwrap(), &one[..bpt]);
         }
     }
 }
@@ -1168,6 +1183,19 @@ fn fill_pattern(buf: &mut [u8], pat: &[u8]) {
         buf.copy_within(0..m, n);
         n += m;
     }
+}
+
+/// `fill_pattern` split over the worker pool for big buffers: a 4K clear is
+/// memory-bandwidth bound, and one core does not saturate the memory system.
+fn fill_pattern_par(buf: &mut [u8], pat: &[u8]) {
+    let threads = raster_threads(&[[0; 4]; 64], 1, 1);
+    if buf.len() < (1 << 22) || threads <= 1 {
+        return fill_pattern(buf, pat);
+    }
+    // pieces that are a whole number of texels
+    let per = buf.len().div_ceil(threads).div_ceil(pat.len() * 64) * pat.len() * 64;
+    let pieces: Vec<Mutex<&mut [u8]>> = buf.chunks_mut(per).map(Mutex::new).collect();
+    super::pool::run(pieces.len(), &|i| fill_pattern(&mut pieces[i].lock().unwrap(), pat));
 }
 
 /// The demo's draw: raw Rgba8Uint target, pixel-space positions, flat
@@ -1266,7 +1294,13 @@ impl<'a> Locks<'a> {
     }
 }
 
-fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
+/// `pending_clear`: a render-pass clear no draw has applied yet; this draw
+/// folds it into its per-band work
+fn draw_standard(
+    st: &StdDrawState<'_>,
+    what: StdDraw,
+    pending_clear: &std::cell::Cell<Option<([u8; 4], usize)>>,
+) {
     use wgpu::PrimitiveTopology as T;
     let pipe = st.pipe;
     let target = pipe.target.as_ref().expect("standard draw needs a color target");
@@ -1524,7 +1558,11 @@ fn draw_standard(st: &StdDrawState<'_>, what: StdDraw) {
     // quads; without this every band would set up every one of them)
     let prim_rows: Option<Vec<(i64, i64)>> =
         (n_bands > 1 && prims.len() >= 64).then(|| prim_row_ranges(&prims, &verts, &viewport, ch));
+    let clear_first = pending_clear.take();
     let run_band = |band: Band<'_>, fs: &mut Invoker<'_>| {
+        if let Some((one, bpt)) = clear_first {
+            fill_pattern(band.color, &one[..bpt]);
+        }
         let mut raster = super::raster::Raster {
             color: super::raster::ColorTarget {
                 format: target.format,
