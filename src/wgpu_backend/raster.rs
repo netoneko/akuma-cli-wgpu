@@ -248,6 +248,45 @@ impl Raster<'_> {
             && plan.unorm8.is_some()
             && !fs.uses_position_zw();
         let geo = SpanGeo { s: &s, dwdx, inv_sum };
+        let tri_planes = if span_fast && !flat_all {
+            let mut locs = [(0u32, 0u32); 32];
+            let nl = fs.span_locs(&mut locs);
+            let mut tp = TriPlanes { n: nl, p: [TriPlane::Const(0); 32] };
+            let ortho = s[0].invw == s[1].invw && s[1].invw == s[2].invw;
+            // edge functions at the bounding-box corner (min_x, min_y)
+            let w00 = w_row;
+            for i in 0..nl {
+                let (loc, comp) = (locs[i].0 as usize, locs[i].1 as usize);
+                let mode = self.interp.iter().find(|(x, _)| *x as usize == loc).map_or(Interp::Flat, |(_, m)| *m);
+                tp.p[i] = match mode {
+                    Interp::Flat => TriPlane::Const(provoking[loc][comp]),
+                    _ => {
+                        let v = [
+                            f32::from_bits(s[0].var[loc][comp]) as f64,
+                            f32::from_bits(s[1].var[loc][comp]) as f64,
+                            f32::from_bits(s[2].var[loc][comp]) as f64,
+                        ];
+                        // inv_sum * sum(w_i * g_i) for the origin value and the x / y slopes
+                        let plane = |g: [f64; 3]| {
+                            let f = |e: [i64; 3]| inv_sum * (e[0] as f64 * g[0] + e[1] as f64 * g[1] + e[2] as f64 * g[2]);
+                            (f(w00), f(dwdx), f(dwdy))
+                        };
+                        if mode == Interp::Linear || ortho {
+                            let (a, bx, by) = plane(v);
+                            TriPlane::Lin { a, bx, by }
+                        } else {
+                            let iw = [s[0].invw, s[1].invw, s[2].invw];
+                            let (a, bx, by) = plane([v[0] * iw[0], v[1] * iw[1], v[2] * iw[2]]);
+                            let (da, dbx, dby) = plane(iw);
+                            TriPlane::Persp { a, bx, by, da, dbx, dby }
+                        }
+                    }
+                };
+            }
+            Some(tp)
+        } else {
+            None
+        };
 
         for py in min_y..max_y {
             // the covered pixels of this row are one interval [lo, hi) of
@@ -268,9 +307,47 @@ impl Raster<'_> {
                     hi = hi.min((w0 - t).div_euclid(-d) + 1);
                 }
             }
-            if lo < hi && span_fast {
+            // a position-independent shader whose result simply replaces the
+            // destination: fill the run
+            let mut filled = false;
+            if lo < hi && constant_fs && self.depth.is_none() && plan.bpt == 4 {
+                let frag = match cached {
+                    Some(c) => c,
+                    None => {
+                        let c = fs.run_fragment(&var, [(min_x + lo) as f32 + 0.5, py as f32 + 0.5, 0.0, 0.0]);
+                        cached = Some(c);
+                        c
+                    }
+                };
+                match frag {
+                    None => filled = true, // discarded
+                    Some(col) => {
+                        let src = [f32::from_bits(col[0]), f32::from_bits(col[1]), f32::from_bits(col[2]), f32::from_bits(col[3])];
+                        let stores = (plan.blend.is_none() && plan.mask_all) || (plan.opaque_is_store && src[3] == 1.0);
+                        if stores {
+                            let t = *const_texel.get_or_insert_with(|| {
+                                let mut t = [0u8; 4];
+                                format::encode(plan.fmt, src, &mut t);
+                                t
+                            });
+                            let base = ((py - self.row0) * cw + min_x + lo) as usize * 4;
+                            let dst = &mut self.color.data[base..base + (hi - lo) as usize * 4];
+                            for px in dst.chunks_exact_mut(4) {
+                                px.copy_from_slice(&t);
+                            }
+                            filled = true;
+                        }
+                    }
+                }
+            }
+            if filled {
+                // nothing more for this row
+            } else if lo < hi && span_fast {
                 let w0 = [w_row[0] + dwdx[0] * lo, w_row[1] + dwdx[1] * lo, w_row[2] + dwdx[2] * lo];
-                self.fast_span(fs, &plan, &geo, provoking, flat_all, py, min_x + lo, w0, (hi - lo) as usize);
+                self.fast_span(
+                    fs, &plan, &geo, tri_planes.as_ref(), provoking, flat_all, py, min_x + lo, w0, (hi - lo) as usize,
+                    (lo, py - min_y),
+                );
             } else {
                 for k in lo..hi {
                     let px = min_x + k;
@@ -355,12 +432,14 @@ impl Raster<'_> {
         fs: &mut Invoker<'_>,
         plan: &PixelPlan,
         geo: &SpanGeo<'_>,
+        tp: Option<&TriPlanes>,
         provoking: &Varyings,
         flat_all: bool,
         py: i64,
         px0: i64,
         w0: [i64; 3],
         n: usize,
+        (kx0, ky): (i64, i64),
     ) {
         use super::exec::Shade4;
         let bgra = plan.unorm8.unwrap();
@@ -370,42 +449,22 @@ impl Raster<'_> {
         }
         let cw = self.color.width as i64;
         let base = ((py - self.row0) * cw + px0) as usize * 4;
-        // each varying component the shader reads is a plane over the span:
-        // value(k) = a + b*k for the k-th pixel (perspective: a ratio of two)
-        let mut locs = [(0u32, 0u32); 32];
-        let nl = fs.span_locs(&mut locs);
+        // the triangle's planes, evaluated at this span's first pixel:
+        // value(k) = a + b*k for the k-th pixel of the span
         let mut planes = [Plane::Const(0); 32];
-        let ortho = geo.s[0].invw == geo.s[1].invw && geo.s[1].invw == geo.s[2].invw;
-        for i in 0..nl {
-            let (loc, comp) = (locs[i].0 as usize, locs[i].1 as usize);
-            let mode = self.interp.iter().find(|(x, _)| *x as usize == loc).map_or(Interp::Flat, |(_, m)| *m);
-            planes[i] = match mode {
-                Interp::Flat => Plane::Const(provoking[loc][comp]),
-                _ => {
-                    let v = [
-                        f32::from_bits(geo.s[0].var[loc][comp]) as f64,
-                        f32::from_bits(geo.s[1].var[loc][comp]) as f64,
-                        f32::from_bits(geo.s[2].var[loc][comp]) as f64,
-                    ];
-                    // plane of per-vertex values g: inv_sum * sum(w_i(k) * g_i)
-                    let plane = |g: [f64; 3]| {
-                        (
-                            geo.inv_sum * (w0[0] as f64 * g[0] + w0[1] as f64 * g[1] + w0[2] as f64 * g[2]),
-                            geo.inv_sum
-                                * (geo.dwdx[0] as f64 * g[0] + geo.dwdx[1] as f64 * g[1] + geo.dwdx[2] as f64 * g[2]),
-                        )
-                    };
-                    if mode == Interp::Linear || ortho {
-                        let (a, b) = plane(v);
-                        Plane::Lin { a, b }
-                    } else {
-                        let iw = [geo.s[0].invw, geo.s[1].invw, geo.s[2].invw];
-                        let (a, b) = plane([v[0] * iw[0], v[1] * iw[1], v[2] * iw[2]]);
-                        let (da, db) = plane(iw);
-                        Plane::Persp { a, b, da, db }
-                    }
-                }
-            };
+        if let Some(tp) = tp {
+            for i in 0..tp.n {
+                planes[i] = match tp.p[i] {
+                    TriPlane::Const(b) => Plane::Const(b),
+                    TriPlane::Lin { a, bx, by } => Plane::Lin { a: a + bx * kx0 as f64 + by * ky as f64, b: bx },
+                    TriPlane::Persp { a, bx, by, da, dbx, dby } => Plane::Persp {
+                        a: a + bx * kx0 as f64 + by * ky as f64,
+                        b: bx,
+                        da: da + dbx * kx0 as f64 + dby * ky as f64,
+                        db: dbx,
+                    },
+                };
+            }
         }
         let mut done = 0usize;
         while done < n {
@@ -476,12 +535,14 @@ impl Raster<'_> {
         _fs: &mut Invoker<'_>,
         _plan: &PixelPlan,
         _geo: &SpanGeo<'_>,
+        _tp: Option<&TriPlanes>,
         _provoking: &Varyings,
         _flat_all: bool,
         _py: i64,
         _px0: i64,
         _w0: [i64; 3],
         _n: usize,
+        _k: (i64, i64),
     ) {
         unreachable!("span_fast needs a wide stage")
     }
@@ -679,6 +740,22 @@ fn clip(tri: &[CV; 3], interp: &[(u32, Interp)]) -> Vec<CV> {
 // ---------------------------------------------------------------------------
 // per-triangle pixel write plan
 // ---------------------------------------------------------------------------
+
+/// A varying component over a whole triangle: value(kx, ky) = a + bx*kx + by*ky
+/// at pixel offsets (kx, ky) from the triangle's bounding-box corner
+/// (perspective: a ratio of two such planes).
+#[derive(Clone, Copy)]
+enum TriPlane {
+    Const(u32),
+    Lin { a: f64, bx: f64, by: f64 },
+    Persp { a: f64, bx: f64, by: f64, da: f64, dbx: f64, dby: f64 },
+}
+
+/// the planes of every varying input the shader reads, built once per triangle
+struct TriPlanes {
+    n: usize,
+    p: [TriPlane; 32],
+}
 
 #[derive(Clone, Copy)]
 enum Plane {
