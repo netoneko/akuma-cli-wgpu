@@ -1448,6 +1448,7 @@ fn draw_standard(
                 break;
             }
             let (lo, hi) = (c * VCHUNK, ((c + 1) * VCHUNK).min(nverts));
+            let tq0 = crate::clock::monotonic();
             let mut out = scratch_take(&CHUNK_POOL);
             out.clear();
             out.reserve(hi - lo);
@@ -1469,6 +1470,7 @@ fn draw_standard(
     };
     let vthreads = if nverts >= 4096 { raster_threads(&[[0; 4]; 64], 1, 1).min(nchunks) } else { 1 };
     let tj0 = crate::clock::monotonic();
+    POST_T.store(tj0.to_bits(), std::sync::atomic::Ordering::Relaxed);
     super::pool::run(vthreads.max(1), &vwork);
     if super::prof::enabled() {
         eprintln!("[vs] {vthreads} workers, {nchunks} chunks: {:.2} ms", (crate::clock::monotonic() - tj0) * 1e3);
@@ -1646,7 +1648,8 @@ fn draw_standard(
     }
 }
 
-const VSHIFT: usize = 13;
+static POST_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const VSHIFT: usize = 11;
 /// vertices per chunk of the vertex stage's output
 const VCHUNK: usize = 1 << VSHIFT;
 
@@ -1673,7 +1676,7 @@ fn scratch_take(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>) -> Vec<super::ex
 fn scratch_give(pool: &Mutex<Vec<Vec<super::exec::RawVertex>>>, mut v: Vec<super::exec::RawVertex>) {
     v.clear();
     let mut g = pool.lock().unwrap();
-    if g.len() < 8 {
+    if g.len() < 128 {
         g.push(v);
     }
 }
