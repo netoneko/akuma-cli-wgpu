@@ -113,6 +113,7 @@ COMMANDS:
     matrix         Matrix backdrop only
     selftest       render headlessly into RAM, print stats, exit
     exec-selftest  diff the shader executors (interp/vm/jit) bit for bit
+    shader-check <file.wgsl>...  does each entry point compile / jit? (and why not)
 
 OPTIONS:
     --latin        Latin characters in the backdrop (default: katakana)
@@ -192,6 +193,10 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // takes file arguments, so it bypasses the flag parser
+    if argv.first().map(String::as_str) == Some("shader-check") {
+        std::process::exit(wgpu_backend::exec_selftest::shader_check(&argv[1..]));
+    }
     let opts = match parse_args(&argv) {
         Ok(o) => o,
         Err(msg) => {

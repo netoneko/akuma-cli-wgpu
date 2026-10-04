@@ -109,37 +109,73 @@ Composing each frame in ordinary RAM and copying whole rows into the mapping is 
 kernel maps the framebuffer write-combining, which is fast for full-row copies (~3000 MB/s on the
 box) and slow for scattered writes (~71 MB/s). Keep that property in anything you change.
 
-## The wgpu backend (M3) — exists, one known defect
+## The wgpu backend (M3) — acceptance MET (2026-10-04)
 
 `--wgpu` renders any mode through the custom backend instead of the software rasterizer:
 `wgpu::Instance::from_custom(backend::Instance)` (wgpu 30, `features = ["custom", "wgsl"]`, no
-real GPU backends in the build), WGSL parsed by naga into IR and *interpreted* (`interp.rs`) —
-no JIT yet (plan §5b option A). The kernel refuses writable-and-executable pages, but a JIT does not need one — see "Next steps". Rasterization is
-fixed-function in `backend.rs`, under contract to mirror softrender's scanline walk exactly
-(same `mul_add` area test and `-0.01` cull, same edge/z interpolation, strict `z <` depth test).
+real GPU backends in the build). WGSL is parsed by naga into IR; rasterization is fixed-function
+in `backend.rs`, under contract to mirror softrender's scanline walk exactly (same `mul_add`
+area test and `-0.01` cull, same edge/z interpolation, strict `z <` depth test).
 
-Verified on 2026-10-03, on this tree:
+**Frames are bit-identical to the software path** on the trashcan: same `fnv1a` for all four
+assets at 256x144, 1280x720 and 3840x2160 (120 frames), under every executor below. The
+earlier mesh defect was the triangle storage buffer being packed without WGSL's 16-byte
+`vec3` alignment (fixed in `e20359c`).
 
-* Both paths run end to end on the box: live `screensaver`/`matrix` into `/dev/fb0`, headless
-  `selftest --wgpu` (`SELFTEST OK`).
-* The **rain backdrop is bit-identical** on the two paths — it is shared CPU code
-  (`softrender::backdrop`), so it cannot diverge.
-* The per-frame uniform carries `(time, width, height, extent, center_x)` as eight plain f32s.
-  An A/B of the previous 16-byte `vec4` uniform against the current 32-byte struct produced
-  byte-identical wgpu output — the uniform layout is not involved in the defect below.
+### Shader executors (`src/wgpu_backend/`)
 
-Not verified — the M3 acceptance is currently **not met**:
+A pipeline stage is run by one of three executors behind `exec.rs::Stage`; the rasterizer never
+knows which:
 
-* `selftest --wgpu` frames do **not** equal the software frames: mesh coverage lands at
-  0.9–1.5% vs 5.1–6.3% on the software path, and the `--dump` pictures show a cat roughly
-  1/3 the expected size, shrunk toward mid-frame. The A/B above rules out the uniform; the
-  defect predates 2026-10-03's edits and lives somewhere in the mesh path — `vs_main`
-  interpretation, the tri storage-buffer read (48-byte stride), or the fixed-function
-  rasterizer. Repro (cheap, the interpreter is slow at big frames):
-  `selftest --w 256 --h 144 --frames 8 --dump` vs the same with `--wgpu` — the rain rows diff
-  clean, only the mesh differs. Next session starts there.
+| executor | what | where it lives |
+|---|---|---|
+| **jit** (default on x86-64 Linux/Akuma) | machine code emitted from the register program; `mmap` RW → write → `mprotect(R+X)`, never a W+X page (the kernel refuses those, but a JIT does not need one — `userspace/jitprobe` in the kernel repo proved it on the trashcan) | `jit.rs` |
+| **vm** | bytecode interpreter over the same register program; portable, no executable memory | `vm.rs` |
+| **interp** | the original naga-IR tree walker; handles everything the backend supports, slow; the fallback when the lowering declines a shader | `interp.rs` |
 
-## Baseline: selftest checksums and timings (2026-10-03)
+`compile.rs` lowers naga IR **once, at pipeline creation**, into `program.rs`'s `Program`: a flat
+register machine over 32-bit words (vectors/matrices/structs/arrays scalarized away, user
+functions inlined, locals as mutable registers, everything else single-assignment; transcendentals
+and Rust-vs-CPU-divergent ops go through shared `extern "C"` helpers, so VM and JIT agree by
+construction). Anything it does not understand returns `Err` and the stage silently uses the
+interpreter — the compiler can grow feature by feature without ever being a correctness gate.
+
+Tools and switches:
+
+* `akuma-wgpu exec-selftest` — **the differential test.** 17 WGSL snippets (float/int/bit ops,
+  casts, comparisons with NaN, transcendentals, aggregates, swizzles, if/loop/switch, locals,
+  function calls, uniform + dynamic buffer indexing, matrix products) run through interp, VM and
+  JIT over 300 vertices fed pseudo-random data including NaN/±inf/±0; results must be
+  bit-identical. 17/17 on the trashcan. Writing it found eight interpreter bugs (see done-log
+  Task 8). Run it after touching `compile.rs`, `vm.rs`, `jit.rs` or `interp.rs`.
+* `akuma-wgpu shader-check <file.wgsl>...` — per entry point: does it lower, does it JIT, and if
+  not, why. Point it at real shaders.
+* `AKUMA_EXEC=interp|vm|jit` forces an executor; `AKUMA_EXEC_VERBOSE=1` reports each stage's
+  choice and why a fallback happened.
+* `AKUMA_PROF=1` prints a per-phase breakdown (backdrop, upload, vertex, raster, readback);
+  `AKUMA_PROF=2` adds per-fragment timers — each is a syscall on Akuma, so that level distorts
+  the numbers around it; use it only for fragment counts.
+* `./deploy.sh` cross-builds `x86_64-unknown-linux-musl` on the dev machine and pushes the
+  binary to the trashcan over HTTP (`/tmp/akuma-wgpu`; the box has `wget`, no `scp`). Needs
+  `x86_64-linux-musl-gcc` (musl-cross) and `ssh akuma` working.
+
+### Measured on the trashcan (2026-10-04, 120 frames, render only)
+
+| config | software | wgpu: interp | wgpu: vm | wgpu: jit |
+|---|---|---|---|---|
+| 1280×720 | 1.25 ms | 359 ms | 10.3 ms | **7.2 ms** |
+| 3840×2160 | 9.9 ms | (seconds) | — | **43.8 ms** |
+
+Where the wgpu 4K frame goes now (jit): ~25 ms is demo-integration plumbing around full-frame
+33 MB buffers (backdrop, texture upload memcpy, depth fill, `copy_texture_to_buffer`, readback
+blit), ~17 ms is raster + fragment (533k flat-colored fragments, ~33 ns each), 2 ms is the vertex
+stage (10.8k invocations at ~200 ns). The vertex stage was 227 ms/frame at 256x144 before the
+compiler. Of the vertex time that remains, much is `sin`/`cos` of per-frame uniforms recomputed
+for every vertex — hoisting uniform-only computation out of the per-invocation path is the
+obvious next win for the executor itself.
+
+
+## Baseline: selftest checksums and timings (re-measured 2026-10-04)
 
 These are the acceptance numbers for M3: the wgpu path must reproduce these frames (same
 `fnv1a` per asset). They are stable across runs on the trashcan (nightly
@@ -148,8 +184,13 @@ these to change — update this table and say why in your report.
 
 | config | akuma_40 | akuma_79 | akuma_120 | akuma_20 | avg render |
 |---|---|---|---|---|---|
-| 1280×720, 120 frames | `20365fb4` | `d0e5069d` | `a3614304` | `63bcb2d0` | 1.46 ms/frame (~686 fps) |
-| 3840×2160, 120 frames | `39155478` | `40cb1469` | `b095c423` | `e4574017` | 10.67 ms/frame (~94 fps) |
+| 1280×720, 120 frames | `9c5f8a2d` | `3e6005a8` | `1a65844b` | `3ec5edbf` | 1.25 ms/frame (~799 fps) |
+| 3840×2160, 120 frames | `3faaed4e` | `ef795024` | `eefd7b18` | `8ef751d6` | 9.89 ms/frame (~101 fps) |
+
+**The table above was stale** — the 2026-10-03 solid-two-tone-logo-colors change (`e20359c`) altered every
+frame's bits and the previous values were never re-measured. These are measured on the trashcan
+2026-10-04 and **the wgpu path (`--wgpu`, every executor) produces the same checksums**: that is the
+M3 acceptance, met.
 
 **Changed 2026-10-03 twice — intentional.** (1) Matrix rain rework (done-log Task 4): the
 backdrop went from 1-px streaks to cell-based Matrix columns. (2) Rain packed to a column per
@@ -159,7 +200,7 @@ live rain (see done-log): column count now matches between builder and resizer, 
 loop no longer rebuilds the rain every frame — positions and per-column speeds are back. The
 mesh math is untouched
 (`Scene::center_x` defaults to mid-frame in selftest), so these remain the
-renderer-equivalence target — see "The wgpu backend (M3)" for the one path that misses it.
+renderer-equivalence target.
 
 Re-verified 2026-10-03 after the fb.rs u16 fix, the clock hardening and the signal-handler
 change: **checksums identical**, `SELFTEST OK` on every build.
@@ -337,38 +378,68 @@ what its absence does.
   rows deeper over the extra second (frozen rain dumps were identical). Live
   `matrix --timeout 2`: 113 frames @ 54 fps on the panel.
 
-## Next steps (2026-10-04) — the wgpu path is too slow; here is the order
+### Task 8 — profile, then a shader compiler, a VM and an x86-64 JIT — DONE 2026-10-04
 
-**Finding:** the kernel's W^X policy does **not** block a JIT. `userspace/jitprobe/c/jit_probe.c`
-in the kernel repo ran on the trashcan and passed: mmap RW → write code → `mprotect(R+X)` →
-call; RX→RW→rewrite→RX re-JIT cycles (fresh code each time); an RX page surviving `fork`; a
-JITed loop at 0.39 ns/iter. Only a single call asking for W+X together is refused (`EINVAL`),
-and no JIT needs that. So no kernel work and no `memfd_create` — the plan's old "option B
-needs dual mapping" was wrong (corrected in `docs/fbdev-wgpu-plan.md` §5b).
+- **Profile first** (`AKUMA_PROF`): vertex-stage interpretation was 96-98% of the wgpu frame
+  (22.6 µs per vertex invocation on the box, ~4x the host — musl's allocator under an
+  interpreter that allocates for every value). Raster and fragment together were ~1 ms.
+- **`jit_probe`** (kernel repo, `userspace/jitprobe`) showed RW → `mprotect(R+X)` works on the
+  trashcan: no kernel change needed (the plan's `memfd_create` dual-mapping idea was wrong).
+- Built `exec.rs` (Stage/Invoker), `compile.rs` + `program.rs` (lowering), `vm.rs`, `jit.rs`;
+  per-draw buffer slices instead of per-read mutex locks; `exec-selftest`, `shader-check`,
+  `deploy.sh`. Vertex invocation on the box: interp 21.1 µs → vm 444 ns → jit 201 ns.
+- **`exec-selftest` found eight interpreter bugs** that the demo's two tiny shaders never hit
+  and that would have bitten sugarloaf's the moment the fallback ran them: no
+  `vec * scalar`; no int↔int bitcasts; `vec4(vec2, vec2)` did not flatten; no store to a vector
+  component (`v.x = ..`); no static index step into arrays; **local `var x = <const>` ignored
+  its initializer**; **loops never re-evaluated their conditions** (expressions were memoized
+  on first use for the whole invocation, so `loop { if i >= 12 { break } .. }` spun forever);
+  and `let` values were read at first *use* instead of at their `Emit` point. The interpreter
+  now follows naga's Emit semantics.
+- **Cut the 4K plumbing**: the frame is handed to wgpu as bytes instead of converted per
+  pixel; `get_mapped_range` no longer clones a 33 MB buffer per map; vectorizable masked
+  blit. 4K wgpu frame 90 → 38 ms.
+- **Could not verify:** the live `screensaver --wgpu` on `/dev/fb0` after these changes (only
+  headless `selftest` was run end to end); how it looks to a human.
+- **Not done:** textures/samplers, vertex buffers, blending, standard viewport semantics —
+  see "Next steps".
 
-Order matters; each step makes the next one verifiable:
+## Next steps (updated 2026-10-04, branch `jit-shader-executor`)
 
-1. **Fix the mesh defect first** (M3 section above; repro is cheap at 256×144). Without frame
-   equality with softrender, no speedup can be checked against the baseline checksums.
-2. **Profile the wgpu path** (per-frame time split: vertex interp, fragment interp, rasterizer,
-   buffer clones/allocations). The slowness is attributed to the interpreter by inference,
-   not measurement — measure before building anything.
-3. **Introduce a shader-executor interface** between `backend.rs` and the executor, with the
-   current tree-walking interpreter as one implementation. Later steps become swappable
-   and diffable against it.
-4. **A faster, no-executable-memory executor:** compile the naga IR once at pipeline creation
-   into a flat register bytecode or closures. Expect several-fold; also the fallback if the
-   JIT is ever unavailable.
-5. **A JIT executor** behind the same interface, W^X-clean (RW→RX flips). Choice to make:
-   a small hand-written x86-64 emitter covering only the ops sugarloaf's shaders use (keeps
-   rule 2 — three dependencies — intact), versus `cranelift` (more general, but breaks rule 2
-   and its build on the on-box musl nightly is unverified; spike that on the box before
-   committing). First enumerate sugarloaf's actual WGSL so the op set is known.
-6. **Then rio** (`rio-window` framebuffer platform + this backend). rio redraws on change
-   with 2D quads and a glyph atlas, so it needs far less than full-screen 60 fps shading.
+Done this session, in the order the previous version of this section laid out: (1) mesh parity
+— verified, it was already fixed; (2) profiled — the interpreter was ~97% of the frame; (3) the
+`Stage` executor interface; (4) the naga-IR → register-program compiler and VM; (5) the x86-64
+JIT. All bit-identical to softrender, all diffed by `exec-selftest`. The wgpu path went from
+254 ms/frame at 256x144 to 7 ms at 720p. Remaining, in rough order of value:
 
-Run the probe again after any kernel memory-management change: `userspace/jitprobe/c/build.sh
---push-akuma && ssh akuma /tmp/jit_probe` (kernel repo).
+1. **Make real shaders compile: textures.** `shader-check` against sugarloaf's actual WGSL
+   (`rio/sugarloaf/src/**/*.wgsl`) says **10 of 16 entry points already lower and JIT** — all 7
+   vertex shaders and the 382-instruction grid background fragment shader — and **all 6
+   declines are one cause**: texture/sampler globals (`textureLoad`, `textureSample`,
+   `textureSampleLevel`, `textureDimensions`). Needs `ImageLoad`/`ImageSample`/`ImageQuery`
+   lowering plus texture and sampler bindings in the backend (today `build_resources` panics on
+   them) — nearest first (`textureLoad` is what the grid text pass uses), then bilinear.
+2. **Backend features rio needs that the fixed-function side does not have yet** (this is
+   most of the distance to rio, and it is backend work, not shader work):
+   * standard clip → NDC → viewport transform and varying interpolation. Today the contract is
+     "`@builtin(position)` is already in pixels, varyings are flat" — right for this demo's
+     bit-exactness, wrong for any real wgpu client. Make it a per-pipeline mode so the demo
+     keeps its contract.
+   * vertex buffers + instancing (sugarloaf's text/quad passes are instanced attribute
+     streams: `Uint32x2`, `Sint16x2`, `Unorm8x4`, `Uint8` ...). The compiled stages already
+     accept `@location` inputs (`Src::Location`); nothing feeds them yet.
+   * triangle strips, premultiplied-alpha blending (`One`, `OneMinusSrcAlpha`), unorm color
+     targets (`Rgba8Unorm`/`Bgra8Unorm`, today only `Rgba8Uint`), optional depth,
+     scissor/viewport state, multiple bind groups beyond what `execute_render` handles.
+   * `discard` already works in all executors (`Kill`).
+3. **Executor speed, if the demo's 4K frame matters:** hoist uniform-only computation (the
+   `sin`/`cos` of per-frame uniforms is recomputed per vertex) out of the per-invocation path;
+   evaluate flat-varying, position-independent fragment shaders once per triangle; real
+   register allocation in the JIT (every virtual register currently lives in memory).
+4. **Then rio itself:** a framebuffer platform in `rio-window` (screen = `/dev/fb0`, input = the
+   console tty), a `Surface` whose texture is presented into the mapping with whole-row
+   copies, and this backend as sugarloaf's wgpu. rio redraws on change with 2D quads and a
+   glyph atlas, so it needs far less than full-screen 60 fps shading.
 
 ## Tasks, in order
 

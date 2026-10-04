@@ -295,3 +295,47 @@ pub fn run() -> i32 {
         1
     }
 }
+
+/// `akuma-wgpu shader-check <file.wgsl>...`: for every entry point of every
+/// file, report whether the lowering accepts it, whether it JITs, and why not.
+pub fn shader_check(files: &[String]) -> i32 {
+    let mut bad = 0;
+    for f in files {
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{f}: {e}");
+                bad += 1;
+                continue;
+            }
+        };
+        let sh = match Shader::parse(&src) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                println!("{f}: does not parse/validate: {e}");
+                bad += 1;
+                continue;
+            }
+        };
+        for (i, ep) in sh.module.entry_points.iter().enumerate() {
+            let verdict = match super::compile::compile(&sh, i) {
+                Err(e) => {
+                    bad += 1;
+                    format!("DECLINED: {e}")
+                }
+                Ok(p) => {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    let j = match super::jit::compile(&p) {
+                        Ok(j) => format!("jit {} B", j.code_len()),
+                        Err(e) => format!("jit declined: {e}"),
+                    };
+                    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+                    let j = "no jit on this target".to_string();
+                    format!("ok: {} insts, {} regs, {} buffers, {j}", p.code.len(), p.nregs, p.bufs.len())
+                }
+            };
+            println!("{f}: {:?} {:<22} {verdict}", ep.stage, ep.name);
+        }
+    }
+    if bad == 0 { 0 } else { 1 }
+}
