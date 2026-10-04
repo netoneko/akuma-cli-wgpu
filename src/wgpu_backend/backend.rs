@@ -61,11 +61,9 @@ pub struct TextureData {
 }
 
 impl TextureData {
-    fn bytes_per_texel(&self) -> u32 {
-        match self.format {
-            wgpu::TextureFormat::Rgba8Uint | wgpu::TextureFormat::Depth32Float => 4,
-            other => panic!("akuma backend: unsupported texture format {other:?}"),
-        }
+    pub fn bytes_per_texel(&self) -> u32 {
+        super::format::bytes_per_texel(self.format)
+            .unwrap_or_else(|| panic!("akuma backend: unsupported texture format {:?}", self.format))
     }
 }
 
@@ -141,9 +139,29 @@ pub enum Cmd {
     CopyTextureToBuffer {
         src_store: Arc<TexStore>,
         src_width: u32,
+        src_bpt: u32,
         src_origin: wgpu::Origin3d,
         dst_bytes: Arc<Mutex<Vec<u8>>>,
         layout: wgpu::TexelCopyBufferLayout,
+        size: wgpu::Extent3d,
+    },
+    CopyBufferToTexture {
+        src_bytes: Arc<Mutex<Vec<u8>>>,
+        layout: wgpu::TexelCopyBufferLayout,
+        dst_store: Arc<TexStore>,
+        dst_width: u32,
+        dst_bpt: u32,
+        dst_origin: wgpu::Origin3d,
+        size: wgpu::Extent3d,
+    },
+    CopyTextureToTexture {
+        src_store: Arc<TexStore>,
+        src_width: u32,
+        src_origin: wgpu::Origin3d,
+        dst_store: Arc<TexStore>,
+        dst_width: u32,
+        dst_origin: wgpu::Origin3d,
+        bpt: u32,
         size: wgpu::Extent3d,
     },
     ClearBuffer {
@@ -475,12 +493,15 @@ impl wgpu::custom::DeviceInterface for Device {
         let pixels = desc.size.width as usize
             * desc.size.height as usize
             * desc.size.depth_or_array_layers as usize;
+        assert_eq!(desc.mip_level_count, 1, "akuma backend: mip chains unsupported");
+        assert_eq!(desc.sample_count, 1, "akuma backend: multisampling unsupported");
+        assert_eq!(desc.dimension, wgpu::TextureDimension::D2, "akuma backend: only 2D textures");
         let store = match desc.format {
-            wgpu::TextureFormat::Rgba8Uint => {
-                TexStore::Color(Mutex::new(vec![0u8; pixels * 4]))
-            }
             wgpu::TextureFormat::Depth32Float => TexStore::Depth(Mutex::new(vec![0.0f32; pixels])),
-            other => panic!("akuma backend: unsupported texture format {other:?}"),
+            f => match super::format::bytes_per_texel(f) {
+                Some(bpt) => TexStore::Color(Mutex::new(vec![0u8; pixels * bpt as usize])),
+                None => panic!("akuma backend: unsupported texture format {f:?}"),
+            },
         };
         wgpu::custom::DispatchTexture::custom(TextureData {
             size: desc.size,
@@ -707,11 +728,6 @@ impl wgpu::custom::QueueInterface for Queue {
         size: wgpu::Extent3d,
     ) {
         assert_eq!(
-            texture.origin,
-            wgpu::Origin3d::ZERO,
-            "akuma backend: nonzero write_texture origin unused"
-        );
-        assert_eq!(
             size.depth_or_array_layers, 1,
             "akuma backend: layered write_texture unused"
         );
@@ -729,8 +745,9 @@ impl wgpu::custom::QueueInterface for Queue {
             TexStore::Depth(_) => panic!("write_texture into a depth texture"),
         };
         for y in 0..size.height {
-            let src = y as usize * src_pitch;
-            let dst = y as usize * dst_row_pitch as usize;
+            let src = data_layout.offset as usize + y as usize * src_pitch;
+            let dst = (texture.origin.y + y) as usize * dst_row_pitch as usize
+                + (texture.origin.x * bpt) as usize;
             let count = (size.width * bpt) as usize;
             store[dst..dst + count].copy_from_slice(&data[src..src + count]);
         }
@@ -792,28 +809,98 @@ fn execute(cmd: Cmd) {
         Cmd::CopyTextureToBuffer {
             src_store,
             src_width,
+            src_bpt,
             src_origin,
             dst_bytes,
             layout,
             size,
         } => {
-            assert_eq!(src_origin, wgpu::Origin3d::ZERO);
             assert_eq!(size.depth_or_array_layers, 1);
-            let bpt = 4u32;
-            let row_pitch = src_width * bpt;
-            let dst_pitch = layout.bytes_per_row.unwrap_or(size.width * bpt) as usize;
+            let bpt = src_bpt as usize;
+            let count = size.width as usize * bpt;
+            let dst_pitch = layout.bytes_per_row.map(|p| p as usize).unwrap_or(count);
             let mut d = dst_bytes.lock().unwrap();
             match &*src_store {
                 TexStore::Color(c) => {
                     let s = c.lock().unwrap();
-                    for y in 0..size.height {
-                        let so = (y * row_pitch) as usize;
-                        let doff = layout.offset as usize + y as usize * dst_pitch;
-                        let count = (size.width * bpt) as usize;
+                    for y in 0..size.height as usize {
+                        let so = ((src_origin.y as usize + y) * src_width as usize
+                            + src_origin.x as usize)
+                            * bpt;
+                        let doff = layout.offset as usize + y * dst_pitch;
                         d[doff..doff + count].copy_from_slice(&s[so..so + count]);
                     }
                 }
                 TexStore::Depth(_) => panic!("copy depth texture to buffer unused"),
+            }
+        }
+        Cmd::CopyBufferToTexture {
+            src_bytes,
+            layout,
+            dst_store,
+            dst_width,
+            dst_bpt,
+            dst_origin,
+            size,
+        } => {
+            assert_eq!(size.depth_or_array_layers, 1);
+            let bpt = dst_bpt as usize;
+            let count = size.width as usize * bpt;
+            let src_pitch = layout.bytes_per_row.map(|p| p as usize).unwrap_or(count);
+            let s = src_bytes.lock().unwrap();
+            match &*dst_store {
+                TexStore::Color(c) => {
+                    let mut d = c.lock().unwrap();
+                    for y in 0..size.height as usize {
+                        let so = layout.offset as usize + y * src_pitch;
+                        let doff = ((dst_origin.y as usize + y) * dst_width as usize
+                            + dst_origin.x as usize)
+                            * bpt;
+                        d[doff..doff + count].copy_from_slice(&s[so..so + count]);
+                    }
+                }
+                TexStore::Depth(_) => panic!("copy buffer to depth texture unused"),
+            }
+        }
+        Cmd::CopyTextureToTexture {
+            src_store,
+            src_width,
+            src_origin,
+            dst_store,
+            dst_width,
+            dst_origin,
+            bpt,
+            size,
+        } => {
+            assert_eq!(size.depth_or_array_layers, 1);
+            let bpt = bpt as usize;
+            let count = size.width as usize * bpt;
+            // stage through a temporary so a copy within one texture (or
+            // overlapping regions) behaves like a memmove
+            let mut tmp = vec![0u8; count * size.height as usize];
+            match &*src_store {
+                TexStore::Color(c) => {
+                    let s = c.lock().unwrap();
+                    for y in 0..size.height as usize {
+                        let so = ((src_origin.y as usize + y) * src_width as usize
+                            + src_origin.x as usize)
+                            * bpt;
+                        tmp[y * count..(y + 1) * count].copy_from_slice(&s[so..so + count]);
+                    }
+                }
+                TexStore::Depth(_) => panic!("depth texture copies unused"),
+            }
+            match &*dst_store {
+                TexStore::Color(c) => {
+                    let mut d = c.lock().unwrap();
+                    for y in 0..size.height as usize {
+                        let doff = ((dst_origin.y as usize + y) * dst_width as usize
+                            + dst_origin.x as usize)
+                            * bpt;
+                        d[doff..doff + count].copy_from_slice(&tmp[y * count..(y + 1) * count]);
+                    }
+                }
+                TexStore::Depth(_) => panic!("depth texture copies unused"),
             }
         }
         Cmd::ClearBuffer {
@@ -1126,11 +1213,27 @@ impl wgpu::custom::CommandEncoderInterface for Encoder {
 
     fn copy_buffer_to_texture(
         &self,
-        _source: wgpu::TexelCopyBufferInfo<'_>,
-        _destination: wgpu::TexelCopyTextureInfo<'_>,
-        _copy_size: wgpu::Extent3d,
+        source: wgpu::TexelCopyBufferInfo<'_>,
+        destination: wgpu::TexelCopyTextureInfo<'_>,
+        copy_size: wgpu::Extent3d,
     ) {
-        panic!("akuma backend: buffer->texture copy unused");
+        let src = source
+            .buffer
+            .as_custom::<BufferData>()
+            .expect("akuma backend: foreign buffer");
+        let dst = destination
+            .texture
+            .as_custom::<TextureData>()
+            .expect("akuma backend: foreign texture");
+        self.shared.cmds.lock().unwrap().push(Cmd::CopyBufferToTexture {
+            src_bytes: Arc::clone(&src.bytes),
+            layout: source.layout,
+            dst_store: Arc::clone(&dst.store),
+            dst_width: dst.size.width,
+            dst_bpt: dst.bytes_per_texel(),
+            dst_origin: destination.origin,
+            size: copy_size,
+        });
     }
 
     fn copy_texture_to_buffer(
@@ -1154,6 +1257,7 @@ impl wgpu::custom::CommandEncoderInterface for Encoder {
             .push(Cmd::CopyTextureToBuffer {
                 src_store: Arc::clone(&src.store),
                 src_width: src.size.width,
+                src_bpt: src.bytes_per_texel(),
                 src_origin: source.origin,
                 dst_bytes: Arc::clone(&dst.bytes),
                 layout: destination.layout,
@@ -1163,11 +1267,29 @@ impl wgpu::custom::CommandEncoderInterface for Encoder {
 
     fn copy_texture_to_texture(
         &self,
-        _source: wgpu::TexelCopyTextureInfo<'_>,
-        _destination: wgpu::TexelCopyTextureInfo<'_>,
-        _copy_size: wgpu::Extent3d,
+        source: wgpu::TexelCopyTextureInfo<'_>,
+        destination: wgpu::TexelCopyTextureInfo<'_>,
+        copy_size: wgpu::Extent3d,
     ) {
-        panic!("akuma backend: texture->texture copy unused");
+        let src = source
+            .texture
+            .as_custom::<TextureData>()
+            .expect("akuma backend: foreign texture");
+        let dst = destination
+            .texture
+            .as_custom::<TextureData>()
+            .expect("akuma backend: foreign texture");
+        assert_eq!(src.format, dst.format, "akuma backend: copy between different formats");
+        self.shared.cmds.lock().unwrap().push(Cmd::CopyTextureToTexture {
+            src_store: Arc::clone(&src.store),
+            src_width: src.size.width,
+            src_origin: source.origin,
+            dst_store: Arc::clone(&dst.store),
+            dst_width: dst.size.width,
+            dst_origin: destination.origin,
+            bpt: src.bytes_per_texel(),
+            size: copy_size,
+        });
     }
 
     fn begin_compute_pass(
