@@ -33,6 +33,7 @@
 //! equal the software-path baselines in the README.
 
 pub mod backend;
+pub mod exec;
 pub mod interp;
 pub mod shaders;
 

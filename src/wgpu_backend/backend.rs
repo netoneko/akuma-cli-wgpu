@@ -29,7 +29,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::interp::{self, Resources, Shader};
+use super::exec::{Invoker, RawVertex, Stage, Varyings};
+use super::interp::{Resources, Shader};
 use wgpu::{
     BufferAddress, BufferSize, MapMode,
 };
@@ -91,8 +92,7 @@ pub struct BindGroupData {
 
 #[derive(Clone, Debug)]
 pub struct StageData {
-    pub shader: Arc<Shader>,
-    pub entry: usize,
+    pub stage: Arc<Stage>,
 }
 
 impl StageData {
@@ -100,7 +100,7 @@ impl StageData {
         let entry = shader
             .entry(entry_point)
             .unwrap_or_else(|e| panic!("akuma backend: {what} entry: {e}"));
-        StageData { shader, entry }
+        StageData { stage: Arc::new(Stage::new(shader, entry)) }
     }
 }
 
@@ -905,7 +905,8 @@ fn execute_render(data: RenderPassData) {
                 let ztex = depth
                     .as_ref()
                     .expect("akuma backend: draws require a depth attachment");
-                let res = build_resources(&groups);
+                let guards = lock_buffers(&groups);
+                let res = build_resources(&guards);
                 let mut zbuf = match &*ztex.store {
                     TexStore::Depth(d) => d.lock().unwrap(),
                     TexStore::Color(_) => unreachable!(),
@@ -914,24 +915,25 @@ fn execute_render(data: RenderPassData) {
                     TexStore::Color(c) => c.lock().unwrap(),
                     TexStore::Depth(_) => unreachable!(),
                 };
+                let mut vs_inv = pipe.vs.stage.begin(&res);
+                let mut fs_inv = pipe
+                    .fs
+                    .as_ref()
+                    .expect("akuma backend: draw needs a fragment stage")
+                    .stage
+                    .begin(&res);
                 for inst in instances.clone() {
                     // vertex stage: one interpreter invocation per corner
                     let tv = crate::clock::monotonic();
                     let mut verts = Vec::with_capacity((vertices.end - vertices.start) as usize);
                     for vi in vertices.clone() {
-                        verts.push(interp::run_vertex(
-                            &pipe.vs.shader,
-                            pipe.vs.entry,
-                            &res,
-                            vi,
-                            inst,
-                        ));
+                        verts.push(vs_inv.run_vertex(vi, inst));
                     }
                     super::prof::add_ns(4, crate::clock::monotonic() - tv);
                     super::prof::inc(8, verts.len() as u64);
                     let tr = crate::clock::monotonic();
                     for tri in verts.chunks_exact(3) {
-                        raster_tri(tri, pipe, &res, depth_st, &mut zbuf, &mut color, w, h);
+                        raster_tri(tri, &mut fs_inv, depth_st, &mut zbuf, &mut color, w, h);
                     }
                     // raster total minus the fragment time raster_tri booked
                     super::prof::add_ns(5, crate::clock::monotonic() - tr);
@@ -941,20 +943,45 @@ fn execute_render(data: RenderPassData) {
     }
 }
 
-fn build_resources(groups: &[Option<BindGroupData>]) -> Resources {
-    let mut res = Resources::default();
+/// Lock every buffer the bound groups reference, once per draw. The same
+/// buffer bound at two slots is locked once (a second `lock()` on the same
+/// mutex would deadlock). Returns (group, binding, guard index) + the guards.
+type Locked<'a> = (Vec<(u32, u32, usize)>, Vec<std::sync::MutexGuard<'a, Vec<u8>>>);
+
+fn lock_buffers(groups: &[Option<BindGroupData>]) -> Locked<'_> {
+    let mut guards = Vec::new();
+    let mut seen: Vec<*const Mutex<Vec<u8>>> = Vec::new();
+    let mut idx = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         let g = g.as_ref().expect("bind group not set");
         for (binding, r) in &g.entries {
             match r {
                 BindRes::Buffer(bytes) => {
-                    res = res.with_buffer(gi as u32, *binding, Arc::clone(bytes));
+                    let p = Arc::as_ptr(bytes);
+                    let at = match seen.iter().position(|&q| q == p) {
+                        Some(i) => i,
+                        None => {
+                            seen.push(p);
+                            guards.push(bytes.lock().unwrap());
+                            guards.len() - 1
+                        }
+                    };
+                    idx.push((gi as u32, *binding, at));
                 }
                 BindRes::Texture(_) | BindRes::Sampler => {
                     panic!("akuma backend: texture/sampler bindings unsupported")
                 }
             }
         }
+    }
+    (idx, guards)
+}
+
+fn build_resources<'a>(locked: &'a Locked<'_>) -> Resources<'a> {
+    let (idx, guards) = locked;
+    let mut res = Resources::default();
+    for &(g, b, at) in idx {
+        res = res.with_buffer(g, b, &guards[at][..]);
     }
     res
 }
@@ -974,9 +1001,8 @@ fn edge_xz(p: Vtx, q: Vtx, yy: f32) -> (f32, f32) {
 /// comes from the provoking (first) vertex; the fragment stage runs per
 /// covered pixel and hands back the exact target bytes.
 fn raster_tri(
-    v: &[interp::VertexOut],
-    pipe: &RenderPipelineData,
-    res: &Resources,
+    v: &[RawVertex],
+    fs: &mut Invoker<'_>,
     depth_st: &wgpu::DepthStencilState,
     zbuf: &mut [f32],
     color: &mut [u8],
@@ -1000,8 +1026,7 @@ fn raster_tri(
     }
 
     // provoking vertex = first corner: the flat varying source
-    let provoking = &v[0].varyings;
-    let fs = pipe.fs.as_ref().expect("akuma backend: draw needs a fragment stage");
+    let provoking: &Varyings = &v[0].varyings;
 
     // scanline raster with per-pixel z interpolated along the edges
     let (wi, hi) = (w as i64, h as i64);
@@ -1044,13 +1069,7 @@ fn raster_tri(
                 // fragment stage for this pixel; it returns the four raw
                 // target-component values
                 let tf = crate::clock::monotonic();
-                let frag = interp::run_fragment(
-                    &fs.shader,
-                    fs.entry,
-                    res,
-                    provoking,
-                    [x as f32 + 0.5, yy, z, 1.0],
-                );
+                let frag = fs.run_fragment(provoking, [x as f32 + 0.5, yy, z, 1.0]);
                 super::prof::add_ns(6, crate::clock::monotonic() - tf);
                 super::prof::inc(9, 1);
                 if let Some(px) = frag {

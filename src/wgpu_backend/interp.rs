@@ -30,7 +30,6 @@
 //! ops are explicitly unimplemented (they panic with a clear message).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use naga::{
     AddressSpace, BinaryOperator, BuiltIn, Expression, Function, Handle, Literal, MathFunction,
@@ -140,12 +139,15 @@ pub enum PtrStep {
 /// What a shader invocation can see. Buffers only for now: the M3 shaders
 /// use one uniform (frame/time) and one read-only storage buffer (the mesh).
 #[derive(Default)]
-pub struct Resources {
-    pub bufs: HashMap<(u32, u32), Arc<Mutex<Vec<u8>>>>,
+pub struct Resources<'r> {
+    /// bound buffer contents, borrowed for the duration of one draw (the
+    /// backend holds the buffers' locks across it, so every stage executor —
+    /// interpreter, VM, JIT — reads plain slices)
+    pub bufs: HashMap<(u32, u32), &'r [u8]>,
 }
 
-impl Resources {
-    pub fn with_buffer(mut self, group: u32, binding: u32, bytes: Arc<Mutex<Vec<u8>>>) -> Self {
+impl<'r> Resources<'r> {
+    pub fn with_buffer(mut self, group: u32, binding: u32, bytes: &'r [u8]) -> Self {
         self.bufs.insert((group, binding), bytes);
         self
     }
@@ -282,6 +284,7 @@ fn read_shape(module: &naga::Module, bytes: &[u8], off: u32, shape: &PtrShape) -
     }
 }
 
+#[allow(dead_code)]
 fn write_shape(
     module: &naga::Module,
     bytes: &mut [u8],
@@ -312,6 +315,7 @@ fn read_scalar(bytes: &[u8], off: u32, s: naga::Scalar) -> Value {
     }
 }
 
+#[allow(dead_code)]
 fn write_scalar(bytes: &mut [u8], off: u32, v: &Value) {
     let at = off as usize;
     match v {
@@ -383,6 +387,7 @@ fn read_value(module: &naga::Module, bytes: &[u8], off: u32, ty: Handle<naga::Ty
     }
 }
 
+#[allow(dead_code)]
 fn write_value(
     module: &naga::Module,
     bytes: &mut [u8],
@@ -438,7 +443,7 @@ const MAX_CALL_DEPTH: u32 = 64;
 struct Frame<'a> {
     sh: &'a Shader,
     fun: &'a Function,
-    res: &'a Resources,
+    res: &'a Resources<'a>,
     args: Vec<Value>,
     slots: Vec<Option<Value>>,
     memo: Vec<Option<Value>>,
@@ -450,7 +455,7 @@ impl<'a> Frame<'a> {
     fn new(
         sh: &'a Shader,
         fun: &'a Function,
-        res: &'a Resources,
+        res: &'a Resources<'a>,
         args: Vec<Value>,
         depth: u32,
     ) -> Frame<'a> {
@@ -772,15 +777,13 @@ impl<'a> Frame<'a> {
                 v
             }
             PtrBase::Buffer { group, binding } => {
-                let bytes = self
+                let bytes = *self
                     .res
                     .bufs
                     .get(&(group, binding))
-                    .expect("interp: shader reads an unbound buffer")
-                    .lock()
-                    .unwrap();
+                    .expect("interp: shader reads an unbound buffer");
                 let (off, shape) = self.buffer_ptr_offset_shape(&ptr);
-                read_shape(&self.sh.module, &bytes, off, &shape)
+                read_shape(&self.sh.module, bytes, off, &shape)
             }
         }
     }
@@ -820,15 +823,10 @@ impl<'a> Frame<'a> {
                 *cur = v;
             }
             PtrBase::Buffer { group, binding } => {
-                let mut bytes = self
-                    .res
-                    .bufs
-                    .get(&(group, binding))
-                    .expect("interp: shader writes an unbound buffer")
-                    .lock()
-                    .unwrap();
-                let (off, shape) = self.buffer_ptr_offset_shape(&ptr);
-                write_shape(&self.sh.module, &mut bytes, off, &shape, &v);
+                // vertex/fragment stages here only ever read buffers; the
+                // backend holds them as shared slices for the whole draw
+                let _ = (group, binding, v);
+                panic!("interp: storage-buffer writes unsupported");
             }
         }
     }
