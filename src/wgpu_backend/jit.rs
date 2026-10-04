@@ -323,9 +323,32 @@ fn emit_scalar(
                 fixups.push((a.b.len(), t));
                 a.u32(0);
             }
+            Inst::MemoGet { m, t } => {
+                emit_memo_call(a, p, m, super::program::memo_get as usize)?;
+                a.bytes(&[0x85, 0xC0, 0x0F, 0x85]); // test eax,eax; jnz t
+                fixups.push((a.b.len(), t));
+                a.u32(0);
+            }
+            Inst::MemoPut { m } => emit_memo_call(a, p, m, super::program::memo_put as usize)?,
             Inst::Kill => a.epilogue(true),
             Inst::Ret => a.epilogue(false),
         }
+    Ok(())
+}
+
+/// `memo_get/put(regs, &memos[m], stride)`; the register file layout (stride)
+/// is whatever `a` is emitting for. Lanes never diverge here: the helper
+/// reports a hit only for a whole batch.
+fn emit_memo_call(a: &mut Asm, p: &Program, m: u32, f: usize) -> Result<(), String> {
+    let info = p.memos.get(m as usize).ok_or("memo out of range")?;
+    a.bytes(&[0x48, 0x89, 0xDF]); // mov rdi,rbx
+    a.bytes(&[0x48, 0xBE]); // mov rsi, imm64
+    a.bytes(&(info as *const _ as usize as u64).to_le_bytes());
+    a.u8(0xBA); // mov edx, imm32
+    a.u32(a.stride);
+    a.bytes(&[0x48, 0xB8]); // mov rax, imm64
+    a.bytes(&(f as u64).to_le_bytes());
+    a.bytes(&[0xFF, 0xD0]); // call rax
     Ok(())
 }
 
@@ -804,6 +827,8 @@ fn emit_wide(
         }
         Inst::Kill => a.epilogue(true),
         Inst::Ret => a.epilogue(false),
+        // memo helpers take the whole 4-lane register file
+        Inst::MemoGet { .. } | Inst::MemoPut { .. } => emit_scalar(a, p, inst, fixups)?,
         // everything else: the scalar template, once per lane
         _ => {
             for lane in 0..4 {

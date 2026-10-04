@@ -322,7 +322,7 @@ impl Invoker<'_> {
             Invoker::Interp { s, res } => s.run_vertex(res, vertex_index, instance_index),
             Invoker::Vm { p, regs, bufs, texs, smps } => {
                 vertex_in(p, regs, vertex_index, instance_index, attrs);
-                vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops);
+                vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops, &p.memos);
                 vertex_out(p, regs)
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -357,7 +357,7 @@ impl Invoker<'_> {
             Invoker::Interp { s, res } => s.run_fragment(res, varyings, frag_pos),
             Invoker::Vm { p, regs, bufs, texs, smps } => {
                 frag_in(p, regs, varyings, frag_pos);
-                if vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops) {
+                if vm::run(&p.code, regs, bufs, texs, smps, &p.tex_ops, &p.memos) {
                     return None;
                 }
                 Some(frag_out(p, regs))

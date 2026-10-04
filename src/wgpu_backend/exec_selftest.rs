@@ -360,6 +360,12 @@ pub fn shader_check(files: &[String]) -> i32 {
                         }
                     }
                     let ncalls: u32 = calls.values().sum();
+                    if std::env::var("AKUMA_DUMP").is_ok_and(|n| n == ep.name) {
+                        println!("  inputs {:?}\n  outputs {:?}", p.inputs, p.outputs);
+                        for (k, i) in p.code.iter().enumerate() {
+                            println!("  {k:4}: {i:?}");
+                        }
+                    }
                     if std::env::var_os("AKUMA_MIX").is_some() {
                         let mut mix = std::collections::BTreeMap::<String, u32>::new();
                         for i in &p.code {

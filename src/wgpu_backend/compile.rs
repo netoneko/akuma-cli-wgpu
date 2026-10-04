@@ -171,7 +171,7 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
     for (r, v) in &lw.init {
         init[*r as usize] = *v;
     }
-    Ok(Program {
+    let mut prog = Program {
         code: lw.code,
         nregs: lw.nregs,
         init,
@@ -182,7 +182,13 @@ pub fn compile(sh: &Shader, entry: usize) -> Res<Program> {
         texs: lw.texs,
         smps: lw.smps,
         tex_ops: lw.tex_ops,
-    })
+        memos: Vec::new(),
+    };
+    super::opt::optimize(&mut prog, None);
+    if ep.stage == naga::ShaderStage::Fragment {
+        super::memo::apply(&mut prog);
+    }
+    Ok(prog)
 }
 
 fn scalar_k(s: naga::Scalar) -> Res<K> {

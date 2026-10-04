@@ -79,6 +79,13 @@ pub enum Inst {
     Jmp { t: u32 },
     Jz { c: R, t: u32 },
     Jnz { c: R, t: u32 },
+    /// Start of memoized region `Program::memos[m]`: if the region's live-in
+    /// registers match a cached entry, copy the cached live-out registers
+    /// and jump to `t` (just past the matching `MemoPut`); else fall through
+    /// and run the region.
+    MemoGet { m: u32, t: u32 },
+    /// End of region `m`: remember (live-ins -> live-outs) for the next `MemoGet`.
+    MemoPut { m: u32 },
     Kill,
     Ret,
 }
@@ -109,7 +116,7 @@ pub enum Dst {
     Location(u32, u8),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub code: Vec<Inst>,
     pub nregs: u32,
@@ -127,6 +134,112 @@ pub struct Program {
     /// operands of `Inst::Tex`. Heap-stable: the JIT embeds element addresses,
     /// so this Vec must never be grown after `jit::compile`.
     pub tex_ops: Vec<super::texture::TexOp>,
+    /// memoized regions (see `memo.rs`). Heap-stable like `tex_ops`.
+    pub memos: Vec<MemoInfo>,
+}
+
+/// A pure region of the program whose result depends only on a few registers:
+/// a direct-mapped cache in persistent registers maps those (`ins`) to the
+/// region's results (`outs`). The cache survives across invocations (the
+/// register file is initialized once per draw) and is private to the
+/// invoker, i.e. to one thread.
+#[derive(Debug, Clone)]
+pub struct MemoInfo {
+    pub ins: Vec<R>,
+    pub outs: Vec<R>,
+    /// first register of the table: `1 << bits` entries of `1 + ins + outs`
+    /// registers: [valid, keys.., results..]
+    pub base: R,
+    pub bits: u32,
+    /// register holding the entry `MemoGet` selected, for `MemoPut`
+    pub slot: R,
+}
+
+impl MemoInfo {
+    pub fn entry_words(&self) -> u32 {
+        1 + (self.ins.len() + self.outs.len()) as u32
+    }
+    pub fn table_regs(&self) -> u32 {
+        self.entry_words() << self.bits
+    }
+}
+
+/// `slot` value: this invocation must not update the cache
+const NO_SLOT: u32 = u32::MAX;
+
+fn memo_hash(m: &MemoInfo, key: impl Fn(usize) -> u32) -> u32 {
+    let mut h = 0u32;
+    for i in 0..m.ins.len() {
+        h = (h ^ key(i)).wrapping_mul(0x9E37_79B1).rotate_left(13);
+    }
+    h.wrapping_mul(0x85EB_CA6B) >> (32 - m.bits)
+}
+
+/// `MemoGet`: returns 1 on a hit (the live-outs are already written). `regs`
+/// is the register file with `stride` words per register (1 scalar, 4 wide:
+/// register r, lane l at r*stride + l); cache entries only use lane 0, and a
+/// wide batch whose lanes disagree on a key neither hits nor updates the cache.
+///
+/// # Safety
+/// `regs` must point to a register file holding every register `m` names.
+pub unsafe extern "C" fn memo_get(regs: *mut u32, m: *const MemoInfo, stride: u32) -> u32 {
+    let st = stride as usize;
+    unsafe {
+        let m = &*m;
+        let at = |r: R, lane: usize| regs.add(r as usize * st + lane);
+        let slot = at(m.slot, 0);
+        for &k in &m.ins {
+            let v = *at(k, 0);
+            for lane in 1..st {
+                if *at(k, lane) != v {
+                    *slot = NO_SLOT;
+                    return 0;
+                }
+            }
+        }
+        let e = m.base + memo_hash(m, |i| *at(m.ins[i], 0)) * m.entry_words();
+        *slot = e;
+        if *at(e, 0) == 0 {
+            return 0;
+        }
+        for (i, &k) in m.ins.iter().enumerate() {
+            if *at(e + 1 + i as u32, 0) != *at(k, 0) {
+                return 0;
+            }
+        }
+        let o = e + 1 + m.ins.len() as u32;
+        for (j, &r) in m.outs.iter().enumerate() {
+            let v = *at(o + j as u32, 0);
+            for lane in 0..st {
+                *at(r, lane) = v;
+            }
+        }
+        1
+    }
+}
+
+/// `MemoPut`
+///
+/// # Safety
+/// As for `memo_get`.
+pub unsafe extern "C" fn memo_put(regs: *mut u32, m: *const MemoInfo, stride: u32) {
+    let st = stride as usize;
+    unsafe {
+        let m = &*m;
+        let at = |r: R| regs.add(r as usize * st);
+        let e = *at(m.slot);
+        if e == NO_SLOT {
+            return;
+        }
+        *at(e) = 1;
+        for (i, &k) in m.ins.iter().enumerate() {
+            *at(e + 1 + i as u32) = *at(k);
+        }
+        let o = e + 1 + m.ins.len() as u32;
+        for (j, &r) in m.outs.iter().enumerate() {
+            *at(o + j as u32) = *at(r);
+        }
+    }
 }
 
 impl Inst {
@@ -142,7 +255,34 @@ impl Inst {
             | Not { d, .. } | Shl { d, .. } | ShrS { d, .. } | ShrU { d, .. } | Cmp { d, .. }
             | Select { d, .. } | I2F { d, .. } | U2F { d, .. } | Call { d, .. } | CallC { d, .. }
             | LoadBuf { d, .. } => Some(d),
-            Tex { .. } | Jmp { .. } | Jz { .. } | Jnz { .. } | Kill | Ret => None,
+            Tex { .. } | Jmp { .. } | Jz { .. } | Jnz { .. } | MemoGet { .. } | MemoPut { .. }
+            | Kill | Ret => None,
+        }
+    }
+
+    /// rewrite every register operand this instruction reads (not a `CallC`'s
+    /// cache registers, and not texture coordinates, which live in `tex_ops`)
+    pub fn map_reads(&mut self, mut f: impl FnMut(R) -> R) {
+        use Inst::*;
+        match self {
+            Mov { s, .. } => *s = f(*s),
+            Const { .. } | Jmp { .. } | Kill | Ret | Tex { .. } | MemoGet { .. } | MemoPut { .. } => {}
+            FAdd { a, b, .. } | FSub { a, b, .. } | FMul { a, b, .. } | FDiv { a, b, .. }
+            | IAdd { a, b, .. } | ISub { a, b, .. } | IMul { a, b, .. } | And { a, b, .. }
+            | Or { a, b, .. } | Xor { a, b, .. } | Shl { a, b, .. } | ShrS { a, b, .. }
+            | ShrU { a, b, .. } | Cmp { a, b, .. } | Call { a, b, .. } | CallC { a, b, .. } => {
+                *a = f(*a);
+                *b = f(*b);
+            }
+            FNeg { a, .. } | FAbs { a, .. } | Sqrt { a, .. } | Not { a, .. } | I2F { a, .. }
+            | U2F { a, .. } => *a = f(*a),
+            Select { c, a, b, .. } => {
+                *c = f(*c);
+                *a = f(*a);
+                *b = f(*b);
+            }
+            LoadBuf { off, .. } => *off = f(*off),
+            Jz { c, .. } | Jnz { c, .. } => *c = f(*c),
         }
     }
 
@@ -175,8 +315,9 @@ impl Inst {
                 }
             }
             LoadBuf { off, .. } => f(off),
-            // texture ops read their coordinates (Size reads none)
-            Tex { .. } => {}
+            // texture ops read their coordinates (Size reads none); memo
+            // instructions touch registers named by `Program::memos`
+            Tex { .. } | MemoGet { .. } | MemoPut { .. } => {}
             Jz { c, .. } | Jnz { c, .. } => f(c),
         }
     }

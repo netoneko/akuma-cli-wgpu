@@ -3,7 +3,7 @@
 //! The portable fast path: no executable memory, runs anywhere the crate
 //! builds. It is also the oracle the JIT is diffed against.
 
-use super::program::{cmp, Inst};
+use super::program::{cmp, memo_get, memo_put, Inst, MemoInfo};
 use super::texture::{SmpRef, TexOp, TexRef};
 
 /// Run `code` over `regs` (already holding inputs and hoisted constants).
@@ -15,6 +15,7 @@ pub fn run(
     texs: &[TexRef],
     smps: &[SmpRef],
     tex_ops: &[TexOp],
+    memos: &[MemoInfo],
 ) -> bool {
     let mut pc = 0usize;
     macro_rules! fop {
@@ -117,6 +118,14 @@ pub fn run(
                     continue;
                 }
             }
+            Inst::MemoGet { m, t } => {
+                // SAFETY: the memo's registers are inside `regs` by construction
+                if unsafe { memo_get(regs.as_mut_ptr(), &memos[m as usize], 1) } != 0 {
+                    pc = t as usize;
+                    continue;
+                }
+            }
+            Inst::MemoPut { m } => unsafe { memo_put(regs.as_mut_ptr(), &memos[m as usize], 1) },
             Inst::Kill => return true,
             Inst::Ret => return false,
         }

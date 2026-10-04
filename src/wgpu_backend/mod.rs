@@ -41,6 +41,8 @@ pub mod gpu_selftest;
 pub mod interp;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod jit;
+pub mod memo;
+pub mod opt;
 pub mod program;
 pub mod raster;
 pub mod vertex;
