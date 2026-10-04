@@ -313,6 +313,114 @@ fn full(vi: u32) -> vec4<f32> {
 // tests
 // ---------------------------------------------------------------------------
 
+fn t_surface_present(g: &Gpu) -> TestResult {
+    // The full surface path through the real wgpu API: create (RAM sink —
+    // no panel on the test machine), configure, render a gradient, present,
+    // then check the texture bytes the present would have copied.
+    let instance = wgpu::Instance::from_custom(super::backend::Instance);
+    let surface = unsafe {
+        // the backend ignores the handles entirely (the surface is
+        // /dev/fb0, or the RAM sink when there is no panel)
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(wgpu::rwh::RawDisplayHandle::Web(
+                wgpu::rwh::WebDisplayHandle::new(),
+            )),
+            raw_window_handle: wgpu::rwh::RawWindowHandle::Web(
+                wgpu::rwh::WebWindowHandle::new(1),
+            ),
+        })
+    }
+    .map_err(|e| format!("create_surface: {e:?}"))?;
+
+    let (w, h) = (8u32, 4u32);
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("request_adapter");
+    let caps = surface.get_capabilities(&adapter);
+    expect(
+        caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm),
+        || format!("Bgra8Unorm in surface formats (got {:?})", caps.formats),
+    )?;
+    expect(
+        caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque),
+        || format!("Opaque in surface alpha modes (got {:?})", caps.alpha_modes),
+    )?;
+
+    surface.configure(
+        &g.device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            width: w,
+            height: h,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        },
+    );
+
+    let frame = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(f) => f,
+        other => return Err(format!("get_current_texture: {other:?}")),
+    };
+
+    // left half red, right half green (Bgra8 in memory: b,g,r,a)
+    let src = format!(
+        "{FULL_TRI}
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {{ return full(vi); }}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {{
+    if p.x < 4.0 {{ return vec4<f32>(1.0, 0.0, 0.0, 1.0); }}
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}}"
+    );
+    let m = g.module(&src);
+    let p = g.pipeline(
+        &m,
+        &g.empty_layout(),
+        wgpu::TextureFormat::Bgra8Unorm,
+        None,
+        wgpu::PrimitiveTopology::TriangleList,
+        None,
+        &[],
+    );
+    g.pass(&frame.texture, Some(wgpu::Color::BLACK), |rp| {
+        rp.set_pipeline(&p);
+        rp.draw(0..3, 0..1);
+    });
+    g.queue.present(frame);
+
+    // re-fetch the (single, reused) surface texture and inspect the bytes
+    // present copied from
+    let frame = match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(f) => f,
+        other => return Err(format!("get_current_texture(2): {other:?}")),
+    };
+    let bytes = g.read(&frame.texture, w, h, 4);
+    let mut bad = 0;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let px = &bytes[(y * w as usize + x) * 4..][..4];
+            // Bgra8: blue, green, red, alpha
+            let want: [u8; 4] = if (x as u32) < 4 {
+                [0, 0, 255, 255]
+            } else {
+                [0, 255, 0, 255]
+            };
+            if px != want {
+                bad += 1;
+            }
+        }
+    }
+    expect(bad == 0, || {
+        format!(
+            "{bad} of {} presented pixels wrong: {:?}",
+            w * h,
+            &bytes[..16.min(bytes.len())]
+        )
+    })
+}
+
 fn t_fullscreen_solid(g: &Gpu) -> TestResult {
     let src = format!(
         "{FULL_TRI}
@@ -1956,6 +2064,7 @@ pub fn run() -> i32 {
         ("random fragment shaders vs the interpreter", t_fuzz_fragment),
         ("sugarloaf grid.wgsl: cell backgrounds + instanced glyphs", t_sugarloaf_grid),
         ("sugarloaf renderer.wgsl: plain, rounded and clipped rects", t_sugarloaf_quads),
+        ("surface: create, configure, render, present", t_surface_present),
     ];
     let mut failed = 0;
     for (name, f) in tests {

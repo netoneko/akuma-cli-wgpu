@@ -147,6 +147,13 @@ pub struct PixelFormat {
 }
 
 impl PixelFormat {
+    /// `(bits_per_pixel, red_offset, green_offset, blue_offset)` — the
+    /// channel layout inside one pixel, for callers that pack device
+    /// pixels themselves (the wgpu surface).
+    pub fn layout(&self) -> (u32, u32, u32, u32) {
+        (self.bits_per_pixel, self.r.0, self.g.0, self.b.0)
+    }
+
     fn from_var(v: &FbVarScreeninfo) -> Option<PixelFormat> {
         // The kernel fills the red/green/blue bitfields from the multiboot2
         // RGB framebuffer tag (S1); transp stays zero on this scanout.
@@ -401,6 +408,26 @@ impl FbDevice {
                 }
                 _ => unreachable!("checked at open"),
             }
+        }
+        // Single-buffer static scanout: no panning, so no FBIOPAN_DISPLAY.
+        // The kernel's fbcon does an sfence on its own writes; user stores
+        // to WC memory are made visible by the chipset on their own — there
+        // is nothing to flush from userspace.
+    }
+
+    /// Present pre-packed device-format pixels: `src` holds one row of
+    /// `row_bytes` bytes per screen row (packed exactly like the device
+    /// format, e.g. the wgpu backend's Bgra8 texels), copied one full row
+    /// at a time into the mapping. Same WC contract as `present`: whole
+    /// rows only, every byte of every visible row written.
+    pub fn present_raw(&self, src: &[u8], row_bytes: usize) {
+        debug_assert_eq!(row_bytes, self.width * (self.format.bits_per_pixel / 8) as usize);
+        debug_assert!(src.len() >= self.height * row_bytes);
+        for (row, chunk) in src.chunks_exact(row_bytes).enumerate().take(self.height) {
+            let dst = unsafe { self.map.add(row * self.pitch) } as *mut u8;
+            // SAFETY: rows are within the mapping (map_len >= height*pitch),
+            // and src has at least row_bytes left per chunk_exact row.
+            unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, row_bytes) };
         }
         // Single-buffer static scanout: no panning, so no FBIOPAN_DISPLAY.
         // The kernel's fbcon does an sfence on its own writes; user stores

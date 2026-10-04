@@ -284,7 +284,13 @@ impl wgpu::custom::InstanceInterface for Instance {
         &self,
         _target: wgpu::SurfaceTargetUnsafe,
     ) -> Result<wgpu::custom::DispatchSurface, wgpu::CreateSurfaceError> {
-        panic!("akuma backend: no surfaces (the framebuffer is not a wgpu surface)");
+        // The raw handles are ignored: the surface is the framebuffer,
+        // not a window system object. No panel (host machines, tests)
+        // falls back to the RAM sink; `present` is then a no-op and
+        // tests read the texture bytes instead.
+        let surface = super::surface::SurfaceData::open("/dev/fb0")
+            .unwrap_or_else(|_| super::surface::SurfaceData::ram());
+        Ok(wgpu::custom::DispatchSurface::custom(surface))
     }
 
     fn request_adapter(
@@ -341,7 +347,8 @@ impl wgpu::custom::AdapterInterface for Adapter {
     }
 
     fn is_surface_supported(&self, _surface: &wgpu::custom::DispatchSurface) -> bool {
-        false
+        // every surface this backend creates is supported (fb or RAM sink)
+        true
     }
 
     fn features(&self) -> wgpu::Features {
@@ -890,8 +897,11 @@ impl wgpu::custom::QueueInterface for Queue {
         panic!("akuma backend: acceleration structures unsupported");
     }
 
-    fn present(&self, _detail: &wgpu::custom::DispatchSurfaceOutputDetail) {
-        panic!("akuma backend: no surfaces");
+    fn present(&self, detail: &wgpu::custom::DispatchSurfaceOutputDetail) {
+        match detail.as_custom::<super::surface::SurfaceOutputDetail>() {
+            Some(out) => out.present(),
+            None => panic!("akuma backend: present of a foreign surface detail"),
+        }
     }
 }
 

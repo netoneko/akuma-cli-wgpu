@@ -39,6 +39,7 @@ pub mod exec_selftest;
 pub mod format;
 pub mod gpu_selftest;
 pub mod interp;
+pub mod surface;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod jit;
 pub mod memo;
