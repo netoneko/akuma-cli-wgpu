@@ -895,6 +895,83 @@ fn emit_wide(
         }
         Inst::Kill => a.epilogue(true),
         Inst::Ret => a.epilogue(false),
+        // single-key memo: inline lookup / update (the common shape; the helper
+        // call costs more than the rest of a cache hit)
+        Inst::MemoGet { m, t } if p.memos.get(m as usize).is_some_and(|i| i.ins.len() == 1) => {
+            let info = &p.memos[m as usize];
+            let key = info.ins[0];
+            let w = info.entry_words();
+            // all four lanes must carry the same key
+            a.vload(0, key);
+            a.bytes(&[0x66, 0x0F, 0x70, 0xC8, 0x00]); // pshufd xmm1,xmm0,0
+            a.vr(&[0x66], &[0x76], 1, 0); // pcmpeqd xmm1,xmm0
+            a.vr(&[], &[0x50], 0, 1); // movmskps eax,xmm1
+            a.bytes(&[0x83, 0xF8, 0x0F, 0x0F, 0x85]); // cmp eax,15; jne slow
+            let to_slow = a.b.len();
+            a.u32(0);
+            a.bytes(&[0x66, 0x0F, 0x7E, 0xC6]); // movd esi,xmm0
+            a.bytes(&[0x69, 0xC6]); // imul eax,esi,imm32
+            a.u32(0x9E37_79B1);
+            a.bytes(&[0xC1, 0xE8, (32 - info.bits) as u8]); // shr eax,32-bits
+            a.bytes(&[0x69, 0xC0]); // imul eax,eax,entry words
+            a.u32(w);
+            a.u8(0x05); // add eax,table base
+            a.u32(info.base);
+            a.rm(&[0x89], 0, info.slot); // mov [slot lane 0],eax
+            a.bytes(&[0xC1, 0xE0, 0x04]); // shl eax,4   (rax = byte offset of the entry)
+            // valid?
+            a.bytes(&[0x83, 0xBC, 0x03]); // cmp dword [rbx+rax+disp32],0
+            a.u32(0);
+            a.u8(0);
+            a.bytes(&[0x0F, 0x84]); // je done
+            let to_done0 = a.b.len();
+            a.u32(0);
+            a.bytes(&[0x3B, 0xB4, 0x03]); // cmp esi,[rbx+rax+disp32]  (stored key)
+            a.u32(16);
+            a.bytes(&[0x0F, 0x85]); // jne done
+            let to_done1 = a.b.len();
+            a.u32(0);
+            for (j, &o) in info.outs.iter().enumerate() {
+                a.bytes(&[0x66, 0x0F, 0x6E, 0x84, 0x03]); // movd xmm0,[rbx+rax+disp32]
+                a.u32(16 * (2 + j as u32));
+                a.bytes(&[0x66, 0x0F, 0x70, 0xC0, 0x00]); // pshufd xmm0,xmm0,0
+                a.vstore(0, o);
+            }
+            a.u8(0xE9); // jmp t
+            fixups.push((a.b.len(), t));
+            a.u32(0);
+            // slow: the lanes disagree -> no cache update
+            let rel = (a.b.len() - (to_slow + 4)) as i32;
+            a.b[to_slow..to_slow + 4].copy_from_slice(&rel.to_le_bytes());
+            a.rm(&[0xC7], 0, info.slot); // mov dword [slot lane 0], NO_SLOT
+            a.u32(u32::MAX);
+            // done:
+            for pos in [to_done0, to_done1] {
+                let rel = (a.b.len() - (pos + 4)) as i32;
+                a.b[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
+            }
+        }
+        Inst::MemoPut { m } if p.memos.get(m as usize).is_some_and(|i| i.ins.len() == 1) => {
+            let info = &p.memos[m as usize];
+            a.load_eax(info.slot);
+            a.bytes(&[0x83, 0xF8, 0xFF, 0x0F, 0x84]); // cmp eax,-1; je skip
+            let to_skip = a.b.len();
+            a.u32(0);
+            a.bytes(&[0xC1, 0xE0, 0x04]); // shl eax,4
+            a.bytes(&[0xC7, 0x84, 0x03]); // mov dword [rbx+rax+0],1
+            a.u32(0);
+            a.u32(1);
+            a.load_ecx(info.ins[0]);
+            a.bytes(&[0x89, 0x8C, 0x03]); // mov [rbx+rax+16],ecx
+            a.u32(16);
+            for (j, &o) in info.outs.iter().enumerate() {
+                a.load_ecx(o);
+                a.bytes(&[0x89, 0x8C, 0x03]);
+                a.u32(16 * (2 + j as u32));
+            }
+            let rel = (a.b.len() - (to_skip + 4)) as i32;
+            a.b[to_skip..to_skip + 4].copy_from_slice(&rel.to_le_bytes());
+        }
         // memo helpers take the whole 4-lane register file
         Inst::MemoGet { .. } | Inst::MemoPut { .. } => emit_scalar(a, p, inst, fixups)?,
         // everything else: the scalar template, once per lane
