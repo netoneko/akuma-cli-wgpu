@@ -55,8 +55,19 @@ pub fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
+const UNORM_LUT: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    t
+};
+
+#[inline]
 fn unorm(b: u8) -> f32 {
-    b as f32 / 255.0
+    UNORM_LUT[b as usize]
 }
 
 fn to_unorm(c: f32) -> u8 {

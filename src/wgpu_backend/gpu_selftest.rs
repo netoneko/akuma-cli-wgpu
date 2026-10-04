@@ -823,6 +823,27 @@ pub fn bench() -> i32 {
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         };
+        {
+            let fmt = wgpu::TextureFormat::Bgra8Unorm;
+            let tex = g.texture(w, h, fmt);
+            let p = g.pipeline(&m, &g.empty_layout(), fmt, None, wgpu::PrimitiveTopology::TriangleList, None, &[]);
+            let _ = &p;
+            let t0 = crate::clock::monotonic();
+            for _ in 0..3 {
+                g.pass(&tex, Some(BLACK), |_rp| {});
+            }
+            let ms = (crate::clock::monotonic() - t0) * 1000.0 / 3.0;
+            println!("{w}x{h}, clear only (empty pass): {ms:.1} ms/frame");
+            let t0 = crate::clock::monotonic();
+            for _ in 0..3 {
+                g.pass(&tex, None, |rp| {
+                    rp.set_pipeline(&p);
+                    rp.draw(0..3, 0..1);
+                });
+            }
+            let ms = (crate::clock::monotonic() - t0) * 1000.0 / 3.0;
+            println!("{w}x{h}, constant shader, no clear, no blend: {ms:.1} ms/frame ({:.0} ns/fragment)", ms * 1e6 / (w * h) as f64);
+        }
         for (what, blend) in [
             ("constant shader, no blend", None),
             ("constant shader, premultiplied blend", Some(wgpu::BlendState { color: c, alpha: c })),

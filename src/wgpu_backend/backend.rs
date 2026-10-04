@@ -1065,9 +1065,7 @@ fn execute_render(data: RenderPassData) {
                 [clear.r as f32, clear.g as f32, clear.b as f32, clear.a as f32],
                 &mut one,
             );
-            for px in c.chunks_exact_mut(bpt) {
-                px.copy_from_slice(&one[..bpt]);
-            }
+            fill_pattern(&mut c, &one[..bpt]);
         }
     }
     let mut depth: Option<Arc<TextureData>> = None;
@@ -1149,6 +1147,26 @@ fn execute_render(data: RenderPassData) {
                 draw_standard(&st, StdDraw::Indexed { indices, base_vertex, instances });
             }
         }
+    }
+}
+
+/// Fill `buf` with the repeating `pat` at memset/memcpy speed: write the
+/// pattern once, then double the filled prefix with `copy_within`.
+fn fill_pattern(buf: &mut [u8], pat: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    if pat.len() == 1 {
+        buf.fill(pat[0]);
+        return;
+    }
+    let n0 = pat.len().min(buf.len());
+    buf[..n0].copy_from_slice(&pat[..n0]);
+    let mut n = n0;
+    while n < buf.len() {
+        let m = n.min(buf.len() - n);
+        buf.copy_within(0..m, n);
+        n += m;
     }
 }
 

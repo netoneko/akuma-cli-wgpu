@@ -215,6 +215,13 @@ impl Raster<'_> {
         // position-independent flat shader: one evaluation per triangle
         let constant_fs = fs.constant_per_primitive();
         let mut cached: Option<Option<[u32; 4]>> = None;
+        // barycentrics, depth and 1/w only matter if something consumes them
+        let need_geom = self.depth.is_some() || !constant_fs;
+        let plan = PixelPlan::new(&self.color, self.blend_constant);
+        // with a constant fragment result the final texel (or the blend
+        // factors) can be computed once per triangle
+        let mut const_texel: Option<[u8; 4]> = None;
+        let mut const_blend: Option<([f32; 4], [f32; 4])> = None;
 
         for py in min_y..max_y {
             let mut w = w_row;
@@ -223,15 +230,17 @@ impl Raster<'_> {
                     && (w[1] > 0 || (w[1] == 0 && tl[1]))
                     && (w[2] > 0 || (w[2] == 0 && tl[2]));
                 if inside {
-                    // barycentric weights (screen space)
-                    let l = [
-                        w[0] as f64 * inv_sum,
-                        w[1] as f64 * inv_sum,
-                        w[2] as f64 * inv_sum,
-                    ];
-                    let z = l[0] * s[0].z + l[1] * s[1].z + l[2] * s[2].z;
-                    let invw = l[0] * s[0].invw + l[1] * s[1].invw + l[2] * s[2].invw;
-                    let zf = z as f32;
+                    let (mut zf, mut invw, mut l) = (0.0f32, 0.0f64, [0.0f64; 3]);
+                    if need_geom {
+                        // barycentric weights (screen space)
+                        l = [
+                            w[0] as f64 * inv_sum,
+                            w[1] as f64 * inv_sum,
+                            w[2] as f64 * inv_sum,
+                        ];
+                        zf = (l[0] * s[0].z + l[1] * s[1].z + l[2] * s[2].z) as f32;
+                        invw = l[0] * s[0].invw + l[1] * s[1].invw + l[2] * s[2].invw;
+                    }
                     let idx = (py * cw + px) as usize;
                     let pass = match &self.depth {
                         Some(d) => compare(d.compare, zf, d.data[idx]),
@@ -255,7 +264,9 @@ impl Raster<'_> {
                                     d.data[idx] = zf;
                                 }
                             }
-                            self.write_pixel(idx, c);
+                            let bpt = plan.bpt;
+                            let texel = &mut self.color.data[idx * bpt..(idx + 1) * bpt];
+                            plan.write(texel, c, constant_fs, &mut const_texel, &mut const_blend);
                         }
                     }
                 }
@@ -297,39 +308,6 @@ impl Raster<'_> {
                 }
             }
         }
-    }
-
-    fn write_pixel(&mut self, idx: usize, frag: [u32; 4]) {
-        let fmt = self.color.format;
-        let bpt = format::bytes_per_texel(fmt).unwrap() as usize;
-        let texel = &mut self.color.data[idx * bpt..(idx + 1) * bpt];
-        let src = [
-            f32::from_bits(frag[0]),
-            f32::from_bits(frag[1]),
-            f32::from_bits(frag[2]),
-            f32::from_bits(frag[3]),
-        ];
-        let mut out = src;
-        let wm = self.color.write_mask;
-        let needs_dst = self.color.blend.is_some() || wm != wgpu::ColorWrites::ALL;
-        let dst = if needs_dst { format::decode(fmt, texel) } else { [0.0; 4] };
-        if let Some(b) = &self.color.blend {
-            out = blend(b, src, dst, self.blend_constant);
-        }
-        if wm != wgpu::ColorWrites::ALL {
-            let masks = [
-                wm.contains(wgpu::ColorWrites::RED),
-                wm.contains(wgpu::ColorWrites::GREEN),
-                wm.contains(wgpu::ColorWrites::BLUE),
-                wm.contains(wgpu::ColorWrites::ALPHA),
-            ];
-            for i in 0..4 {
-                if !masks[i] {
-                    out[i] = dst[i];
-                }
-            }
-        }
-        format::encode(fmt, out, texel);
     }
 }
 
@@ -459,4 +437,134 @@ fn clip(tri: &[CV; 3], interp: &[(u32, Interp)]) -> Vec<CV> {
     // already forces w >= 0, drop degenerate leftovers
     poly.retain(|p| p.pos[3] > 1e-12);
     poly
+}
+
+// ---------------------------------------------------------------------------
+// per-triangle pixel write plan
+// ---------------------------------------------------------------------------
+
+/// Everything about writing a pixel that does not change within a triangle,
+/// resolved once instead of per pixel.
+struct PixelPlan {
+    fmt: wgpu::TextureFormat,
+    bpt: usize,
+    blend: Option<wgpu::BlendState>,
+    mask: [bool; 4],
+    mask_all: bool,
+    k: [f32; 4],
+}
+
+impl PixelPlan {
+    fn new(c: &ColorTarget<'_>, k: [f32; 4]) -> PixelPlan {
+        let wm = c.write_mask;
+        PixelPlan {
+            fmt: c.format,
+            bpt: format::bytes_per_texel(c.format).unwrap() as usize,
+            blend: c.blend,
+            mask: [
+                wm.contains(wgpu::ColorWrites::RED),
+                wm.contains(wgpu::ColorWrites::GREEN),
+                wm.contains(wgpu::ColorWrites::BLUE),
+                wm.contains(wgpu::ColorWrites::ALPHA),
+            ],
+            mask_all: wm == wgpu::ColorWrites::ALL,
+            k,
+        }
+    }
+
+    /// blend factors that depend only on the source and the constant: the
+    /// destination-dependent ones cannot be hoisted
+    fn src_only(f: BlendFactor) -> bool {
+        !matches!(
+            f,
+            BlendFactor::Dst
+                | BlendFactor::OneMinusDst
+                | BlendFactor::DstAlpha
+                | BlendFactor::OneMinusDstAlpha
+                | BlendFactor::SrcAlphaSaturated
+        )
+    }
+
+    #[inline]
+    fn write(
+        &self,
+        texel: &mut [u8],
+        frag: [u32; 4],
+        constant_src: bool,
+        const_texel: &mut Option<[u8; 4]>,
+        const_blend: &mut Option<([f32; 4], [f32; 4])>,
+    ) {
+        let src = [
+            f32::from_bits(frag[0]),
+            f32::from_bits(frag[1]),
+            f32::from_bits(frag[2]),
+            f32::from_bits(frag[3]),
+        ];
+        let Some(b) = &self.blend else {
+            if self.mask_all {
+                // plain store: for a constant source the texel is the same
+                // for the whole triangle
+                if constant_src {
+                    let t = const_texel.get_or_insert_with(|| {
+                        let mut t = [0u8; 4];
+                        format::encode(self.fmt, src, &mut t);
+                        t
+                    });
+                    texel.copy_from_slice(&t[..self.bpt]);
+                } else {
+                    format::encode(self.fmt, src, texel);
+                }
+                return;
+            }
+            return self.write_generic(texel, src, None);
+        };
+        // blend with source-and-constant-only factors, Add, all channels
+        // written, constant source: out = src*sf + dst*df with sf/df fixed
+        let hoistable = constant_src
+            && self.mask_all
+            && b.color.operation == BlendOperation::Add
+            && b.alpha.operation == BlendOperation::Add
+            && Self::src_only(b.color.src_factor)
+            && Self::src_only(b.color.dst_factor)
+            && Self::src_only(b.alpha.src_factor)
+            && Self::src_only(b.alpha.dst_factor);
+        if hoistable {
+            let (sf, df) = const_blend.get_or_insert_with(|| {
+                let z = [0.0; 4];
+                let (mut sf, mut df) = ([0.0f32; 4], [0.0f32; 4]);
+                for c in 0..4 {
+                    let comp = if c == 3 { &b.alpha } else { &b.color };
+                    sf[c] = factor(comp.src_factor, src, z, self.k, c);
+                    df[c] = factor(comp.dst_factor, src, z, self.k, c);
+                }
+                (sf, df)
+            });
+            let d = format::decode(self.fmt, texel);
+            let out = [
+                src[0] * sf[0] + d[0] * df[0],
+                src[1] * sf[1] + d[1] * df[1],
+                src[2] * sf[2] + d[2] * df[2],
+                src[3] * sf[3] + d[3] * df[3],
+            ];
+            format::encode(self.fmt, out, texel);
+            return;
+        }
+        self.write_generic(texel, src, Some(b))
+    }
+
+    fn write_generic(&self, texel: &mut [u8], src: [f32; 4], blend_state: Option<&wgpu::BlendState>) {
+        let mut out = src;
+        let dst = format::decode(self.fmt, texel);
+        if let Some(b) = blend_state {
+            out = blend(b, src, dst, self.k);
+        }
+        if !self.mask_all {
+            for i in 0..4 {
+                if !self.mask[i] {
+                    out[i] = dst[i];
+                }
+            }
+        }
+        format::encode(self.fmt, out, texel);
+    }
 }
