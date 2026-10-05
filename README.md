@@ -301,7 +301,10 @@ the `[renderer]` table. rio's own librashader CRT (`filters = ["newpixiecrt"]`) 
 frame on the CPU — unusable; that is why the cheap one exists.
 
 Open: `ssh` from inside rio misbehaves (expected: under the pipe fallback ssh has no tty, so no
-raw mode and no remote pty; kernel ptys fix it). Cursor blink.
+raw mode and no remote pty; kernel ptys fix it).
+
+Cursor blink was just off: rio's default is `blinking = false`; the panel config now sets
+`[cursor] blinking = true` (not yet confirmed at the panel).
 
 Note: `/tmp/rio.log` on the box is only the expect harness's stderr
 redirect (the fb trace mirror), not rio's `--enable-log-file` log; the
