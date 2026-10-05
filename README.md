@@ -272,11 +272,11 @@ so `forkpty`/`openpty` failed, and rio silently substituted a *dead context*
 
 **The panel setup** (config: `misc/akuma/config.toml` in the rio fork, installed as
 `/root/.config/rio/config.toml`; the previous one is `config.toml.bak`). Font Source Code Pro
-27 (a ~34 px line, 15% under the kernel console's 20×40 cell). Two side-by-side sessions for a
+32 (a ~40 px line, about the kernel console's 20×40 cell). Two side-by-side sessions for a
 panel whose right half is dead. The console tty cannot send Super or Ctrl+Shift (a tty byte
 stream has no encoding for them; the fb platform only sees bytes), and the kernel's keyboard
 drivers drop Alt (Alt+D arrives as `d`; see kernel findings). So every binding is
-**Esc, then a letter**: press and release Esc, then press the letter. (The bindings are
+**Esc, then a letter**: press and release Esc, then press the letter. The letter must follow within 400 ms (after that a lone Esc is delivered to the program). (The bindings are
 declared as Alt+letter, which a terminal sends as ESC followed by the letter, so over ssh
 from a terminal with Alt/Option-as-Meta, real Alt works too.)
 
@@ -300,8 +300,18 @@ the `[renderer]` table. rio's own librashader CRT (`filters = ["newpixiecrt"]`) 
 (`var<private>` globals were added to the compiler and interpreter) but takes 10-20 s per 4K
 frame on the CPU — unusable; that is why the cheap one exists.
 
-Open: `ssh` from inside rio misbehaves (expected: under the pipe fallback ssh has no tty, so no
-raw mode and no remote pty; kernel ptys fix it).
+**A full TUI over ssh, with images (2026-10-05).** The kernel has real ptys now (`/dev/ptmx`), so
+rio runs its shell on a real tty (the pipe fallback is not taken) and `ssh` inside rio gets a
+remote pty. late.sh (a chat TUI) runs in rio on the panel, and **images work through the kitty
+graphics protocol**: an inline thumbnail and a full-size "Image Preview" popup rendered in the
+chat (photographed at the panel). That is the first real use of sugarloaf's image path
+(`image.wgsl`) on this backend. What it took, beyond ptys: rio's fb platform delivered Enter as LF
+and Esc as nothing, and held a lone Esc until the next key (fixed in the rio fork: Esc flush after
+400 ms, Enter = CR, Escape carries its byte); and the kernel's `SET_TERMINAL_ATTRIBUTES` ignored
+its fd, so `ssh` never made the pty slave raw (cooked: buffered keys, `^[[A` echoed over the
+screen). Fixed in the kernel (kernel repo, `AKUMA_AMD64_PTY.md` §7). Still true: slow (CPU
+rendering, 4K, font 32) and some stale/missing cells on redraw while late.sh scrolls regions, not
+yet diagnosed; emoji and other non-Latin glyphs are tofu (no fontconfig fallback).
 
 Cursor blink was just off: rio's default is `blinking = false`; the panel config now sets
 `[cursor] blinking = true` (not yet confirmed at the panel).
@@ -781,7 +791,8 @@ in ~20 ms. In order:
    mipmapped textures (rio's filter chain creates them), depth/stencil, multisampling
    (rio uses `sample_count: 1`), and the 2 `copy_texture_to_texture` / 2 `set_viewport`
    call sites. Not yet exercised by a test: sugarloaf's `image.wgsl`, `text_shader.wgsl` and the
-   filter shaders (they compile and JIT; only `grid.wgsl` and `renderer.wgsl` render under test).
+   filter shaders (they compile and JIT; only `grid.wgsl` and `renderer.wgsl` render under test;
+   `image.wgsl` has rendered in real use: kitty-protocol images in rio on the panel, 2026-10-05).
 4. The demo's own legacy raster path (`backend.rs::draw_legacy`) still shades fragment by
    fragment on one thread; the live demo is present-bound (33 MB write-combined copy ≈ 11 ms)
    so there is little to gain, but its vertex stage could use the wide path and the worker pool.
